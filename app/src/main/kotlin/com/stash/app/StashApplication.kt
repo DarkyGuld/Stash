@@ -177,6 +177,10 @@ class StashApplication : Application(), Configuration.Provider {
     @Inject
     lateinit var streamCacheMaintenance: com.stash.core.media.streaming.StreamCacheMaintenance
 
+    /** Idle-time TLS/DNS warm for the Eclipse addon host. */
+    @Inject
+    lateinit var eclipseAddonWarmup: com.stash.core.media.streaming.EclipseAddonWarmup
+
     @Inject
     lateinit var streamingQualityPreferences: com.stash.data.download.prefs.StreamingQualityPreferences
 
@@ -493,6 +497,12 @@ class StashApplication : Application(), Configuration.Provider {
         applicationScope.launch {
             runCatching { eclipseAddonPreferences.migrateCloudAppleQualityOnce() }
                 .onFailure { Log.w("StashStartup", "cloud apple-quality migration failed", it) }
+        }
+        // After the first frame/idle, warm the addon host so the first resolve's TLS is already up.
+        applicationScope.launch {
+            kotlinx.coroutines.delay(2_500)
+            runCatching { eclipseAddonWarmup.warm() }
+                .onFailure { Log.w("StashStartup", "addon warmup failed", it) }
         }
         // The live cache starts at the persisted cap (raising keeps entries; lowering trims now).
         applicationScope.launch {
