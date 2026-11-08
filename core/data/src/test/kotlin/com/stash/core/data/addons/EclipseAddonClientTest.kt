@@ -631,7 +631,10 @@ class EclipseAddonClientTest {
 
             assertThat(hits.map { it.trackId }).containsExactly(6766866994L)
             val terms = List(server.requestCount) { server.takeRequest().requestUrl!!.queryParameter("term") }
+            // The full query is retried once (empty is not trusted as a catalog miss),
+            // then the cleaned variant finds it.
             assertThat(terms).containsExactly(
+                "Stay - Ely Oaks Version Ely Oaks, Misdemeanor",
                 "Stay - Ely Oaks Version Ely Oaks, Misdemeanor",
                 "Stay Ely Oaks",
             ).inOrder()

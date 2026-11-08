@@ -633,7 +633,17 @@ class StashPlaybackService : MediaLibraryService() {
             // role-swap does NOT surface here — we move this listener to the new
             // master instead of advancing the old one.
             when (reason) {
-                Player.MEDIA_ITEM_TRANSITION_REASON_SEEK,
+                Player.MEDIA_ITEM_TRANSITION_REASON_SEEK -> {
+                    // Manual next/previous: if the spare was already primed for the
+                    // requested item, hand over instead of cancelling it and letting
+                    // the master resolve/prepare from scratch.
+                    if (!useSpareForManualSkip(mediaItem)) {
+                        crossfadeEngine?.cancelTransition()
+                        crossfadePreparedId = null
+                        restoredPrimePending = false
+                        restoredPrimeId = null
+                    }
+                }
                 Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED -> {
                     crossfadeEngine?.cancelTransition()
                     crossfadePreparedId = null
@@ -1761,6 +1771,37 @@ class StashPlaybackService : MediaLibraryService() {
      * Cast, Listen Together, bit-perfect and the end-of-track sleep hold all
      * fall back to the normal auto-advance.
      */
+    /**
+     * Manual next/previous: the master has already moved to the requested item; if
+     * the spare is READY on that exact item, swap to it (position 0) instead of
+     * cancelling the prime and re-preparing. False means "use the normal path".
+     */
+    private fun useSpareForManualSkip(item: MediaItem?): Boolean {
+        val id = item?.mediaId ?: return false
+        val engine = crossfadeEngine ?: return false
+        if (crossfadeEnabled || isCasting || crossfadeSuspended ||
+            crossfadeHeldForBitPerfect || crossfadeHeldForSleep
+        ) {
+            return false
+        }
+        if (!engine.isPreparedForResume(id)) return false
+        crossfadePollJob?.cancel()
+        crossfadePollJob = null
+        val startedNs = System.nanoTime()
+        val swapped = engine.performResumeSwap { newMaster -> onCrossfadeSwap(newMaster) }
+        restoredPrimePending = false
+        restoredPrimeId = null
+        if (swapped) {
+            val master = crossfadeEngine?.masterPlayer
+            markLatencyStart(master?.currentMediaItem)
+            android.util.Log.i(
+                "Crossfade",
+                "manual next used the primed spare in ${(System.nanoTime() - startedNs) / 1_000_000} ms",
+            )
+        }
+        return swapped
+    }
+
     /** Prime the spare on the restored current item (paused, silent) once its queue lands. */
     private fun maybePrimeRestored(player: Player) {
         if (!restoredPrimePending) return

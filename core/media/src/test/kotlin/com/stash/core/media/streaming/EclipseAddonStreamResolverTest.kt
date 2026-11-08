@@ -583,14 +583,11 @@ class EclipseAddonStreamResolverTest {
     }
 
     @Test
-    fun `fast mode will not start Apple for an ambiguous or weak match`() = runTest {
+    fun `fast mode falls back to best for ambiguous or unknown-duration hits, never a weak artist`() = runTest {
+        // Not strong, but the normal matcher still accepts these, so Apple may play.
         for (hits in listOf(
-            // Two strong candidates: ambiguous.
             listOf(marioHit, marioHit.copy(trackId = 555_000_002L)),
-            // Unknown duration: not strong.
             listOf(marioHit.copy(trackId = 555_000_003L, trackTimeMillis = 0)),
-            // Weak artist: not strong.
-            listOf(marioHit.copy(trackId = 555_000_004L, artistName = "Someone Else")),
         )) {
             val repository: EclipseAddonRepository = mockk()
             val cloud = resolveOnly("eclipse-music-cloud")
@@ -600,10 +597,25 @@ class EclipseAddonStreamResolverTest {
                 null
             }
             coEvery { repository.searchApple(cloud, any(), any()) } returns hits
+            coEvery { repository.streamApple(cloud, any(), any()) } returns stream(format = "hls")
 
-            assertThat(fastResolver(repository).resolve(mario)).isNull()
-            coVerify(exactly = 0) { repository.streamApple(any(), any(), any()) }
+            assertThat(fastResolver(repository).resolve(mario)).isNotNull()
+            coVerify(exactly = 1) { repository.streamApple(cloud, any(), any()) }
         }
+
+        // A wrong artist is rejected by best() too.
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        coEvery { repository.resolve(cloud, any(), any(), any(), any()) } coAnswers {
+            kotlinx.coroutines.delay(2_000)
+            null
+        }
+        coEvery { repository.searchApple(cloud, any(), any()) } returns
+            listOf(marioHit.copy(trackId = 555_000_004L, artistName = "Someone Else"))
+
+        assertThat(fastResolver(repository).resolve(mario)).isNull()
+        coVerify(exactly = 0) { repository.streamApple(any(), any(), any()) }
     }
 
     @Test
@@ -927,6 +939,96 @@ class EclipseAddonStreamResolverTest {
 
         assertThat(resolver.resolve(track(), speculative = true)).isNull()
         coVerify(exactly = 0) { repository.searchApple(any(), any(), any()) }
+    }
+
+    @Test
+    fun `the real Dancin remix hit matches and streams its Apple id`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        coEvery { repository.resolve(any(), any(), any(), any(), any()) } returns null
+        coEvery { repository.searchApple(any(), any(), any()) } returns listOf(
+            EclipseAppleTrack(
+                trackId = 1_890_207_695L,
+                trackName = "Dancin (feat. Luvli) [southstar Remix]",
+                artistName = "Aaron Smith & southstar",
+                trackTimeMillis = 173_333,
+            ),
+        )
+        coEvery { repository.streamApple(any(), "1890207695", any()) } returns stream(format = "hls")
+        val resolver = cachedResolver(repository)
+        val dancin = TrackEntity(
+            title = "Dancin (feat. Luvli) - southstar Remix",
+            artist = "Aaron Smith, Luvli, southstar",
+            durationMs = 173_333,
+        )
+
+        assertThat(resolver.resolve(dancin)).isNotNull()
+        coVerify(exactly = 1) { repository.streamApple(cloud, "1890207695", any()) }
+    }
+
+    @Test
+    fun `fast mode starts the Apple stream for the exact Dancin hit`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        coEvery { repository.resolve(any(), any(), any(), any(), any()) } coAnswers {
+            kotlinx.coroutines.delay(2_000)
+            null
+        }
+        val hit = EclipseAppleTrack(
+            trackId = 1_890_207_695L,
+            trackName = "Dancin (feat. Luvli) [southstar Remix]",
+            artistName = "Aaron Smith & southstar",
+            trackTimeMillis = 173_333,
+        )
+        coEvery { repository.searchApple(any(), any(), any()) } returns listOf(hit)
+        coEvery { repository.streamApple(any(), "1890207695", any()) } returns stream(format = "hls")
+        val dancin = TrackEntity(
+            title = "Dancin (feat. Luvli) - southstar Remix",
+            artist = "Aaron Smith, Luvli, southstar",
+            durationMs = 173_333,
+        )
+
+        assertThat(fastResolver(repository).resolve(dancin)).isNotNull()
+        coVerify(exactly = 1) { repository.streamApple(cloud, "1890207695", any()) }
+    }
+
+    @Test
+    fun `fast mode falls back to best when the strict gate declines`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        coEvery { repository.resolve(any(), any(), any(), any(), any()) } coAnswers {
+            kotlinx.coroutines.delay(2_000)
+            null
+        }
+        // 12 s apart: inside the matcher's 15 s, outside the fast gate's 10 s.
+        val hit = appleHit.copy(trackTimeMillis = 185_333)
+        coEvery { repository.searchApple(any(), any(), any()) } returns listOf(hit)
+        coEvery { repository.streamApple(any(), "6812560833", any()) } returns stream(format = "hls")
+
+        assertThat(fastResolver(repository).resolve(track())).isNotNull()
+        coVerify(exactly = 1) { repository.streamApple(any(), "6812560833", any()) }
+    }
+
+    @Test
+    fun `the connector-token artist is a strong match`() = runTest {
+        val resolver = cachedResolver(mockk(relaxed = true))
+        val hit = EclipseAppleTrack(
+            trackId = 1_890_207_695L,
+            trackName = "Dancin (feat. Luvli) [southstar Remix]",
+            artistName = "Aaron Smith & southstar",
+            trackTimeMillis = 173_333,
+        )
+        val dancin = TrackEntity(
+            title = "Dancin (feat. Luvli) - southstar Remix",
+            artist = "Aaron Smith, Luvli, southstar",
+            durationMs = 173_333,
+        )
+
+        assertThat(resolver.isStrongAppleHit(dancin, hit)).isTrue()
+        assertThat(resolver.strongAppleId(dancin, listOf(hit))).isEqualTo("1890207695")
     }
 
     private fun track() = TrackEntity(title = "Blinding Lights", artist = "The Weeknd", durationMs = 200_000)

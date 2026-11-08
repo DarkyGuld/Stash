@@ -241,7 +241,12 @@ class EclipseAddonStreamResolver private constructor(
             null
         }
 
-    /** Apple: at most one iTunes search, only a strong + `best()`-equal match may start its stream. */
+    /**
+     * Apple: at most one iTunes search. The strict [strongAppleId] gate decides
+     * whether Apple may win the race *early*; when it declines, this is still the
+     * normal Apple fallback and the ordinary [matchAppleId] pick may start its
+     * stream. The fast path is an optimisation, never a reason to miss the song.
+     */
     private suspend fun appleRace(
         addon: EclipseAddon,
         track: TrackEntity,
@@ -251,11 +256,15 @@ class EclipseAddonStreamResolver private constructor(
     ): CloudRace? =
         try {
             val hits = appleHits(addon, track, appleKey, speculative) ?: return null
-            val strongId = strongAppleId(track, hits) ?: return null
-            val url = mapStream(streamAppleWithRetry(addon, strongId, track.isrc))
+            val strongId = strongAppleId(track, hits)
+            val appleId = strongId ?: matchAppleId(track, hits) ?: return null
+            if (strongId == null) {
+                Log.d(TAG, "apple fast-path rejected ${hits.size} hit(s); falling back to best() -> $appleId")
+            }
+            val url = mapStream(streamAppleWithRetry(addon, appleId, track.isrc))
                 ?.let { served(addon, track, it, startedNs) }
                 ?: return null
-            CloudRace(url) { rememberAppleId(addon, track, strongId) }
+            CloudRace(url) { rememberAppleId(addon, track, appleId) }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -457,7 +466,17 @@ class EclipseAddonStreamResolver private constructor(
                 isrc = hit.isrc,
             )
         }
-        return EclipseAddonMatcher.best(track, candidates)?.id
+        val best = EclipseAddonMatcher.best(track, candidates)
+        if (best == null && hits.isNotEmpty()) {
+            Log.d(
+                TAG,
+                "apple match rejected ${hits.size} hit(s) for '${track.title}' / '${track.artist}' / " +
+                    "${track.durationMs} ms: " + hits.take(3).joinToString("; ") {
+                        "${it.trackName}|${it.artistName}|${it.trackTimeMillis}"
+                    },
+            )
+        }
+        return best?.id
             ?.let(byId::get)?.trackId?.takeIf { it > 0 }?.toString()
     }
 
@@ -467,14 +486,14 @@ class EclipseAddonStreamResolver private constructor(
      * both sides carry one; otherwise title exact, same recording markers,
      * strong artist, and both durations known within 10 s.
      */
-    private fun strongAppleId(track: TrackEntity, hits: List<EclipseAppleTrack>): String? {
+    internal fun strongAppleId(track: TrackEntity, hits: List<EclipseAppleTrack>): String? {
         val strong = hits.filter { isStrongAppleHit(track, it) }
         if (strong.size != 1) return null
         val id = strong[0].trackId.toString()
         return id.takeIf { it == matchAppleId(track, hits) }
     }
 
-    private fun isStrongAppleHit(track: TrackEntity, hit: EclipseAppleTrack): Boolean {
+    internal fun isStrongAppleHit(track: TrackEntity, hit: EclipseAppleTrack): Boolean {
         val trackIsrc = track.isrc?.trim()?.takeIf { it.isNotEmpty() }
         val hitIsrc = hit.isrc?.trim()?.takeIf { it.isNotEmpty() }
         if (trackIsrc != null && hitIsrc != null) {
@@ -495,8 +514,10 @@ class EclipseAddonStreamResolver private constructor(
         val right = EclipseAddonMatcher.normalize(b)
         if (left.isEmpty() || right.isEmpty()) return false
         if (left == right) return true
-        val leftTokens = left.split(' ').toSet()
-        val rightTokens = right.split(' ').toSet()
+        // Connector words don't identify an artist: "Aaron Smith & southstar" and
+        // "Aaron Smith, Luvli, southstar" must compare on the names only.
+        val leftTokens = left.split(' ').filterNot { it in ARTIST_CONNECTORS }.toSet()
+        val rightTokens = right.split(' ').filterNot { it in ARTIST_CONNECTORS }.toSet()
         if (leftTokens.isEmpty() || rightTokens.isEmpty()) return false
         val (shorter, longer) = if (leftTokens.size <= rightTokens.size) {
             leftTokens to rightTokens
@@ -680,7 +701,9 @@ class EclipseAddonStreamResolver private constructor(
         }
         if (addons.isEmpty()) return
         coroutineScope {
-            val slots = Semaphore(2)
+            // Sequential: the queue warm must not compete with the search view's
+            // warm or the foreground search for iPhone-side rate limits.
+            val slots = Semaphore(1)
             for (track in work) launch {
                 slots.withPermit {
                     for (addon in addons) {
@@ -751,6 +774,9 @@ class EclipseAddonStreamResolver private constructor(
 
         /** Fast mode's stricter duration tolerance: 10 s, not the matcher's 15 s. */
         private const val STRONG_DURATION_TOLERANCE_MS = 10_000L
+
+        /** Credit connectors ignored when comparing artist names. */
+        private val ARTIST_CONNECTORS = setOf("and", "feat", "ft", "with", "the")
     }
 }
 

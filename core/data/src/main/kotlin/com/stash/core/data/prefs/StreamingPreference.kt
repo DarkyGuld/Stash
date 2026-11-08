@@ -58,6 +58,7 @@ class StreamingPreference @Inject constructor(
     private val addonsFirstKey = booleanPreferencesKey("eclipse_addons_first")
     private val cloudFastestSourceKey = booleanPreferencesKey("eclipse_cloud_fastest_source")
     private val prefetchSearchResultsKey = booleanPreferencesKey("prefetch_search_results")
+    private val prefetchWholeFileKey = booleanPreferencesKey("prefetch_whole_file")
     private val qobuzEnabledKey = booleanPreferencesKey("stream_source_qobuz")
     private val tidalEnabledKey = booleanPreferencesKey("stream_source_tidal")
     private val addonsEnabledKey = booleanPreferencesKey("stream_source_eclipse_addons")
@@ -144,6 +145,15 @@ class StreamingPreference @Inject constructor(
         prefs[prefetchSearchResultsKey] ?: true
     }
 
+    /**
+     * Whole-file warm of the *next* track on Wi-Fi (60 MB cap). Off by default:
+     * it competes with the current stream and can evict the next track's first
+     * chunk from the 500 MB cache. The 2 MB chunk warm is always on.
+     */
+    val prefetchWholeFile: Flow<Boolean> = context.streamingDataStore.data.map { prefs ->
+        prefs[prefetchWholeFileKey] ?: false
+    }
+
     // Per-source switches in the streaming chain. All on by default: the chain
     // behaves exactly as before until the user turns one off (the UI's way to
     // force a source, e.g. only Cloud). No dev gate: these are user settings.
@@ -219,6 +229,8 @@ class StreamingPreference @Inject constructor(
 
     suspend fun isPrefetchSearchResults(): Boolean = prefetchSearchResults.first()
 
+    suspend fun isPrefetchWholeFile(): Boolean = prefetchWholeFile.first()
+
     suspend fun isQobuzEnabled(): Boolean = qobuzEnabled.first()
 
     suspend fun isTidalEnabled(): Boolean = tidalEnabled.first()
@@ -259,6 +271,10 @@ class StreamingPreference @Inject constructor(
 
     suspend fun setPrefetchSearchResults(value: Boolean) {
         context.streamingDataStore.edit { it[prefetchSearchResultsKey] = value }
+    }
+
+    suspend fun setPrefetchWholeFile(value: Boolean) {
+        context.streamingDataStore.edit { it[prefetchWholeFileKey] = value }
     }
 
     suspend fun setQobuzEnabled(value: Boolean) {

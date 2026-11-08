@@ -12,6 +12,9 @@ import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
@@ -377,7 +380,13 @@ class EclipseAddonClient @Inject constructor(
         for ((variantTitle, variantArtist) in EclipseAddonQuery.variants(title, artist)) {
             val term = "$variantTitle $variantArtist".trim()
             if (term.isEmpty()) continue
-            val hits = searchAppleTerm(term)
+            var hits = searchAppleTerm(term)
+            if (hits.isEmpty()) {
+                // A transient empty (throttle, a dropped body) is not a catalog miss:
+                // one short retry before recording a negative for the variant.
+                delay(APPLE_EMPTY_RETRY_MS)
+                hits = searchAppleTerm(term)
+            }
             if (hits.isNotEmpty()) return hits
         }
         return emptyList()
@@ -429,15 +438,34 @@ class EclipseAddonClient @Inject constructor(
             .addQueryParameter("limit", APPLE_SEARCH_LIMIT.toString())
             .addQueryParameter("country", country)
             .build()
-        val body = getBody(url) ?: return emptyList()
-        return parseBody(body) { text ->
-            val root = json.parseToJsonElement(text) as? JsonObject
-                ?: return@parseBody emptyList()
-            (root["results"] as? JsonArray)?.mapNotNull { element ->
-                runCatching {
-                    json.decodeFromJsonElement(EclipseAppleTrack.serializer(), element)
-                }.getOrNull()
-            } ?: emptyList()
+        // The search view, queue warm and variants can otherwise overlap into a burst.
+        return appleSearchPermits.withPermit {
+            val body = getBody(url) ?: run {
+                Log.d(TAG, "itunes country=$country empty body")
+                return@withPermit emptyList()
+            }
+            parseBody(body) { text ->
+                val root = runCatching { json.parseToJsonElement(text) as? JsonObject }.getOrNull()
+                if (root == null) {
+                    Log.d(TAG, "itunes country=$country unparseable body (${text.length} chars)")
+                    return@parseBody emptyList()
+                }
+                val results = (root["results"] as? JsonArray)?.mapNotNull { element ->
+                    runCatching {
+                        json.decodeFromJsonElement(EclipseAppleTrack.serializer(), element)
+                    }.getOrNull()
+                } ?: emptyList()
+                val declared = (root["resultCount"] as? kotlinx.serialization.json.JsonPrimitive)
+                    ?.contentOrNull
+                val top = results.firstOrNull()
+                // No URLs: just enough to see what the catalog answered.
+                Log.d(
+                    TAG,
+                    "itunes country=$country resultCount=${declared ?: results.size} parsed=${results.size} " +
+                        "top=${top?.let { "${it.trackId}|${it.trackName}|${it.artistName}|${it.trackTimeMillis}" } ?: "none"}",
+                )
+                results
+            }
         }
     }
 
@@ -693,6 +721,12 @@ class EclipseAddonClient @Inject constructor(
         private val ITUNES_SEARCH_URL = "https://itunes.apple.com/search".toHttpUrlOrNull()!!
         private const val APPLE_SEARCH_LIMIT = 10
         private const val APPLE_FALLBACK_COUNTRY = "US"
+
+        /** One empty-result retry before a variant is treated as a catalog miss. */
+        private const val APPLE_EMPTY_RETRY_MS = 350L
+
+        /** At most two iTunes searches in flight process-wide. */
+        private val appleSearchPermits = Semaphore(2)
 
         /** Minted access tokens are truncated by this much before expiry. */
         private const val EXPIRY_SKEW_MS = 30_000L

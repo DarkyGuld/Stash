@@ -281,11 +281,24 @@ class PrefetchOrchestratorTest {
             coEvery { dataSaverApplies() } returns false
             coEvery { isMeteredNetwork() } returns false
         }
+        val wholeFileOn: StreamingPreference = mockk { coEvery { isPrefetchWholeFile() } returns true }
         val fullWarmer: EclipseFirstChunkPrefetcher = mockk(relaxed = true)
-        PrefetchOrchestrator(streamResolver, StreamUrlCache(), trackDao, unmeteredPolicy, firstChunk = fullWarmer)
-            .prefetchUrlsAhead(this, listOf(5L))
+        PrefetchOrchestrator(
+            streamResolver, StreamUrlCache(), trackDao, unmeteredPolicy,
+            firstChunk = fullWarmer, streamingPreference = wholeFileOn,
+        ).prefetchUrlsAhead(this, listOf(5L))
         advanceUntilIdle()
         coVerify(exactly = 1) { fullWarmer.warm(5L, url, full = true) }
+
+        // Default off: even unmetered, only the first chunk.
+        val wholeFileOff: StreamingPreference = mockk { coEvery { isPrefetchWholeFile() } returns false }
+        val chunkOnWifi: EclipseFirstChunkPrefetcher = mockk(relaxed = true)
+        PrefetchOrchestrator(
+            streamResolver, StreamUrlCache(), trackDao, unmeteredPolicy,
+            firstChunk = chunkOnWifi, streamingPreference = wholeFileOff,
+        ).prefetchUrlsAhead(this, listOf(5L))
+        advanceUntilIdle()
+        coVerify(exactly = 1) { chunkOnWifi.warm(5L, url, full = false) }
 
         val meteredPolicy: StreamQualityPolicy = mockk {
             coEvery { dataSaverApplies() } returns false
@@ -296,6 +309,36 @@ class PrefetchOrchestratorTest {
             .prefetchUrlsAhead(this, listOf(5L))
         advanceUntilIdle()
         coVerify(exactly = 1) { chunkWarmer.warm(5L, url, full = false) }
+    }
+
+    @Test
+    fun list_warmup_does_not_cancel_the_queue_next_track_warm() = runTest {
+        val dao = mockk<TrackDao>()
+        val queueTrack = TrackEntity(id = 5L, title = "Next", artist = "A", durationMs = 200_000, isStreamable = true)
+        val searchTrack = TrackEntity(id = 6L, title = "Search", artist = "B", durationMs = 200_000, isStreamable = true)
+        coEvery { dao.getById(5L) } returns queueTrack
+        coEvery { dao.getById(6L) } returns searchTrack
+        val url5 = StreamUrl(url = "https://cdn.test/5.flac", expiresAtMs = Long.MAX_VALUE, origin = "addon:Cloud")
+        val url6 = StreamUrl(url = "https://cdn.test/6.flac", expiresAtMs = Long.MAX_VALUE, origin = "addon:Cloud")
+        coEvery {
+            streamResolver.resolve(queueTrack, allowYouTube = true, allowYtDlp = true, speculative = true)
+        } coAnswers {
+            delay(1_000)
+            url5
+        }
+        coEvery {
+            streamResolver.resolve(searchTrack, allowYouTube = true, allowYtDlp = true, speculative = true)
+        } returns url6
+        val cache = StreamUrlCache()
+        val orchestrator = PrefetchOrchestrator(streamResolver, cache, dao)
+
+        orchestrator.prefetchUrlsAhead(this, listOf(5L))
+        // Opportunistic warmup while the queue warm is in flight: it must not cancel it.
+        orchestrator.warmVisibleRows(this, listOf(6L))
+        advanceUntilIdle()
+
+        assertThat(cache.get(5L)).isEqualTo(url5)
+        assertThat(cache.get(6L)).isNull()
     }
 
     @Test

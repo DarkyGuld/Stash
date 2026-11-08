@@ -63,6 +63,8 @@ class PrefetchOrchestrator @Inject constructor(
     private val firstChunk: EclipseFirstChunkPrefetcher? = null,
     /** Apple-id search warm for search results; null in hand-built tests. */
     private val eclipseStreamResolver: EclipseAddonStreamResolver? = null,
+    /** Read for the whole-file preference; null in hand-built tests (off, as default). */
+    private val streamingPreference: com.stash.core.data.prefs.StreamingPreference? = null,
 ) {
     /**
      * Track ids for which a prefetch resolve has been attempted in the
@@ -108,8 +110,11 @@ class PrefetchOrchestrator @Inject constructor(
                 // same cache the player reads — whole file (60 MB cap) on unmetered,
                 // first ~2 MB on mobile data. HLS/DASH skip this.
                 if (resolved.origin?.startsWith("${EclipseAddonStreamResolver.ORIGIN}") == true) {
+                    // The next track always gets its first chunk. The whole file only
+                    // with the explicit preference on (and unmetered).
                     val unmetered = qualityPolicy?.isMeteredNetwork() == false
-                    firstChunk?.warm(id, resolved, full = unmetered)
+                    val wholeFile = unmetered && streamingPreference?.isPrefetchWholeFile() == true
+                    firstChunk?.warm(id, resolved, full = wholeFile)
                 }
                 Log.d(TAG, "Prefetched stream URL for upcoming track $id")
             }
@@ -127,6 +132,12 @@ class PrefetchOrchestrator @Inject constructor(
         searchAppleJob?.cancel()
         val ids = trackIds.filter { it > 0 }.distinct()
         if (ids.isEmpty()) return
+        // Queue next-track warm has priority: don't compete with it or let an
+        // opportunistic warmup cancel it.
+        if (urlPrefetchJob?.isActive == true) {
+            Log.d(TAG, "list warmup skipped: queue prefetch is active")
+            return
+        }
 
         searchAppleJob = scope.launch {
             val tracks = ids.take(SEARCH_APPLE_WARM).mapNotNull { trackDao.getById(it) }
