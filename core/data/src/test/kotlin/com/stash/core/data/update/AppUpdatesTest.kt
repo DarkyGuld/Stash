@@ -21,7 +21,7 @@ class AppUpdatesTest {
         assertEquals(171_411_798L, u.sizeBytes)
         // As written, line ends made plain: ReleaseNotes reads them for the sheet.
         assertEquals("## What's new\n- **Paste links** from [Spotify](https://x)\n\n\n\n- Sync tab", u.notes)
-        assertEquals("https://github.com/rawnaldclark/Stash/releases/tag/v0.9.122", u.pageUrl)
+        assertEquals("https://github.com/DarkyGuld/Stash/releases/tag/v0.9.122", u.pageUrl)
     }
 
     @Test

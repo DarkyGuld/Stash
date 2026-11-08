@@ -98,9 +98,9 @@ class UpdateCheckWorker(
         private const val PREFS_NAME = "update_check_prefs"
         private const val KEY_LAST_NOTIFIED_VERSION = "last_notified_version"
         private const val RELEASES_URL =
-            "https://api.github.com/repos/rawnaldclark/Stash/releases/latest"
+            "https://api.github.com/repos/DarkyGuld/Stash/releases/latest"
         private const val DOWNLOAD_URL =
-            "https://github.com/rawnaldclark/Stash/releases/latest"
+            "https://github.com/DarkyGuld/Stash/releases/latest"
 
         /** Lenient JSON parser that ignores unknown keys from the GitHub API. */
         private val json = Json { ignoreUnknownKeys = true }

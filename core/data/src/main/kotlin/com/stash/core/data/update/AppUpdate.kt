@@ -63,7 +63,7 @@ object AppUpdates {
     fun releasePage(tag: String): String = "$RELEASES/tag/${tag.trim()}"
 
     /** The release page for every release, when the tag isn't known. */
-    const val RELEASES = "https://github.com/rawnaldclark/Stash/releases"
+    const val RELEASES = "https://github.com/DarkyGuld/Stash/releases"
 
     /** "171 MB". */
     fun sizeLabel(bytes: Long): String = if (bytes <= 0) "" else "${(bytes + 500_000) / 1_000_000} MB"
