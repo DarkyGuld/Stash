@@ -521,12 +521,16 @@ class SearchDownloadCoordinator @Inject constructor(
         // Lossy AAC rungs: fetched by the downloader and checked as AAC, not FLAC.
         val isLossyAac = match.sourceId == JioSaavnResolver.SOURCE_ID ||
             match.sourceId == com.stash.data.download.lossless.tidal.TidalAacResolver.SOURCE_ID
-        if (isLossyAac || match.isDash) {
+        if (isLossyAac || match.isDash || match.isHls) {
             // Use the shared OkHttp downloader rather than Media3's redirect-
             // following HTTP source. The Jio transport disables redirects so
             // the trusted aac.saavncdn.com URL cannot pivot to another host.
-            // A DASH match (Tidal) is a manifest, not the file: only the
-            // downloader knows to fetch its segments and remux them to FLAC.
+            // A DASH match (Tidal) or an HLS match (Cloud) is a manifest, not the
+            // file: only the downloader knows to fetch its segments and concatenate
+            // (HLS) or remux (DASH). The preview-cache copy above cannot read either.
+            if (match.isHls) {
+                Log.d(TAG, "lossless HLS fetch for ${match.sourceId}")
+            }
             val fetched = losslessUrlDownloader.download(match, tempFile)
             fetched.exceptionOrNull()?.let { error ->
                 if (error is CancellationException) throw error

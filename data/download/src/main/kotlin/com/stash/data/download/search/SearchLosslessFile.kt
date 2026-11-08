@@ -24,7 +24,10 @@ internal object SearchLosslessFile {
      * mix files. Never equal to the preview's `lossless:<videoId>` key.
      */
     fun cacheKey(match: SourceResult): String {
-        val file = match.sourceTrackId?.takeIf { it.isNotBlank() } ?: "url:${match.downloadUrl}"
+        // Never the signed URL: its query carries exp/sig/token. Host+path only,
+        // and the same file with a fresh signature keeps the same key.
+        val file = match.sourceTrackId?.takeIf { it.isNotBlank() }
+            ?: "url:${match.downloadUrl.substringBefore('?').substringBefore('#')}"
         val f = match.format
         return "lossless-dl:${match.sourceId}:$file:${f.codec}/${f.bitsPerSample}/${f.sampleRateHz}"
     }

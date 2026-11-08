@@ -239,6 +239,54 @@ class SearchDownloadCoordinatorCompletionTest {
     }
 
     @Test
+    fun `a search HLS match uses the shared HLS downloader, not the preview cache`() = runTest {
+        coEvery { losslessPrefs.downloadModeNow() } returns com.stash.core.model.DownloadMode.LOSSLESS
+        coEvery { losslessPrefs.youtubeFallbackEnabledNow() } returns false
+        coEvery { registry.resolve(any(), any()) } returns SourceResult(
+            sourceId = "eclipse-addon",
+            downloadUrl = "https://addons.test/x.m3u8?exp=1&sig=secret",
+            format = AudioFormat("flac", 0, 44_100, 24, fileExtension = "m4a"),
+            confidence = 1f,
+            isHls = true,
+        )
+        coEvery { losslessUrlDownloader.download(any(), any(), any()) } coAnswers {
+            val file = arg<File>(1)
+            file.parentFile?.mkdirs()
+            file.writeText("hls")
+            Result.success(file)
+        }
+        coEvery { audioDurationExtractor.extract(any()) } returns AudioMetadata(
+            durationMs = 200_000L,
+            bitrateKbps = 0,
+            format = "flac",
+            sampleRateHz = 44_100,
+            bitsPerSample = 24,
+        )
+        coEvery { trackFinalizer.finalizeFile(any(), any(), any(), any()) } returns
+            TrackFinalizer.FinalizeResult.Success(
+                committed = CommittedTrack(
+                    filePath = "/library/Sample Artist/Sample.m4a",
+                    sizeBytes = 4096L,
+                ),
+                meta = AudioMetadata(
+                    durationMs = 200_000L,
+                    bitrateKbps = 0,
+                    format = "flac",
+                    sampleRateHz = 44_100,
+                    bitsPerSample = 24,
+                ),
+            )
+
+        newSubject().download(track()).toList()
+
+        coVerify(exactly = 1) {
+            losslessUrlDownloader.download(match { it.isHls }, any(), any())
+        }
+        // The preview-cache copy path is used by progressive matches only.
+        coVerify(exactly = 0) { previewCache.startReadWrite(any(), any(), any()) }
+    }
+
+    @Test
     fun `Opus mode goes straight to YouTube, never JioSaavn`() = runTest {
         arrangeFinalizedYtDlpDownload()
         coEvery { losslessPrefs.downloadModeNow() } returns com.stash.core.model.DownloadMode.OPUS
