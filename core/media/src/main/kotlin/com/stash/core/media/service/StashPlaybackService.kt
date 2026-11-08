@@ -63,6 +63,7 @@ import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.guava.future
 import javax.inject.Inject
 import androidx.core.app.ServiceCompat
@@ -90,6 +91,69 @@ class StashPlaybackService : MediaLibraryService() {
     @Inject lateinit var hiResOutputController: com.stash.core.media.output.HiResOutputController
     @Inject lateinit var trackDao: TrackDao
     @Inject lateinit var streamingPreference: com.stash.core.data.prefs.StreamingPreference
+    /** The media-source pick needs to know, synchronously, whether an addon may answer HLS. */
+    @Inject lateinit var eclipseAddonRepository: com.stash.core.data.addons.EclipseAddonRepository
+
+    /** Logcat-only tap → first-audio measurement (see [StashLatency]). */
+    private val stashLatency = com.stash.core.media.service.StashLatency()
+
+    private fun latencyTrackId(item: MediaItem?): Long? =
+        item?.mediaMetadata?.extras?.getLong(EXTRA_TRACK_ID, -1L)?.takeIf { it > 0 }
+            ?: item?.mediaId?.toLongOrNull()?.takeIf { it > 0 }
+
+    private fun markLatencyStart(item: MediaItem?) {
+        val mediaItem = item ?: return
+        val id = latencyTrackId(mediaItem) ?: return
+        stashLatency.start(
+            trackId = id,
+            title = mediaItem.mediaMetadata.title?.toString(),
+            origin = mediaItem.mediaMetadata.extras?.getString(EXTRA_STREAM_ORIGIN),
+        )
+    }
+
+    private fun latencyFirstAudio(player: Player?) {
+        stashLatency.firstAudio(latencyTrackId(player?.currentMediaItem))
+    }
+
+    @Inject lateinit var eclipseAddonStreamResolver: com.stash.core.media.streaming.EclipseAddonStreamResolver
+
+    /** The in-flight Apple-id warm for the queue ahead; a queue change cancels it. */
+    private var appleWarmJob: Job? = null
+
+    /**
+     * Warms Apple ids (iTunes search only) for the next few queue items, so the
+     * one-time ~200 ms lookup is done before the user reaches them. Replaced (and
+     * the old work cancelled) on every track change.
+     */
+    private fun warmAppleIdsAhead(player: Player?) {
+        val ids = queueTrackIdsAhead(player, APPLE_WARM_AHEAD)
+        if (ids.isEmpty()) return
+        appleWarmJob?.cancel()
+        appleWarmJob = serviceScope.launch {
+            val tracks = withContext(Dispatchers.IO) { ids.mapNotNull { trackDao.getById(it) } }
+            eclipseAddonStreamResolver.warmAppleIds(tracks)
+        }
+    }
+
+    /** The next [count] queue items' track ids (Apple-id warm and URL prefetch). */
+    private fun queueTrackIdsAhead(player: Player?, count: Int): List<Long> {
+        val p = player ?: return emptyList()
+        val index = p.currentMediaItemIndex
+        if (index < 0) return emptyList()
+        return (1..count)
+            .mapNotNull { (index + it).takeIf { i -> i < p.mediaItemCount }?.let(p::getMediaItemAt) }
+            .mapNotNull(::latencyTrackId)
+    }
+
+    /**
+     * Warms the resolved stream URL for the next couple of tracks as soon as the
+     * queue knows them, so auto-advance and a manual skip both hit the cache.
+     */
+    private fun prefetchUrlsAhead(player: Player?) {
+        val ids = queueTrackIdsAhead(player, URL_PREFETCH_AHEAD)
+        if (ids.isEmpty()) return
+        prefetchOrchestrator.prefetchUrlsAhead(serviceScope, ids)
+    }
 
     /**
      * Download mode just switched on (review on #731): a stream already open keeps reading on the connection it has, and
@@ -189,6 +253,12 @@ class StashPlaybackService : MediaLibraryService() {
     @Inject lateinit var widgetSink: com.stash.core.media.widget.NowPlayingWidgetSink
 
     companion object {
+        /** How many queue items ahead the Apple-id warm looks (iTunes search only). */
+        private const val APPLE_WARM_AHEAD = 3
+
+        /** How many upcoming tracks get their resolved stream URL warmed (one Cloud call each). */
+        private const val URL_PREFETCH_AHEAD = 2
+
         /**
          * The intent that opens the app on the full player: what a tap on the media notification
          * sends (the session activity) and what the home screen widget's cover and title send. Null
@@ -350,6 +420,13 @@ class StashPlaybackService : MediaLibraryService() {
          */
         private const val PREPARE_AT_MS = 90_000L
 
+        /**
+         * With crossfade off: how close to the end the prepared spare is swapped in.
+         * The poll is 250 ms, so this starts the next song at most ~0.4 s early —
+         * the point is to arrive there already prepared, not to cut the song.
+         */
+        private const val HARD_CUT_LEAD_MS = 400L
+
         /** Slack left on the outgoing when the fade ends, so it doesn't hit its natural end. */
         private const val HANDOFF_MARGIN_MS = 500L
 
@@ -436,6 +513,12 @@ class StashPlaybackService : MediaLibraryService() {
 
     /** mediaId the spare is currently primed for, so we don't re-prepare it. */
     @Volatile private var crossfadePreparedId: String? = null
+
+    /** Addon generation the spare was primed under; a change re-primes it. */
+    @Volatile private var earlyPrimeGeneration: Long = -1
+
+    /** How far before the song's end the spare was primed (for the handoff log). */
+    private var earlyPrimeAtMs: Long = 0
 
     /** The crossfade preference as last read; [crossfadeEnabled] is this AND not suspended. */
     @Volatile private var crossfadePrefEnabled = false
@@ -553,6 +636,12 @@ class StashPlaybackService : MediaLibraryService() {
             updateCustomLayout()
             onTrackTransitionForLoudness(mediaItem)
             prefetchOrchestrator.resetSession()
+            // Tap → first audio: a real track change starts the measurement; a seek doesn't.
+            if (reason != Player.MEDIA_ITEM_TRANSITION_REASON_SEEK) {
+                markLatencyStart(mediaItem)
+                warmAppleIdsAhead(crossfadeEngine?.masterPlayer)
+                prefetchUrlsAhead(crossfadeEngine?.masterPlayer)
+            }
             // While casting the master is stopped; castListener drives presence and the poll.
             if (isCasting) return
             val master = crossfadeEngine?.masterPlayer
@@ -571,6 +660,7 @@ class StashPlaybackService : MediaLibraryService() {
             val master = crossfadeEngine?.masterPlayer
             updateDiscordPresence(master?.currentMediaItem, isPlaying)
             if (isPlaying && master != null) {
+                stashLatency.firstAudio(latencyTrackId(master.currentMediaItem))
                 startPrefetchPoll(master)
                 startCrossfadePoll(master)
             } else {
@@ -586,6 +676,7 @@ class StashPlaybackService : MediaLibraryService() {
 
         override fun onPlaybackStateChanged(playbackState: Int) {
             refreshPlayerIdle()
+            if (playbackState == Player.STATE_READY) latencyFirstAudio(crossfadeEngine?.masterPlayer)
         }
 
         override fun onPlayerError(error: PlaybackException) {
@@ -762,9 +853,12 @@ class StashPlaybackService : MediaLibraryService() {
             resolver = streamResolver,
             urlCache = streamUrlCache,
             trackDao = trackDao,
-            // Tidal may answer with a DASH MPD, so with a server set placeholders
-            // resolve before their media source is chosen.
-            resolveBeforeSourcePick = tidalStreamResolver::enabledHint,
+            // Tidal may answer with a DASH MPD, and an Eclipse addon with an HLS
+            // manifest, so while either is configured placeholders resolve before
+            // their media source is chosen.
+            resolveBeforeSourcePick = {
+                tidalStreamResolver.enabledHint() || eclipseAddonRepository.hasEnabledAddonNow()
+            },
             // Download mode plays only files on the phone, whatever queued a stream.
             streamAllowed = ::streamAllowedNow,
             // The user's own cloud files: pre-authenticated links (Dropbox, OneDrive), or Google
@@ -1560,10 +1654,12 @@ class StashPlaybackService : MediaLibraryService() {
     private fun startCrossfadePoll(player: Player) {
         crossfadePollJob?.cancel()
         crossfadePollJob = null
-        if (!crossfadeEnabled) return
+        // Runs even with crossfade off: the early-prime/instant-handoff path needs
+        // the same tick. `evaluateCrossfade` itself still no-ops unless enabled.
         crossfadePollJob = serviceScope.launch {
             while (isActive && player.isPlaying) {
-                evaluateCrossfade(player)
+                evaluateEarlyHandoff(player)
+                if (crossfadeEnabled) evaluateCrossfade(player)
                 delay(CROSSFADE_POLL_INTERVAL_MS)
             }
         }
@@ -1579,13 +1675,9 @@ class StashPlaybackService : MediaLibraryService() {
         val wasEnabled = crossfadeEnabled
         crossfadeEnabled = enabled
         if (enabled == wasEnabled) return
-        val master = crossfadeEngine?.masterPlayer
-        if (enabled) {
-            if (master?.isPlaying == true) startCrossfadePoll(master)
-        } else {
-            crossfadePollJob?.cancel()
-            crossfadePollJob = null
-        }
+        // The poll also drives the early prime/instant handoff, so turning
+        // crossfade off must not stop it; the tick just skips the fade.
+        crossfadeEngine?.masterPlayer?.takeIf { it.isPlaying }?.let { startCrossfadePoll(it) }
     }
 
     /** Collector body for the crossfade preference; Listen Together can hold crossfade off without writing it. */
@@ -1649,6 +1741,80 @@ class StashPlaybackService : MediaLibraryService() {
      *  - **fire**: inside the fade window, once the spare is buffered, run the
      *    equal-power fade + role-swap via [CrossfadeEngine.performTransition].
      */
+    /**
+     * Early prime + instant handoff. Runs on every poll tick, crossfade on or
+     * off:
+     *  - Prime the spare on the immediate next item as soon as it is known
+     *    (crossfade's own 90 s prime then finds it already prepared).
+     *  - With crossfade off, at the very end of the song, hard-cut onto the
+     *    ready spare: ExoPlayer's ~400 ms prepare/decoder start is already paid.
+     * Cast, Listen Together, bit-perfect and the end-of-track sleep hold all
+     * fall back to the normal auto-advance.
+     */
+    @OptIn(UnstableApi::class)
+    private fun evaluateEarlyHandoff(player: Player) {
+        val engine = crossfadeEngine ?: return
+        if (engine.isTransitioning()) return
+        if (player.repeatMode == Player.REPEAT_MODE_ONE) return
+        if (player.duration <= 0) return
+        val nextIndex = player.nextMediaItemIndex
+        if (nextIndex == C.INDEX_UNSET) return
+        val nextItem = runCatching { player.getMediaItemAt(nextIndex) }.getOrNull() ?: return
+
+        // Addon toggled/removed/reordered: the spare's URL/decision may be stale.
+        val generation = eclipseAddonRepository.addonGeneration.value
+        if (earlyPrimeGeneration != generation) {
+            if (crossfadePreparedId != null) {
+                engine.cancelTransition()
+                crossfadePreparedId = null
+            }
+            earlyPrimeGeneration = generation
+        }
+
+        val nextId = nextItem.mediaId
+        if (isNextResolved(nextItem) && !engine.isPreparedFor(nextId)) {
+            engine.prepareNext(nextItem)
+            crossfadePreparedId = nextId
+            val speed = player.playbackParameters.speed
+            earlyPrimeAtMs = mediaToWallMs(player.duration - player.currentPosition, speed)
+            android.util.Log.d(
+                "Crossfade",
+                "early prime $nextId at $earlyPrimeAtMs ms before end (crossfade=$crossfadeEnabled)",
+            )
+        }
+
+        // Crossfade's own path owns the seam when it is on.
+        if (crossfadeEnabled) return
+
+        val speed = player.playbackParameters.speed
+        val remaining = mediaToWallMs(player.duration - player.currentPosition, speed)
+        if (remaining > HARD_CUT_LEAD_MS || !engine.isPreparedFor(nextId) || !engine.isNextReady()) return
+
+        if (isCasting || crossfadeSuspended || crossfadeHeldForBitPerfect || crossfadeHeldForSleep) {
+            android.util.Log.d("Crossfade", "early handoff fallback: a hold is active")
+            return
+        }
+
+        val primedFor = earlyPrimeAtMs
+        crossfadePollJob?.cancel()
+        crossfadePollJob = null
+        val startedNs = System.nanoTime()
+        val swapped = engine.performHardCut { newMaster -> onCrossfadeSwap(newMaster) }
+        if (swapped) {
+            val master = crossfadeEngine?.masterPlayer
+            markLatencyStart(master?.currentMediaItem)
+            stashLatency.firstAudio(latencyTrackId(master?.currentMediaItem))
+            android.util.Log.i(
+                "Crossfade",
+                "early handoff: primed ${primedFor} ms before end, handoff in " +
+                    "${(System.nanoTime() - startedNs) / 1_000_000} ms",
+            )
+        } else {
+            android.util.Log.i("Crossfade", "early handoff fallback: spare not ready")
+            startCrossfadePoll(player)
+        }
+    }
+
     @OptIn(UnstableApi::class)
     private fun evaluateCrossfade(player: Player) {
         val engine = crossfadeEngine ?: return
@@ -2433,6 +2599,8 @@ class StashPlaybackService : MediaLibraryService() {
         ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
             crossfadeEngine?.cancelTransition()
             crossfadePreparedId = null
+            // A queue set is a new start for the song that will play first.
+            mediaItems.getOrNull(startIndex.coerceAtLeast(0))?.let { markLatencyStart(it) }
             // A queue set by another controller (the car, a media button) is not the app's big queue:
             // its shuffle is Media3's own again. The app asks for it again with each big queue it sets.
             if (controller.packageName != packageName) {

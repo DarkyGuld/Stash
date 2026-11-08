@@ -469,6 +469,57 @@
     <string name="settings_reset_lossless_attempts">Reset lossless attempts</string>
     <string name="settings_equalizer_title">Equalizer</string>
 
+    <!-- Settings > Audio & Quality > Lossless sources > Sources -->
+    <string name="settings_sources_title">Sources</string>
+    <string name="settings_sources_desc">Turn a source off to remove it from the fallback chain. With JioSaavn and YouTube off, playback stays with the remaining sources, so Cloud can fail instead of falling back to OPUS or YouTube.</string>
+    <string name="settings_source_qobuz">Qobuz</string>
+    <string name="settings_source_tidal">Tidal</string>
+    <string name="settings_source_eclipse_addons">Eclipse addons</string>
+    <string name="settings_source_jiosaavn">JioSaavn</string>
+    <string name="settings_source_youtube">YouTube</string>
+
+    <!-- Settings > Audio & Quality > Lossless sources > Eclipse addons -->
+    <string name="settings_addons_title">Eclipse addons</string>
+    <string name="settings_addons_desc">Optional music sources from Eclipse addons. Stash tries them after Qobuz/Tidal and before the lossy fallbacks, in the order they\'re listed.</string>
+    <string name="settings_addons_empty">No addons yet. Paste an addon manifest URL above.</string>
+    <string name="settings_addons_first_title">Play Eclipse addons first</string>
+    <string name="settings_addons_first_desc">Tries your Eclipse addons before Qobuz/Tidal, so Cloud starts without the extra misses. Falls back to the normal chain if an addon can\'t serve the track.</string>
+    <string name="settings_cloud_fastest_title">Cloud: fastest source</string>
+    <string name="settings_cloud_fastest_desc">Start the Apple stream as soon as iTunes returns an exact match, in parallel with Tidal. Off: Tidal is always tried first.</string>
+    <string name="settings_addon_url_label">Addon URL</string>
+    <string name="settings_addon_url_placeholder">https://…/manifest.json</string>
+    <string name="settings_addon_add">Add</string>
+    <string name="settings_addon_adding">Adding…</string>
+    <string name="settings_addon_remove">Remove addon</string>
+    <string name="settings_addon_move_up">Move up</string>
+    <string name="settings_addon_move_down">Move down</string>
+    <string name="settings_addon_enabled">Enabled</string>
+    <string name="settings_addon_disabled">Off</string>
+    <string name="settings_addon_settings">Addon settings</string>
+    <string name="settings_addon_settings_title">%1$s settings</string>
+    <string name="settings_addon_setting_text_hint">Enter a value</string>
+    <string name="settings_addon_setting_per_network">Applies to this device</string>
+
+    <!-- Settings > Audio & Quality > Lossless sources > Eclipse account -->
+    <string name="settings_eclipse_account_title">Eclipse account</string>
+    <string name="settings_eclipse_signed_in">Signed in to Eclipse</string>
+    <string name="settings_eclipse_signed_in_as">Signed in as %1$s</string>
+    <string name="settings_eclipse_sign_in_desc">Sign in to use Eclipse Cloud addons.</string>
+    <string name="settings_eclipse_sign_in_google">Google</string>
+    <string name="settings_eclipse_sign_in_discord">Discord</string>
+    <string name="settings_eclipse_sign_in_email">Sign in with email</string>
+    <string name="settings_eclipse_email_label">Eclipse email</string>
+    <string name="settings_eclipse_password_label">Password</string>
+    <string name="settings_eclipse_sign_in">Sign in</string>
+    <string name="settings_eclipse_signing_in">Signing in…</string>
+    <string name="settings_eclipse_forgot_password">Forgot password?</string>
+    <string name="settings_eclipse_paste_token">Paste token</string>
+    <string name="settings_eclipse_token_label">Eclipse account token</string>
+    <string name="settings_eclipse_save">Save</string>
+    <string name="settings_eclipse_sign_out">Sign out</string>
+    <string name="settings_eclipse_signin_title">Sign in to Eclipse</string>
+    <string name="settings_eclipse_login_failed">Sign-in didn\'t return a token. Try again or paste a token.</string>
+
     <!-- Settings > Audio & Quality > Lossless tiers -->
     <string name="settings_lossless_tier_max">Max (24-bit/192 kHz)</string>
     <string name="settings_lossless_tier_max_hint">~140 MB / 4 min</string>

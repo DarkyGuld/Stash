@@ -346,6 +346,53 @@ class CrossfadeEngine(
     }
 
     /**
+     * Hard cut onto an already-prepared spare: the next-track handoff with
+     * crossfade off. The spare becomes the master at position 0 with no ramp;
+     * the outgoing is stopped and cleared. Returns false (leaving both players
+     * untouched) unless the spare is prepared, READY, and is exactly the
+     * outgoing's next item — the caller then falls back to the normal
+     * auto-advance.
+     */
+    fun performHardCut(onSwap: (ExoPlayer) -> Unit): Boolean {
+        if (transitioning || !::playerB.isInitialized || playerB.mediaItemCount == 0) return false
+        val outgoing = playerA
+        val incoming = playerB
+        val incomingIndex = incomingIndexIn(outgoing, incoming) ?: return false
+        if (incoming.playbackState != Player.STATE_READY) return false
+
+        transitioning = true
+        val startedNs = System.nanoTime()
+        outgoing.pauseAtEndOfMediaItems = true
+        outgoing.volume = 0f
+        incoming.volume = 1f
+        incoming.playbackParameters = outgoing.playbackParameters
+        incoming.playWhenReady = true
+        incoming.play()
+
+        transferQueue(from = outgoing, to = incoming, incomingIndex = incomingIndex)
+        outgoing.removeListener(masterFocusListener)
+        incoming.addListener(masterFocusListener)
+        incoming.pauseAtEndOfMediaItems = false
+        playerA = incoming
+        playerB = outgoing
+        if (incoming.playWhenReady) requestFocus()
+        onSwap(playerA)
+
+        outgoing.pauseAtEndOfMediaItems = false
+        outgoing.playWhenReady = false
+        outgoing.stop()
+        outgoing.clearMediaItems()
+        outgoing.volume = 1f
+        transitioning = false
+        android.util.Log.i(
+            "Crossfade",
+            "hard-cut handoff in ${(System.nanoTime() - startedNs) / 1_000_000} ms " +
+                "(new master=${tag(playerA)})",
+        )
+        return true
+    }
+
+    /**
      * [outgoing]'s timeline index of the song [incoming] is playing, or null
      * when that song is no longer the outgoing's NEXT one.
      *

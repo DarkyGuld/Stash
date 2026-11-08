@@ -9,6 +9,13 @@ import com.stash.core.auth.youtube.YouTubeCookieHelper
 import android.content.Context
 import android.net.Uri
 import com.stash.core.data.db.dao.TrackDao
+import com.stash.core.data.addons.AddAddonError
+import com.stash.core.data.addons.AddAddonException
+import com.stash.core.data.addons.EclipseAccountManager
+import com.stash.core.data.addons.EclipseAddon
+import com.stash.core.data.addons.EclipseAddonRepository
+import com.stash.core.data.addons.EclipseAuthError
+import com.stash.core.data.addons.EclipseAuthException
 import com.stash.core.data.diagnostics.CrashFileStore
 import com.stash.core.data.prefs.DownloadNetworkPreference
 import com.stash.core.data.prefs.LikePreferences
@@ -16,6 +23,7 @@ import com.stash.core.data.social.Destination
 import com.stash.core.data.prefs.QualityPreference
 import com.stash.core.data.prefs.StartTab
 import com.stash.core.data.prefs.StoragePreference
+import com.stash.core.data.prefs.StreamSourceToggle
 import com.stash.core.data.prefs.ThemePreference
 import com.stash.core.data.prefs.YouTubeHistoryPreference
 import com.stash.core.data.youtube.YouTubeHistoryScrobbler
@@ -76,6 +84,20 @@ import javax.inject.Inject
 /** Shown when a connect call failed with an error (e.g. the sign-in could not be stored) rather than a rejection. */
 private const val CONNECT_SAVE_FAILED =
     "Couldn't finish connecting on this device. Please try again."
+
+// Eclipse addon install failures. Short and specific enough to act on without a dialog.
+private const val ADDON_URL_BLANK = "Enter the addon's URL."
+private const val ADDON_URL_INVALID = "That isn't a valid https addon URL."
+private const val ADDON_UNREACHABLE = "Couldn't reach that addon. Check the URL and try again."
+private const val ADDON_INVALID_MANIFEST = "That link isn't a music addon (it needs search and stream)."
+private const val ADDON_DUPLICATE = "That addon is already installed."
+private const val ADDON_GENERIC = "Couldn't add that addon."
+private const val ECLIPSE_TOKEN_TEST_FAILED =
+    "Couldn't use that Eclipse account token. Check it hasn't expired and try again."
+private const val ECLIPSE_LOGIN_MISSING = "Enter your Eclipse email and password."
+private const val ECLIPSE_LOGIN_REJECTED = "Wrong email or password."
+private const val ECLIPSE_LOGIN_NETWORK = "Couldn't reach Eclipse. Check your connection and try again."
+private const val ECLIPSE_LOGIN_SERVER = "Eclipse couldn't sign you in. Try again in a moment."
 
 /**
  * ViewModel for the Settings screen.
@@ -152,6 +174,12 @@ class SettingsViewModel @Inject constructor(
     private val syncStateManager: com.stash.core.data.sync.SyncStateManager,
     /** The line under each "Like on … too" switch, and its "tap to retry". */
     private val likeCoordinator: com.stash.core.data.social.LikeCoordinator,
+    /** Installed Eclipse addons (Settings › Lossless sources). */
+    private val eclipseAddonRepository: EclipseAddonRepository,
+    /** The Eclipse Music account token, for account-bound addons. */
+    private val eclipseAccountManager: EclipseAccountManager,
+    /** Cached stream URLs: addon changes invalidate every one, or a disabled addon's URL can still play. */
+    private val streamUrlCache: com.stash.core.media.streaming.StreamUrlCache,
 ) : ViewModel() {
 
     // ── ListenBrainz ────────────────────────────────────────────────────────
@@ -239,6 +267,256 @@ class SettingsViewModel @Inject constructor(
     fun onRetryLikeMirror(destination: Destination) {
         viewModelScope.launch { likeCoordinator.retry(destination) }
     }
+
+    // ── Eclipse addons ─────────────────────────────────────────────────────
+    //
+    // Standalone flows, like ListenBrainz's: they belong to the Lossless
+    // sources screen alone, and the addon list changes only when that screen
+    // installs, removes or reorders one.
+
+    /** Installed addons, in stream-fallback order. */
+    val addons: StateFlow<List<EclipseAddon>> = eclipseAddonRepository.addons.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5_000),
+        initialValue = emptyList(),
+    )
+
+    private val _addonBusy = MutableStateFlow(false)
+
+    /** An install is in flight (the manifest fetch); the add field shows a spinner. */
+    val addonBusy: StateFlow<Boolean> = _addonBusy
+
+    private val _addonError = MutableStateFlow<String?>(null)
+
+    /** The last add/remove failure, already phrased for the UI; null when there is none. */
+    val addonError: StateFlow<String?> = _addonError
+
+    /** Installs an addon from a pasted base URL or `manifest.json` URL. */
+    fun onAddAddon(raw: String) {
+        if (raw.isBlank()) {
+            _addonError.value = ADDON_URL_BLANK
+            return
+        }
+        if (_addonBusy.value) return
+        viewModelScope.launch {
+            _addonBusy.value = true
+            try {
+                val result = eclipseAddonRepository.add(raw)
+                val failure = result.exceptionOrNull()
+                if (failure == null) {
+                    // A newly installed addon can change what the chain serves.
+                    streamUrlCache.clear()
+                }
+                _addonError.value = if (failure == null) null else addonErrorMessage(failure)
+            } finally {
+                _addonBusy.value = false
+            }
+        }
+    }
+
+    fun onRemoveAddon(id: String) {
+        viewModelScope.launch {
+            eclipseAddonRepository.remove(id)
+            streamUrlCache.clear()
+        }
+    }
+
+    fun onToggleAddon(id: String, enabled: Boolean) {
+        viewModelScope.launch {
+            eclipseAddonRepository.setEnabled(id, enabled)
+            // A prefetched/cached URL from the addon just turned off must not play.
+            streamUrlCache.clear()
+        }
+    }
+
+    fun onMoveAddon(id: String, delta: Int) {
+        viewModelScope.launch { eclipseAddonRepository.move(id, delta) }
+    }
+
+    /** One of an addon's manifest settings changed in the UI; persistence validates it. */
+    fun onAddonSettingChanged(id: String, key: String, value: String) {
+        viewModelScope.launch {
+            eclipseAddonRepository.setSetting(id, key, value)
+            // A quality/setting change can change the stream itself.
+            streamUrlCache.clear()
+        }
+    }
+
+    /** "Play from Eclipse addons first": enabled addons lead the streaming chain. */
+    val addonsFirst: StateFlow<Boolean> = streamingPreference.addonsFirst.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5_000),
+        initialValue = false,
+    )
+
+    fun onAddonsFirstChanged(value: Boolean) {
+        viewModelScope.launch { streamingPreference.setAddonsFirst(value) }
+    }
+
+    /** "Cloud: fastest source": race Tidal and Apple for Cloud's addon. */
+    val cloudFastestSource: StateFlow<Boolean> = streamingPreference.cloudFastestSource.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5_000),
+        initialValue = true,
+    )
+
+    fun onCloudFastestSourceChanged(value: Boolean) {
+        viewModelScope.launch { streamingPreference.setCloudFastestSource(value) }
+    }
+
+    // ── Per-source switches in the streaming chain ─────────────────────────
+    //
+    // All on by default. The UI lane renders them as a row of switches; turning
+    // every other source off is how a user forces (say) the Eclipse Cloud addon.
+
+    val qobuzEnabled: StateFlow<Boolean> = sourceSwitch(streamingPreference.qobuzEnabled)
+
+    /** Both Tidal rungs: the opt-in AAC one and FLAC via a BitChord server. */
+    val tidalEnabled: StateFlow<Boolean> = sourceSwitch(streamingPreference.tidalEnabled)
+
+    val eclipseAddonsEnabled: StateFlow<Boolean> = sourceSwitch(streamingPreference.eclipseAddonsEnabled)
+
+    val jiosaavnEnabled: StateFlow<Boolean> = sourceSwitch(streamingPreference.jiosaavnEnabled)
+
+    val youtubeEnabled: StateFlow<Boolean> = sourceSwitch(streamingPreference.youtubeEnabled)
+
+    private fun sourceSwitch(flow: kotlinx.coroutines.flow.Flow<Boolean>): StateFlow<Boolean> =
+        flow.stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5_000),
+            initialValue = true,
+        )
+
+    fun onSourceEnabledChanged(source: StreamSourceToggle, value: Boolean) {
+        viewModelScope.launch {
+            when (source) {
+                StreamSourceToggle.QOBUZ -> streamingPreference.setQobuzEnabled(value)
+                StreamSourceToggle.TIDAL -> streamingPreference.setTidalEnabled(value)
+                StreamSourceToggle.ECLIPSE_ADDONS -> {
+                    streamingPreference.setEclipseAddonsEnabled(value)
+                    // On: a stale URL from when addons were off must not stick; off: a
+                    // cached/prefetched addon URL must not play.
+                    streamUrlCache.clear()
+                }
+                StreamSourceToggle.JIOSAAVN -> streamingPreference.setJiosaavnEnabled(value)
+                StreamSourceToggle.YOUTUBE -> streamingPreference.setYoutubeEnabled(value)
+            }
+        }
+    }
+
+    /** The error has been shown; the screen clears its banner. */
+    fun onAddonErrorShown() {
+        _addonError.value = null
+    }
+
+    // ── Eclipse account token ──────────────────────────────────────────────
+
+    /** True when an Eclipse account token is stored (account-bound addons need one). */
+    val eclipseTokenPresent: StateFlow<Boolean> = eclipseAccountManager.tokenPresent.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5_000),
+        initialValue = false,
+    )
+
+    private val _eclipseTokenError = MutableStateFlow<String?>(null)
+
+    /** The account token's last failure, phrased for the UI; null when there is none. */
+    val eclipseTokenError: StateFlow<String?> = _eclipseTokenError
+
+    private val _eclipseTokenTest = MutableStateFlow<Boolean?>(null)
+
+    /** The last "Test" result: null = not tested, true = the token minted, false = it didn't. */
+    val eclipseTokenTest: StateFlow<Boolean?> = _eclipseTokenTest
+
+    /** Stores a pasted Eclipse account token; blank clears it. Never logs or echoes it. */
+    fun onEclipseTokenCommitted(raw: String) {
+        viewModelScope.launch {
+            eclipseAccountManager.saveToken(raw)
+            _eclipseTokenError.value = null
+            _eclipseTokenTest.value = null
+        }
+    }
+
+    /** Mints an access token for [addon] now: proves a pasted account token works. */
+    fun onTestEclipseToken(addon: EclipseAddon) {
+        viewModelScope.launch {
+            val ok = try {
+                eclipseAccountManager.verify(addon)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                false
+            }
+            _eclipseTokenTest.value = ok
+            _eclipseTokenError.value = if (ok) null else ECLIPSE_TOKEN_TEST_FAILED
+        }
+    }
+
+    // ── Eclipse email/password sign-in ────────────────────────────────────
+
+    /** The signed-in Eclipse account's email, or null when signed out. */
+    val eclipseUserEmail: StateFlow<String?> = eclipseAccountManager.user
+        .map { it?.email }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5_000),
+            initialValue = null,
+        )
+
+    private val _eclipseLoginBusy = MutableStateFlow(false)
+
+    /** A sign-in is in flight. */
+    val eclipseLoginBusy: StateFlow<Boolean> = _eclipseLoginBusy
+
+    private val _eclipseLoginError = MutableStateFlow<String?>(null)
+
+    /** The last sign-in failure, phrased for the UI; null when there is none. */
+    val eclipseLoginError: StateFlow<String?> = _eclipseLoginError
+
+    /** Signs in to Eclipse with email/password; the token is stored encrypted. */
+    fun onEclipsePasswordLogin(email: String, password: String) {
+        if (email.isBlank() || password.isBlank()) {
+            _eclipseLoginError.value = ECLIPSE_LOGIN_MISSING
+            return
+        }
+        if (_eclipseLoginBusy.value) return
+        viewModelScope.launch {
+            _eclipseLoginBusy.value = true
+            try {
+                val failure = eclipseAccountManager.loginWithPassword(email, password).exceptionOrNull()
+                _eclipseLoginError.value = failure?.let(::eclipseLoginMessage)
+            } finally {
+                _eclipseLoginBusy.value = false
+            }
+        }
+    }
+
+    /** Forgets the Eclipse token and profile. */
+    fun onEclipseSignOut() {
+        viewModelScope.launch {
+            eclipseAccountManager.signOut()
+            _eclipseLoginError.value = null
+            _eclipseTokenError.value = null
+            _eclipseTokenTest.value = null
+        }
+    }
+
+    private fun eclipseLoginMessage(failure: Throwable): String =
+        when ((failure as? EclipseAuthException)?.error) {
+            EclipseAuthError.InvalidCredentials -> ECLIPSE_LOGIN_REJECTED
+            EclipseAuthError.Network -> ECLIPSE_LOGIN_NETWORK
+            EclipseAuthError.Server -> ECLIPSE_LOGIN_SERVER
+            null -> ECLIPSE_LOGIN_SERVER
+        }
+
+    private fun addonErrorMessage(failure: Throwable): String =
+        when ((failure as? AddAddonException)?.error) {
+            AddAddonError.InvalidUrl -> ADDON_URL_INVALID
+            AddAddonError.Unreachable -> ADDON_UNREACHABLE
+            AddAddonError.InvalidManifest -> ADDON_INVALID_MANIFEST
+            AddAddonError.Duplicate -> ADDON_DUPLICATE
+            null -> ADDON_GENERIC
+        }
 
     /**
      * A sign-in to [destination] just succeeded: what its old sign-in held back (and anything parked there) goes again now.

@@ -11,10 +11,13 @@ class StreamServiceTest {
         }
     }
 
-    @Test fun `tidal, jiosaavn and youtube are named for their service`() {
+    @Test fun `tidal, jiosaavn, youtube and addons are named for their service`() {
         assertThat(StreamService.displayName("tidal")).isEqualTo("Tidal")
         assertThat(StreamService.displayName("jiosaavn")).isEqualTo("JioSaavn")
         assertThat(StreamService.displayName("youtube")).isEqualTo("YouTube")
+        assertThat(StreamService.displayName(EclipseAddonStreamResolver.ORIGIN)).isEqualTo("Addon")
+        assertThat(StreamService.displayName("addon:Cloud")).isEqualTo("Cloud")
+        assertThat(StreamService.displayName("addon:")).isEqualTo("Addon")
     }
 
     @Test fun `no origin or an unknown one names no service`() {

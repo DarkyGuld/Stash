@@ -23,6 +23,9 @@ private val Context.streamingDataStore: DataStore<Preferences> by preferencesDat
     corruptionHandler = ReplaceFileCorruptionHandler { emptyPreferences() },
 )
 
+/** One of the streaming chain's sources, for the Settings per-source switches. */
+enum class StreamSourceToggle { QOBUZ, TIDAL, ECLIPSE_ADDONS, JIOSAAVN, YOUTUBE }
+
 /** Stream-quality tier. Persisted as the enum's `name` string. */
 enum class StreamQualityTier { LOSSLESS, HIGH_QUALITY_LOSSY }
 
@@ -52,6 +55,13 @@ class StreamingPreference @Inject constructor(
     private val forceYouTubeFallbackKey = booleanPreferencesKey("force_youtube_fallback")
     private val forceQbdlxOnlyKey = booleanPreferencesKey("force_qbdlx_only")
     private val skipQobuzKey = booleanPreferencesKey("test_skip_qobuz")
+    private val addonsFirstKey = booleanPreferencesKey("eclipse_addons_first")
+    private val cloudFastestSourceKey = booleanPreferencesKey("eclipse_cloud_fastest_source")
+    private val qobuzEnabledKey = booleanPreferencesKey("stream_source_qobuz")
+    private val tidalEnabledKey = booleanPreferencesKey("stream_source_tidal")
+    private val addonsEnabledKey = booleanPreferencesKey("stream_source_eclipse_addons")
+    private val jiosaavnEnabledKey = booleanPreferencesKey("stream_source_jiosaavn")
+    private val youtubeEnabledKey = booleanPreferencesKey("stream_source_youtube")
     // Retained only so [purgeRetiredKeys] can delete them from existing
     // installs; the sources were removed (antra: fix/remove-antra; amz:
     // Plan C; arcod: chore/remove-arcod). The literal names must stay until
@@ -110,6 +120,44 @@ class StreamingPreference @Inject constructor(
     }
 
     /**
+     * "Play from Eclipse addons first": the installed addons lead the streaming
+     * chain, so a Cloud addon starts as fast as Eclipse itself instead of waiting
+     * for the Qobuz/Tidal misses. Not exclusive — every later rung stays a
+     * fallback. Default `false` (addons keep their place after the relays).
+     */
+    val addonsFirst: Flow<Boolean> = context.streamingDataStore.data.map { prefs ->
+        prefs[addonsFirstKey] ?: false
+    }
+
+    /**
+     * "Cloud: fastest source" (Settings › Lossless sources), on by default: for
+     * Eclipse's Cloud addon, race the Tidal lookup and the Apple pipeline and take
+     * the first strong result. Off keeps Tidal strictly first.
+     */
+    val cloudFastestSource: Flow<Boolean> = context.streamingDataStore.data.map { prefs ->
+        prefs[cloudFastestSourceKey] ?: true
+    }
+
+    // Per-source switches in the streaming chain. All on by default: the chain
+    // behaves exactly as before until the user turns one off (the UI's way to
+    // force a source, e.g. only Cloud). No dev gate: these are user settings.
+
+    /** The qbdlx (direct Qobuz) rung. */
+    val qobuzEnabled: Flow<Boolean> = context.streamingDataStore.data.map { it[qobuzEnabledKey] ?: true }
+
+    /** Both Tidal rungs: the opt-in AAC one and FLAC via a BitChord server. */
+    val tidalEnabled: Flow<Boolean> = context.streamingDataStore.data.map { it[tidalEnabledKey] ?: true }
+
+    /** The installed Eclipse addons rung (Cloud included). */
+    val eclipseAddonsEnabled: Flow<Boolean> = context.streamingDataStore.data.map { it[addonsEnabledKey] ?: true }
+
+    /** The JioSaavn AAC fallback. */
+    val jiosaavnEnabled: Flow<Boolean> = context.streamingDataStore.data.map { it[jiosaavnEnabledKey] ?: true }
+
+    /** The YouTube (yt-dlp / InnerTube) last resort. */
+    val youtubeEnabled: Flow<Boolean> = context.streamingDataStore.data.map { it[youtubeEnabledKey] ?: true }
+
+    /**
      * Whether DEVELOPER force toggles (force-qbdlx, skip-Qobuz) are honored. Defaults to
      * the installed app's debuggable flag — the same source of truth the Settings
      * screen uses to decide whether to SHOW those rows, so visibility and effect
@@ -157,6 +205,22 @@ class StreamingPreference @Inject constructor(
     /** [skipQobuz], honored only on debuggable builds (see [devInstrumentsEnabled]). */
     suspend fun isSkipQobuz(): Boolean = devForceToggle(skipQobuz, "test_skip_qobuz")
 
+    /** Whether enabled Eclipse addons lead the streaming chain. */
+    suspend fun isAddonsFirst(): Boolean = addonsFirst.first()
+
+    /** Whether Cloud races Tidal and Apple (first strong result wins). */
+    suspend fun isCloudFastestSource(): Boolean = cloudFastestSource.first()
+
+    suspend fun isQobuzEnabled(): Boolean = qobuzEnabled.first()
+
+    suspend fun isTidalEnabled(): Boolean = tidalEnabled.first()
+
+    suspend fun isEclipseAddonsEnabled(): Boolean = eclipseAddonsEnabled.first()
+
+    suspend fun isJiosaavnEnabled(): Boolean = jiosaavnEnabled.first()
+
+    suspend fun isYoutubeEnabled(): Boolean = youtubeEnabled.first()
+
     suspend fun setEnabled(value: Boolean) {
         context.streamingDataStore.edit { it[enabledKey] = value }
     }
@@ -175,6 +239,34 @@ class StreamingPreference @Inject constructor(
 
     suspend fun setSkipQobuz(value: Boolean) {
         context.streamingDataStore.edit { it[skipQobuzKey] = value }
+    }
+
+    suspend fun setAddonsFirst(value: Boolean) {
+        context.streamingDataStore.edit { it[addonsFirstKey] = value }
+    }
+
+    suspend fun setCloudFastestSource(value: Boolean) {
+        context.streamingDataStore.edit { it[cloudFastestSourceKey] = value }
+    }
+
+    suspend fun setQobuzEnabled(value: Boolean) {
+        context.streamingDataStore.edit { it[qobuzEnabledKey] = value }
+    }
+
+    suspend fun setTidalEnabled(value: Boolean) {
+        context.streamingDataStore.edit { it[tidalEnabledKey] = value }
+    }
+
+    suspend fun setEclipseAddonsEnabled(value: Boolean) {
+        context.streamingDataStore.edit { it[addonsEnabledKey] = value }
+    }
+
+    suspend fun setJiosaavnEnabled(value: Boolean) {
+        context.streamingDataStore.edit { it[jiosaavnEnabledKey] = value }
+    }
+
+    suspend fun setYoutubeEnabled(value: Boolean) {
+        context.streamingDataStore.edit { it[youtubeEnabledKey] = value }
     }
 
     suspend fun setStreamQuality(tier: StreamQualityTier) {

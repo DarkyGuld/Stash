@@ -1,5 +1,6 @@
 package com.stash.data.download.lossless
 
+import com.stash.core.data.addons.EclipseAddonRepository
 import com.stash.data.download.lossless.qbdlx.QbdlxCredentialStore
 import com.stash.data.download.lossless.quota.LosslessQuota
 import com.stash.data.download.lossless.relay.LosslessConfigFetcher
@@ -8,7 +9,9 @@ import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 
 /**
  * The ONE place that answers "is lossless available, and whose is it?" — two
@@ -18,12 +21,13 @@ import kotlinx.coroutines.flow.first
  * deferral reason and the Home banner can never disagree.
  *
  *  - [qbdlxEnabled]       BYO login || relay configured || custom endpoint set
+ *                         || an enabled Eclipse addon installed
  *  - [fileUrlAvailableNow] login LIVE (not merely present) || custom endpoint not
  *                         cooled || any config relay not cooled while the day's
  *                         lossless allowance lasts ([LosslessQuota]) — per call
- *  - [anyUserOwned]       BYO login || custom endpoint → the Home banner
- *                         (a dead PUBLIC relay must not hide the "connect your
- *                         own account" banner — that is the outage it exists for)
+ *  - [anyUserOwned]       BYO login || custom endpoint || enabled Eclipse addon → the
+ *                         Home banner (a dead PUBLIC relay must not hide the "connect
+ *                         your own account" banner — that is the outage it exists for)
  *  - [ownTidalFirst]      own Tidal server && !anyUserOwned → the Tidal rung leads
  *                         both chains (downloads and streaming) above CD quality
  *                         ([ownTidalFirstNow])
@@ -37,12 +41,24 @@ class LosslessAvailability @Inject constructor(
     private val prefs: LosslessSourcePreferences,
     private val relayClient: LosslessRelayClient,
     private val quota: LosslessQuota,
+    /** Installed Eclipse addons: configuration only, like every predicate here. */
+    private val eclipseAddons: EclipseAddonRepository,
 ) {
+    /** How many enabled Eclipse addons are installed; 0 disables their row and warning effect. */
+    private val enabledAddonCount: Flow<Int> = eclipseAddons.addons
+        .map { addons -> addons.count { it.enabled } }
+        .distinctUntilChanged()
+
     // ponytail: config.relays is empty until loadCached() completes, so a tap in the
     // first tens of ms after a cold start can see false and fall to the next rung once.
     val qbdlxEnabled: Flow<Boolean> =
-        combine(credentialStore.hasLogin, config.relays, prefs.customLosslessEndpoint) { login, relays, custom ->
-            login || relays.isNotEmpty() || custom != null
+        combine(
+            credentialStore.hasLogin,
+            config.relays,
+            prefs.customLosslessEndpoint,
+            enabledAddonCount,
+        ) { login, relays, custom, addons ->
+            login || relays.isNotEmpty() || custom != null || addons > 0
         }
 
     suspend fun qbdlxEnabledNow(): Boolean = qbdlxEnabled.first()
@@ -65,7 +81,11 @@ class LosslessAvailability @Inject constructor(
     }
 
     val anyUserOwned: Flow<Boolean> =
-        combine(credentialStore.hasLogin, prefs.customLosslessEndpoint) { l, c -> l || c != null }
+        combine(
+            credentialStore.hasLogin,
+            prefs.customLosslessEndpoint,
+            enabledAddonCount,
+        ) { login, custom, addons -> login || custom != null || addons > 0 }
     suspend fun anyUserOwnedNow(): Boolean = anyUserOwned.first()
 
     /**
@@ -110,46 +130,62 @@ class LosslessAvailability @Inject constructor(
      * flicker to "offline" over one transient 401.
      */
     val routingRows: Flow<List<RoutingRow>> = combine(
-        credentialStore.hasLogin,
-        credentialStore.connectedEmailFlow,
-        config.relays,
-        prefs.customLosslessEndpoint,
-        prefs.bitchordEndpoint,
-    ) { hasLogin, email, relays, custom, tidal ->
-        val tidalFirst = ownTidalLeads(hasLogin, custom, tidal)
-        // Omitted entirely when unset, like the custom endpoint's row below. Never the
-        // address itself: a BitChord base can carry the server's access token as its path.
-        val tidalRow = tidal?.let {
-            RoutingRow("tidal", "Custom Tidal server", if (tidalFirst) "first above CD" else "configured", RoutingState.CONFIGURED)
-        }
-        buildList {
-            // Listed first even when not connected: it is where a connected account would go.
-            add(
-                RoutingRow(
-                    id = "qobuz",
-                    label = "Your Qobuz account",
-                    // Keyed on hasLogin, NEVER on the email: a migrated pasted token
-                    // has none, and keying on it would render "not connected" while
-                    // the badge on the same screen says a source IS configured.
-                    detail = if (hasLogin) (email ?: "connected (token)") else "not connected",
-                    state = if (hasLogin) RoutingState.CONNECTED else RoutingState.NOT_CONFIGURED,
-                ),
-            )
-            if (tidalFirst && tidalRow != null) add(tidalRow)
-            // Omitted entirely when unset — an empty "Custom endpoint — not configured"
-            // row is noise on the screen of everyone who will never set one.
-            if (custom != null) {
-                add(RoutingRow("custom", "Custom endpoint", "configured", RoutingState.CONFIGURED))
+        combine(
+            credentialStore.hasLogin,
+            credentialStore.connectedEmailFlow,
+            config.relays,
+            prefs.customLosslessEndpoint,
+            prefs.bitchordEndpoint,
+        ) { hasLogin, email, relays, custom, tidal ->
+            val tidalFirst = ownTidalLeads(hasLogin, custom, tidal)
+            // Omitted entirely when unset, like the custom endpoint's row below. Never the
+            // address itself: a BitChord base can carry the server's access token as its path.
+            val tidalRow = tidal?.let {
+                RoutingRow("tidal", "Custom Tidal server", if (tidalFirst) "first above CD" else "configured", RoutingState.CONFIGURED)
             }
-            add(
-                RoutingRow(
-                    id = "relay",
-                    label = "Stash lossless",
-                    detail = if (relays.isNotEmpty()) "configured" else "not configured",
-                    state = if (relays.isNotEmpty()) RoutingState.CONFIGURED else RoutingState.NOT_CONFIGURED,
-                ),
+            buildList {
+                // Listed first even when not connected: it is where a connected account would go.
+                add(
+                    RoutingRow(
+                        id = "qobuz",
+                        label = "Your Qobuz account",
+                        // Keyed on hasLogin, NEVER on the email: a migrated pasted token
+                        // has none, and keying on it would render "not connected" while
+                        // the badge on the same screen says a source IS configured.
+                        detail = if (hasLogin) (email ?: "connected (token)") else "not connected",
+                        state = if (hasLogin) RoutingState.CONNECTED else RoutingState.NOT_CONFIGURED,
+                    ),
+                )
+                if (tidalFirst && tidalRow != null) add(tidalRow)
+                // Omitted entirely when unset — an empty "Custom endpoint — not configured"
+                // row is noise on the screen of everyone who will never set one.
+                if (custom != null) {
+                    add(RoutingRow("custom", "Custom endpoint", "configured", RoutingState.CONFIGURED))
+                }
+                add(
+                    RoutingRow(
+                        id = "relay",
+                        label = "Stash lossless",
+                        detail = if (relays.isNotEmpty()) "configured" else "not configured",
+                        state = if (relays.isNotEmpty()) RoutingState.CONFIGURED else RoutingState.NOT_CONFIGURED,
+                    ),
+                )
+                if (!tidalFirst && tidalRow != null) add(tidalRow)
+            }
+        },
+        enabledAddonCount,
+    ) { rows, addons ->
+        // Streaming asks the addons after the lossless relays, before JioSaavn; downloads
+        // never use them. Present only when there is one to ask.
+        if (addons == 0) {
+            rows
+        } else {
+            rows + RoutingRow(
+                id = "eclipse-addon",
+                label = "Eclipse addon",
+                detail = if (addons == 1) "1 enabled" else "$addons enabled",
+                state = RoutingState.CONFIGURED,
             )
-            if (!tidalFirst && tidalRow != null) add(tidalRow)
         }
     }
 

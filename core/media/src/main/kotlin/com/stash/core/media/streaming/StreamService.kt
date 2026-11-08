@@ -16,14 +16,19 @@ object StreamService {
     const val TIDAL = "Tidal"
     const val JIOSAAVN = "JioSaavn"
     const val YOUTUBE = "YouTube"
+    const val ADDON = "Addon"
 
-    fun displayName(origin: String?): String? = when (origin) {
+    fun displayName(origin: String?): String? = when {
         // The ORIGIN constants of QbdlxStreamResolver / KennyyStreamResolver /
         // QobuzStreamResolver (private companions), pinned by StreamServiceTest.
-        "qbdlx", "kennyy", "squid" -> QOBUZ
-        TidalStreamResolver.ORIGIN -> TIDAL
-        JioSaavnStreamResolver.ORIGIN -> JIOSAAVN
-        YouTubeStreamResolver.ORIGIN -> YOUTUBE
+        origin == "qbdlx" || origin == "kennyy" || origin == "squid" -> QOBUZ
+        origin == TidalStreamResolver.ORIGIN -> TIDAL
+        origin == JioSaavnStreamResolver.ORIGIN -> JIOSAAVN
+        origin == YouTubeStreamResolver.ORIGIN -> YOUTUBE
+        // "addon" for an unnamed addon; "addon:<name>" names the addon that served.
+        origin == EclipseAddonStreamResolver.ORIGIN -> ADDON
+        origin != null && origin.startsWith("${EclipseAddonStreamResolver.ORIGIN}:") ->
+            origin.substringAfter(':').takeIf { it.isNotBlank() } ?: ADDON
         else -> null
     }
 }

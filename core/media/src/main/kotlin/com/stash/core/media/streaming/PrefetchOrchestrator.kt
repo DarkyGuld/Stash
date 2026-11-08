@@ -3,6 +3,7 @@ package com.stash.core.media.streaming
 import android.util.Log
 import com.stash.core.data.db.dao.TrackDao
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import java.util.Collections
 import javax.inject.Inject
@@ -53,6 +54,13 @@ class PrefetchOrchestrator @Inject constructor(
     private val trackDao: TrackDao,
     /** Data saver ([StreamQualityPolicy.dataSaverApplies]); null in hand-built tests (never applies). */
     private val qualityPolicy: StreamQualityPolicy? = null,
+    /**
+     * Addon state for the mid-flight guard: null in hand-built tests (no guard,
+     * as no addon change can race them). Hilt injects the real repository.
+     */
+    private val eclipseAddons: com.stash.core.data.addons.EclipseAddonRepository? = null,
+    /** First-chunk file warm into the shared cache; null in hand-built tests. */
+    private val firstChunk: EclipseFirstChunkPrefetcher? = null,
 ) {
     /**
      * Track ids for which a prefetch resolve has been attempted in the
@@ -62,6 +70,49 @@ class PrefetchOrchestrator @Inject constructor(
     private val attempted: MutableSet<Long> = Collections.newSetFromMap(
         java.util.concurrent.ConcurrentHashMap()
     )
+
+    /** The in-flight "URL for the next tracks" warm; a queue change cancels it. */
+    private var urlPrefetchJob: Job? = null
+
+    /**
+     * Warms the resolved stream URL for the next [trackIds] — as soon as they are
+     * known, not at the 60 % auto-advance threshold. Sequential (concurrency 1),
+     * and replaced on every call so a queue change cancels stale work. Black
+     * cloud addons answer this by persisting the URL too (the resolver's disk
+     * layer), so a real play hits memory.
+     */
+    fun prefetchUrlsAhead(scope: CoroutineScope, trackIds: List<Long>) {
+        urlPrefetchJob?.cancel()
+        if (trackIds.isEmpty()) return
+        urlPrefetchJob = scope.launch {
+            // Data saver: no look-ahead streams on a metered network.
+            if (qualityPolicy?.dataSaverApplies() == true) return@launch
+            val generationBefore = eclipseAddons?.addonGeneration?.value
+            for (id in trackIds.distinct()) {
+                if (streamUrlCache.get(id) != null) continue
+                val track = trackDao.getById(id) ?: continue
+                if (track.skipForUrlPrefetch()) continue
+                val resolved = streamResolver.resolve(track, speculative = true) ?: continue
+                // An addon was toggled/removed while resolving: leave the cache alone.
+                if (generationBefore != null && eclipseAddons?.addonGeneration?.value != generationBefore) {
+                    return@launch
+                }
+                streamUrlCache.put(id, resolved)
+                // Progressive addon file (Cloud's direct Qobuz FLAC): warm its first
+                // ~2 MB into the same cache the player will read. HLS/DASH skip this.
+                if (resolved.origin?.startsWith("${EclipseAddonStreamResolver.ORIGIN}") == true) {
+                    firstChunk?.warm(id, resolved)
+                }
+                Log.d(TAG, "Prefetched stream URL for upcoming track $id")
+            }
+        }
+    }
+
+    /** The same rows the next-up prefetch skips: a file, a cloud song, or a known-unplayable row. */
+    private fun com.stash.core.data.db.entity.TrackEntity.skipForUrlPrefetch(): Boolean =
+        isDownloaded ||
+            source == com.stash.core.model.MusicSource.CLOUD ||
+            (!isStreamable && isStreamableCheckedAt != null)
 
     /**
      * Called by the host (service) from its periodic position poll. All
@@ -110,12 +161,23 @@ class PrefetchOrchestrator @Inject constructor(
                 if (!track.isStreamable && track.isStreamableCheckedAt != null) return@launch
 
                 // speculative: never makes the shared Tidal relay search for a look-ahead.
+                val generationBefore = eclipseAddons?.addonGeneration?.value
+                val startedNs = System.nanoTime()
                 val resolved = streamResolver.resolve(track, speculative = true)
+                val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000
                 if (resolved != null) {
-                    streamUrlCache.put(nextTrackId, resolved)
-                    Log.d(TAG, "Prefetched stream URL for track $nextTrackId")
+                    // An addon toggled/removed/settings-changed while this resolve was
+                    // running: the URL may belong to a source the user just turned off.
+                    // The ViewModel clears StreamUrlCache on those actions; a write here
+                    // after that clear would undo it, so drop it.
+                    if (generationBefore != null && eclipseAddons?.addonGeneration?.value != generationBefore) {
+                        Log.d(TAG, "Prefetch for track $nextTrackId discarded: addons changed during resolve ($elapsedMs ms)")
+                    } else {
+                        streamUrlCache.put(nextTrackId, resolved)
+                        Log.d(TAG, "Prefetched stream URL for track $nextTrackId in $elapsedMs ms")
+                    }
                 } else {
-                    Log.w(TAG, "Prefetch resolve returned null for track $nextTrackId")
+                    Log.w(TAG, "Prefetch resolve returned null for track $nextTrackId in $elapsedMs ms")
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
@@ -132,6 +194,7 @@ class PrefetchOrchestrator @Inject constructor(
      */
     fun resetSession() {
         attempted.clear()
+        urlPrefetchJob?.cancel()
     }
 
     private companion object {

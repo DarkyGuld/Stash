@@ -1,5 +1,6 @@
 package com.stash.core.media.streaming
 
+import com.google.common.truth.Truth.assertThat
 import com.stash.core.data.db.dao.TrackDao
 import com.stash.core.data.db.entity.TrackEntity
 import com.stash.core.data.prefs.StreamingPreference
@@ -66,6 +67,133 @@ class PrefetchOrchestratorTest {
         coVerify(exactly = 1) {
             streamResolver.resolve(track, allowYouTube = true, allowYtDlp = true, speculative = true)
         }
+    }
+
+    @Test
+    fun prefetch_discards_a_result_when_addons_changed_mid_flight() = runTest {
+        every { streamUrlCache.get(5L) } returns null
+        val track = TrackEntity(
+            id = 5L,
+            title = "Next Up",
+            artist = "Artist",
+            album = "Album",
+            durationMs = 200_000L,
+            youtubeId = "abc123",
+            isDownloaded = false,
+            isStreamable = true,
+        )
+        val addonUrl = StreamUrl(
+            url = "https://cdn.test/1.flac",
+            expiresAtMs = Long.MAX_VALUE,
+            codec = "flac",
+            origin = "addon:Cloud",
+        )
+        val generation = kotlinx.coroutines.flow.MutableStateFlow(0L)
+        val addonRepository: com.stash.core.data.addons.EclipseAddonRepository = mockk {
+            every { addonGeneration } returns generation
+        }
+        coEvery { trackDao.getById(5L) } returns track
+        // The user disables the addon while the speculative resolve is in flight.
+        coEvery {
+            streamResolver.resolve(track, allowYouTube = true, allowYtDlp = true, speculative = true)
+        } coAnswers {
+            generation.value = 1L
+            addonUrl
+        }
+        val orchestrator = PrefetchOrchestrator(
+            streamResolver = streamResolver,
+            streamUrlCache = streamUrlCache,
+            trackDao = trackDao,
+            eclipseAddons = addonRepository,
+        )
+
+        orchestrator.onPlaybackProgress(
+            scope = this,
+            nextTrackId = 5L,
+            positionMs = 70_000L,
+            durationMs = 100_000L,
+        )
+        advanceUntilIdle()
+
+        // The ViewModel cleared the cache on the toggle; this write must not undo it.
+        io.mockk.verify(exactly = 0) { streamUrlCache.put(any(), any()) }
+    }
+
+    @Test
+    fun prefetch_urls_ahead_fills_the_memory_cache_and_does_not_duplicate() = runTest {
+        val cache = StreamUrlCache()
+        val track = TrackEntity(
+            id = 5L,
+            title = "Next Up",
+            artist = "Artist",
+            durationMs = 200_000L,
+            isDownloaded = false,
+            isStreamable = true,
+        )
+        coEvery { trackDao.getById(5L) } returns track
+        val addonUrl = StreamUrl(
+            url = "https://cdn.test/file.flac",
+            expiresAtMs = Long.MAX_VALUE,
+            codec = "flac",
+            origin = "addon:Cloud",
+        )
+        coEvery {
+            streamResolver.resolve(track, allowYouTube = true, allowYtDlp = true, speculative = true)
+        } returns addonUrl
+        val firstChunk: EclipseFirstChunkPrefetcher = mockk(relaxed = true)
+        val orchestrator = PrefetchOrchestrator(
+            streamResolver = streamResolver,
+            streamUrlCache = cache,
+            trackDao = trackDao,
+            firstChunk = firstChunk,
+        )
+
+        orchestrator.prefetchUrlsAhead(this, listOf(5L))
+        advanceUntilIdle()
+
+        assertThat(cache.get(5L)).isEqualTo(addonUrl)
+        coVerify(exactly = 1) { firstChunk.warm(5L, addonUrl) }
+
+        // A second call sees the memory hit and does not resolve again.
+        orchestrator.prefetchUrlsAhead(this, listOf(5L))
+        advanceUntilIdle()
+        coVerify(exactly = 1) {
+            streamResolver.resolve(track, allowYouTube = true, allowYtDlp = true, speculative = true)
+        }
+    }
+
+    @Test
+    fun prefetch_caches_an_addon_resolved_next_up() = runTest {        every { streamUrlCache.get(5L) } returns null
+        val track = TrackEntity(
+            id = 5L,
+            title = "Next Up",
+            artist = "Artist",
+            album = "Album",
+            durationMs = 200_000L,
+            youtubeId = "abc123",
+            isDownloaded = false,
+            isStreamable = true,
+        )
+        val addonUrl = StreamUrl(
+            url = "https://cdn.test/1.flac",
+            expiresAtMs = Long.MAX_VALUE,
+            codec = "flac",
+            origin = "addon:Cloud",
+        )
+        coEvery { trackDao.getById(5L) } returns track
+        coEvery {
+            streamResolver.resolve(track, allowYouTube = true, allowYtDlp = true, speculative = true)
+        } returns addonUrl
+
+        orchestrator().onPlaybackProgress(
+            scope = this,
+            nextTrackId = 5L,
+            positionMs = 70_000L,
+            durationMs = 100_000L,
+        )
+        advanceUntilIdle()
+
+        io.mockk.verify(exactly = 1) { streamUrlCache.put(5L, addonUrl) }
     }
 
     /**

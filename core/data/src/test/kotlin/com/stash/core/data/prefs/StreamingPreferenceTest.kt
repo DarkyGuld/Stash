@@ -158,4 +158,61 @@ class StreamingPreferenceTest {
         prefs.setEnabled(false)
         assertFalse(prefs.current())
     }
+
+    @Test fun addonsFirst_defaultsToFalse() = runTest {
+        assertFalse(prefs.addonsFirst.first())
+        assertFalse(prefs.isAddonsFirst())
+    }
+
+    @Test fun addonsFirst_roundTripsAndIsNotBuildGated() = runTest {
+        prefs.devInstrumentsEnabled = false
+        prefs.setAddonsFirst(true)
+        assertTrue(prefs.addonsFirst.first())
+        assertTrue(prefs.isAddonsFirst())
+
+        prefs.setAddonsFirst(false)
+        assertFalse(prefs.addonsFirst.first())
+    }
+
+    @Test fun streamingSources_defaultToOn() = runTest {
+        assertTrue(prefs.qobuzEnabled.first())
+        assertTrue(prefs.tidalEnabled.first())
+        assertTrue(prefs.eclipseAddonsEnabled.first())
+        assertTrue(prefs.jiosaavnEnabled.first())
+        assertTrue(prefs.youtubeEnabled.first())
+        assertTrue(prefs.isQobuzEnabled())
+        assertTrue(prefs.isTidalEnabled())
+        assertTrue(prefs.isEclipseAddonsEnabled())
+        assertTrue(prefs.isJiosaavnEnabled())
+        assertTrue(prefs.isYoutubeEnabled())
+    }
+
+    @Test fun cloudFastestSource_defaultsToTrueAndRoundTrips() = runTest {
+        assertTrue(prefs.cloudFastestSource.first())
+        assertTrue(prefs.isCloudFastestSource())
+
+        prefs.setCloudFastestSource(false)
+        assertFalse(prefs.cloudFastestSource.first())
+        assertFalse(prefs.isCloudFastestSource())
+
+        prefs.setCloudFastestSource(true)
+        assertTrue(prefs.cloudFastestSource.first())
+    }
+
+    @Test fun streamingSources_roundTripIndependently() = runTest {        prefs.setQobuzEnabled(false)
+        prefs.setTidalEnabled(false)
+        prefs.setEclipseAddonsEnabled(false)
+        prefs.setJiosaavnEnabled(false)
+        prefs.setYoutubeEnabled(false)
+
+        assertFalse(prefs.isQobuzEnabled())
+        assertFalse(prefs.isTidalEnabled())
+        assertFalse(prefs.isEclipseAddonsEnabled())
+        assertFalse(prefs.isJiosaavnEnabled())
+        assertFalse(prefs.isYoutubeEnabled())
+
+        prefs.setQobuzEnabled(true)
+        assertTrue(prefs.qobuzEnabled.first())
+        assertFalse(prefs.tidalEnabled.first())
+    }
 }

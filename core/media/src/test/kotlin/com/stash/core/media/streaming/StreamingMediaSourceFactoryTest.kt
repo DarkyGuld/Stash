@@ -50,6 +50,7 @@ class StreamingMediaSourceFactoryTest {
         resolver = resolver,
         urlCache = urlCache,
         trackDao = trackDao,
+        okHttpClient = okhttp3.OkHttpClient(),
     )
 
     @Test

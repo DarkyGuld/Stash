@@ -1,0 +1,857 @@
+package com.stash.core.media.streaming
+
+import com.google.common.truth.Truth.assertThat
+import com.stash.core.data.addons.EclipseAddon
+import com.stash.core.data.addons.EclipseAddonException
+import com.stash.core.data.addons.EclipseAddonRepository
+import com.stash.core.data.addons.EclipseAddonStream
+import com.stash.core.data.addons.EclipseAddonTrack
+import com.stash.core.data.addons.EclipseAppleLookupStore
+import com.stash.core.data.addons.EclipseAppleTrack
+import com.stash.core.data.db.entity.TrackEntity
+import io.mockk.coEvery
+import io.mockk.every
+import io.mockk.coVerify
+import io.mockk.mockk
+import kotlinx.coroutines.test.runTest
+import org.junit.Test
+
+class EclipseAddonStreamResolverTest {
+    private val now = 1_762_000_000_000L
+
+    private fun addon(id: String = "nebula", resources: List<String> = listOf("search", "stream")) =
+        EclipseAddon(
+            id = id,
+            name = id,
+            version = "1",
+            manifestUrl = "https://addons.test/$id/manifest.json",
+            resources = resources,
+        )
+
+    private fun stream(
+        url: String = "https://cdn.test/123.flac",
+        format: String? = null,
+        quality: String? = null,
+        expiresAt: Long? = null,
+        codec: String? = null,
+        manifest: String? = null,
+        sampleRate: Int? = null,
+        bitDepth: Int? = null,
+    ) = EclipseAddonStream(
+        url = url,
+        format = format,
+        quality = quality,
+        expiresAt = expiresAt,
+        codec = codec,
+        manifest = manifest,
+        sampleRate = sampleRate,
+        bitDepth = bitDepth,
+    )
+
+    // ── mapping ─────────────────────────────────────────────────────────────
+
+    @Test
+    fun `expiresAt in seconds is converted to millis`() {
+        val mapped = mapStream(stream(expiresAt = 1_762_000_300L), nowMs = now)!!
+
+        assertThat(mapped.expiresAtMs).isEqualTo(1_762_000_300_000L)
+    }
+
+    @Test
+    fun `expiresAt already in millis is kept`() {
+        val mapped = mapStream(stream(expiresAt = 1_762_000_300_000L), nowMs = now)!!
+
+        assertThat(mapped.expiresAtMs).isEqualTo(1_762_000_300_000L)
+    }
+
+    @Test
+    fun `a missing expiry becomes now plus thirty minutes`() {
+        val mapped = mapStream(stream(), nowMs = now)!!
+
+        assertThat(mapped.expiresAtMs).isEqualTo(now + 30 * 60_000L)
+    }
+
+    @Test
+    fun `bit depth and sample rate are carried only when positive`() {
+        val hiRes = mapStream(stream(sampleRate = 96_000, bitDepth = 24), nowMs = now)!!
+        assertThat(hiRes.sampleRateHz).isEqualTo(96_000)
+        assertThat(hiRes.bitsPerSample).isEqualTo(24)
+
+        val unknown = mapStream(stream(sampleRate = 0, bitDepth = 0), nowMs = now)!!
+        assertThat(unknown.sampleRateHz).isNull()
+        assertThat(unknown.bitsPerSample).isNull()
+    }
+
+    @Test
+    fun `codec prefers the stream's own field, then format, then the URL extension`() {
+        assertThat(mapStream(stream(codec = "FLAC", format = "mp3"), nowMs = now)!!.codec).isEqualTo("flac")
+        assertThat(mapStream(stream(format = "M4A"), nowMs = now)!!.codec).isEqualTo("m4a")
+        assertThat(mapStream(stream(url = "https://cdn.test/x/abc.MP3?token=1"), nowMs = now)!!.codec).isEqualTo("mp3")
+    }
+
+    @Test
+    fun `quality's kbps number is the bitrate, and lossless has none`() {
+        assertThat(mapStream(stream(quality = "320kbps"), nowMs = now)!!.bitrateKbps).isEqualTo(320)
+        assertThat(mapStream(stream(quality = "256 kbps"), nowMs = now)!!.bitrateKbps).isEqualTo(256)
+        assertThat(mapStream(stream(quality = "lossless"), nowMs = now)!!.bitrateKbps).isNull()
+    }
+
+    @Test
+    fun `origin is addon, and the manifest kind selects DASH or HLS`() {
+        val dash = mapStream(stream(manifest = "dash"), nowMs = now)!!
+        assertThat(dash.origin).isEqualTo("addon")
+        assertThat(dash.isDash).isTrue()
+        assertThat(dash.isHls).isFalse()
+
+        val hls = mapStream(stream(manifest = "hls"), nowMs = now)!!
+        assertThat(hls.isHls).isTrue()
+        assertThat(mapStream(stream(manifest = "none"), nowMs = now)!!.isDash).isFalse()
+    }
+
+    @Test
+    fun `a stream with no URL is not playable`() {
+        assertThat(mapStream(stream(url = "  "), nowMs = now)).isNull()
+    }
+
+    @Test
+    fun `Cloud's direct Qobuz FLAC answer maps progressive, never HLS`() {
+        val mapped = mapStream(
+            EclipseAddonStream(
+                url = "https://streaming-qobuz-std.akamaized.net/file?uid=1&etsp=1762000000",
+                format = null,
+                codec = "flac",
+                container = "flac",
+                manifest = "none",
+                sampleRate = 44_100,
+                bitDepth = 24,
+            ),
+            nowMs = now,
+        )!!
+
+        assertThat(mapped.isHls).isFalse()
+        assertThat(mapped.isDash).isFalse()
+        assertThat(mapped.codec).isEqualTo("flac")
+        assertThat(mapped.bitsPerSample).isEqualTo(24)
+        assertThat(mapped.sampleRateHz).isEqualTo(44_100)
+        assertThat(mapped.origin).isEqualTo("addon")
+        // The quality stamp reads FLAC 24-bit / 44.1 kHz; StreamService labels origin addon:* as "via <name>".
+    }
+
+    @Test
+    fun `a cloud HLS answer maps isHls, codec and the exp from its signed URL`() {
+        val mapped = mapStream(
+            stream(
+                url = "https://api.eclipsemusic.app/api/tidal/hls/1.m3u8?quality=HI_RES_LOSSLESS&exp=1762000000&sig=x",
+                format = "hls",
+                quality = "HI_RES_LOSSLESS",
+                codec = "flac",
+                bitDepth = 24,
+                sampleRate = 44_100,
+            ),
+            nowMs = now,
+        )!!
+
+        assertThat(mapped.isHls).isTrue()
+        assertThat(mapped.isDash).isFalse()
+        assertThat(mapped.codec).isEqualTo("flac")
+        assertThat(mapped.bitsPerSample).isEqualTo(24)
+        assertThat(mapped.sampleRateHz).isEqualTo(44_100)
+        assertThat(mapped.expiresAtMs).isEqualTo(1_762_000_000_000L)
+    }
+
+    @Test
+    fun `a cloud HLS answer without exp falls back to six hours`() {
+        val mapped = mapStream(
+            stream(url = "https://cdn.test/2.m3u8", format = "hls"),
+            nowMs = now,
+        )!!
+
+        assertThat(mapped.expiresAtMs).isEqualTo(now + 6 * 60 * 60_000L)
+    }
+
+    // ── resolve ─────────────────────────────────────────────────────────────
+
+    @Test
+    fun `resolve searches enabled addons in order and maps the first confident match`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val first = addon("first")
+        val second = addon("second")
+        coEvery { repository.enabledNow() } returns listOf(first, second)
+        coEvery { repository.search(first, any(), any()) } returns emptyList()
+        coEvery { repository.search(second, any(), any()) } returns listOf(
+            EclipseAddonTrack(id = "t1", title = "Blinding Lights", artist = "The Weeknd", duration = 200),
+        )
+        coEvery { repository.stream(second, "t1") } returns stream(quality = "lossless", format = "flac")
+
+        val result = EclipseAddonStreamResolver(repository)
+            .resolve(TrackEntity(title = "Blinding Lights", artist = "The Weeknd", durationMs = 200_000))
+
+        assertThat(result).isNotNull()
+        assertThat(result!!.url).isEqualTo("https://cdn.test/123.flac")
+        // The service label names the addon that served.
+        assertThat(result.origin).isEqualTo("addon:second")
+        coVerify(exactly = 1) { repository.search(first, "The Weeknd Blinding Lights", 25) }
+    }
+
+    @Test
+    fun `a failing addon is skipped, and no match at all is null`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val broken = addon("broken")
+        coEvery { repository.enabledNow() } returns listOf(broken)
+        coEvery { repository.search(broken, any(), any()) } throws IllegalStateException("503")
+
+        assertThat(EclipseAddonStreamResolver(repository).resolve(track())).isNull()
+
+        coEvery { repository.enabledNow() } returns emptyList()
+        assertThat(EclipseAddonStreamResolver(repository).resolve(track())).isNull()
+    }
+
+    @Test
+    fun `a candidate that is not really the track is never streamed`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val addon = addon()
+        coEvery { repository.enabledNow() } returns listOf(addon)
+        coEvery { repository.search(addon, any(), any()) } returns listOf(
+            EclipseAddonTrack(id = "other", title = "Blinding Lights (Live)", artist = "The Weeknd", duration = 200),
+        )
+
+        assertThat(EclipseAddonStreamResolver(repository).resolve(track())).isNull()
+        coVerify(exactly = 0) { repository.stream(any(), any()) }
+    }
+
+    @Test
+    fun `resolve-only addons resolve first and never search`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val resolveOnly = addon("addon", resources = listOf("stream", "settings", "resolve"))
+        coEvery { repository.enabledNow() } returns listOf(resolveOnly)
+        coEvery { repository.resolve(resolveOnly, any(), any(), any(), any()) } returns
+            EclipseAddonTrack(id = "r1", title = "Blinding Lights", isrc = "USUM71923546")
+        coEvery { repository.stream(resolveOnly, "r1") } returns stream(quality = "lossless", format = "flac")
+
+        val result = EclipseAddonStreamResolver(repository).resolve(track())
+
+        assertThat(result?.origin).isEqualTo("addon:addon")
+        coVerify(exactly = 0) { repository.search(any(), any(), any()) }
+        coVerify(exactly = 0) { repository.resolveIsrc(any(), any()) }
+    }
+
+    @Test
+    fun `a resolve miss falls back to search only when the addon offers it`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val both = addon("both", resources = listOf("stream", "resolve", "search"))
+        coEvery { repository.enabledNow() } returns listOf(both)
+        coEvery { repository.resolve(both, any(), any(), any(), any()) } returns null
+        coEvery { repository.search(both, any(), any()) } returns listOf(
+            EclipseAddonTrack(id = "s1", title = "Blinding Lights", artist = "The Weeknd", duration = 200),
+        )
+        coEvery { repository.stream(both, "s1") } returns stream()
+
+        assertThat(EclipseAddonStreamResolver(repository).resolve(track())).isNotNull()
+        coVerify(exactly = 1) { repository.search(both, any(), any()) }
+
+        // Resolve-only: a null resolve ends this addon, no search exists to try.
+        val resolveOnly = addon("ro", resources = listOf("stream", "resolve"))
+        coEvery { repository.enabledNow() } returns listOf(resolveOnly)
+        coEvery { repository.resolve(resolveOnly, any(), any(), any(), any()) } returns null
+
+        assertThat(EclipseAddonStreamResolver(repository).resolve(track())).isNull()
+        coVerify(exactly = 0) { repository.search(resolveOnly, any(), any()) }
+    }
+
+    @Test
+    fun `the ISRC route is used when the manifest lists isrc and resolve has no match`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val addon = addon("isrc", resources = listOf("stream", "isrc"))
+        coEvery { repository.enabledNow() } returns listOf(addon)
+        coEvery { repository.resolveIsrc(addon, "USUM71923546") } returns
+            EclipseAddonTrack(id = "i1", isrc = "USUM71923546")
+        coEvery { repository.stream(addon, "i1") } returns stream()
+
+        val result = EclipseAddonStreamResolver(repository)
+            .resolve(track().copy(isrc = "USUM71923546"))
+
+        assertThat(result).isNotNull()
+        coVerify(exactly = 0) { repository.resolve(any(), any(), any(), any(), any()) }
+        coVerify(exactly = 0) { repository.search(any(), any(), any()) }
+    }
+
+    @Test
+    fun `cloud falls back to resolve-isrc even when its manifest does not list isrc`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = addon("eclipse-music-cloud", resources = listOf("stream", "resolve"))
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        coEvery { repository.resolve(cloud, any(), any(), any(), any()) } returns null
+        coEvery { repository.resolveIsrc(cloud, "USUM71923546") } returns
+            EclipseAddonTrack(id = "c1", isrc = "USUM71923546")
+        coEvery { repository.stream(cloud, "c1") } returns stream()
+
+        val result = EclipseAddonStreamResolver(repository)
+            .resolve(track().copy(isrc = "USUM71923546"))
+
+        assertThat(result).isNotNull()
+        coVerify(exactly = 1) { repository.resolveIsrc(cloud, "USUM71923546") }
+    }
+
+    @Test
+    fun `a 503 preparing is waited out and retried once on the same addon`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val addon = addon("cloud", resources = listOf("stream", "resolve"))
+        coEvery { repository.enabledNow() } returns listOf(addon)
+        coEvery { repository.resolve(addon, any(), any(), any(), any()) } returns EclipseAddonTrack(id = "r1")
+        coEvery { repository.stream(addon, "r1") } throws EclipseAddonException.Preparing(1) andThen
+            stream(quality = "lossless", format = "flac")
+
+        val result = EclipseAddonStreamResolver(repository).resolve(track())
+
+        assertThat(result?.origin).isEqualTo("addon:cloud")
+        coVerify(exactly = 2) { repository.stream(addon, "r1") }
+    }
+
+    @Test
+    fun `a 404 re-resolves the item once rather than retrying it blindly`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val addon = addon("cloud", resources = listOf("stream", "resolve"))
+        coEvery { repository.enabledNow() } returns listOf(addon)
+        coEvery { repository.resolve(addon, any(), any(), any(), any()) } returns EclipseAddonTrack(id = "r1")
+        coEvery { repository.stream(addon, "r1") } throws EclipseAddonException.HttpFailure(404)
+
+        assertThat(EclipseAddonStreamResolver(repository).resolve(track())).isNull()
+        // The id is dropped (it may have rotated) and resolved once more, then given up.
+        coVerify(exactly = 2) { repository.resolve(addon, any(), any(), any(), any()) }
+        coVerify(exactly = 2) { repository.stream(addon, "r1") }
+    }
+
+    // ── Resolve cache ──────────────────────────────────────────────────────
+
+    private fun cachedResolver(
+        repository: EclipseAddonRepository,
+        cache: EclipseAddonResolveCache = EclipseAddonResolveCache(),
+    ) = EclipseAddonStreamResolver.forTest(repository, cache)
+
+    private fun resolveOnly(id: String = "cloud") = addon(id, resources = listOf("stream", "resolve"))
+
+    @Test
+    fun `a cached resolve skips the metadata lookup on the next play`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val addon = resolveOnly()
+        coEvery { repository.enabledNow() } returns listOf(addon)
+        coEvery { repository.resolve(addon, any(), any(), any(), any()) } returns EclipseAddonTrack(id = "r1")
+        coEvery { repository.stream(addon, "r1") } returns stream()
+        val resolver = cachedResolver(repository)
+
+        resolver.resolve(track())
+        resolver.resolve(track())
+
+        coVerify(exactly = 1) { repository.resolve(addon, any(), any(), any(), any()) }
+        coVerify(exactly = 2) { repository.stream(addon, "r1") }
+    }
+
+    @Test
+    fun `a cached miss is not looked up again, and another track is`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val addon = resolveOnly()
+        coEvery { repository.enabledNow() } returns listOf(addon)
+        coEvery { repository.resolve(addon, any(), any(), any(), any()) } returns null
+        val resolver = cachedResolver(repository)
+
+        resolver.resolve(track())
+        resolver.resolve(track())
+        coVerify(exactly = 1) { repository.resolve(addon, any(), any(), any(), any()) }
+        coVerify(exactly = 0) { repository.stream(any(), any()) }
+
+        resolver.resolve(track().copy(id = 2, title = "Another Song"))
+        coVerify(exactly = 2) { repository.resolve(addon, any(), any(), any(), any()) }
+    }
+
+    @Test
+    fun `a stream 404 drops the cached id and re-resolves once`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val addon = resolveOnly()
+        coEvery { repository.enabledNow() } returns listOf(addon)
+        coEvery { repository.resolve(addon, any(), any(), any(), any()) } returns
+            EclipseAddonTrack(id = "r1") andThen EclipseAddonTrack(id = "r2")
+        coEvery { repository.stream(addon, "r1") } returns stream() andThenThrows
+            EclipseAddonException.HttpFailure(404)
+        coEvery { repository.stream(addon, "r2") } returns stream()
+        val resolver = cachedResolver(repository)
+
+        resolver.resolve(track())
+        val second = resolver.resolve(track())
+
+        assertThat(second).isNotNull()
+        coVerify(exactly = 2) { repository.resolve(addon, any(), any(), any(), any()) }
+        coVerify(exactly = 2) { repository.stream(addon, "r1") }
+        coVerify(exactly = 1) { repository.stream(addon, "r2") }
+    }
+
+    @Test
+    fun `a settings change is a different cache key, so the id is resolved afresh`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val addon = resolveOnly()
+        var enabled = listOf(addon)
+        coEvery { repository.enabledNow() } answers { enabled }
+        coEvery { repository.resolve(addon, any(), any(), any(), any()) } returns EclipseAddonTrack(id = "r1")
+        coEvery { repository.stream(addon, "r1") } returns stream()
+        val resolver = cachedResolver(repository)
+
+        resolver.resolve(track())
+        enabled = listOf(addon.copy(settings = mapOf("quality" to "LOSSLESS")))
+        resolver.resolve(track())
+
+        // Two different cache keys: the base addon and the settings-changed copy.
+        coVerify(exactly = 2) { repository.resolve(any(), any(), any(), any(), any()) }
+    }
+
+    // ── Cloud's Apple Music fallback ───────────────────────────────────────
+
+    private val appleHit = EclipseAppleTrack(
+        trackId = 6812560833L,
+        trackName = "Blinding Lights",
+        artistName = "The Weeknd",
+        collectionName = "After Hours",
+        trackTimeMillis = 200_238L,
+        isrc = "FAKEISRC",
+    )
+
+    @Test
+    fun `cloud falls back to Apple when Tidal has no item`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        coEvery { repository.resolve(cloud, any(), any(), any(), any()) } returns null
+        coEvery { repository.searchApple(cloud, "Blinding Lights", "The Weeknd") } returns listOf(appleHit)
+        coEvery { repository.streamApple(cloud, "6812560833", any()) } returns stream(format = "hls", manifest = "hls")
+
+        val result = EclipseAddonStreamResolver(repository).resolve(track())
+
+        assertThat(result?.origin).isEqualTo("addon:eclipse-music-cloud")
+        coVerify(exactly = 0) { repository.stream(any(), any()) }
+        coVerify(exactly = 1) { repository.searchApple(cloud, any(), any()) }
+    }
+
+    @Test
+    fun `a Tidal success ignores the parallel Apple search`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        coEvery { repository.resolve(cloud, any(), any(), any(), any()) } returns EclipseAddonTrack(id = "r1")
+        coEvery { repository.stream(cloud, "r1") } returns stream()
+        coEvery { repository.searchApple(any(), any(), any()) } returns listOf(appleHit)
+
+        val result = EclipseAddonStreamResolver(repository).resolve(track())
+
+        assertThat(result?.origin).isEqualTo("addon:eclipse-music-cloud")
+        coVerify(exactly = 0) { repository.streamApple(any(), any(), any()) }
+    }
+
+    @Test
+    fun `both Tidal and Apple missing is a miss`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        coEvery { repository.resolve(cloud, any(), any(), any(), any()) } returns null
+        coEvery { repository.searchApple(cloud, any(), any()) } returns emptyList()
+
+        assertThat(EclipseAddonStreamResolver(repository).resolve(track())).isNull()
+        coVerify(exactly = 0) { repository.streamApple(any(), any(), any()) }
+    }
+
+    @Test
+    fun `a dead Tidal stream id falls back to Apple`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        coEvery { repository.resolve(cloud, any(), any(), any(), any()) } returns EclipseAddonTrack(id = "r1")
+        coEvery { repository.stream(cloud, "r1") } throws EclipseAddonException.HttpFailure(404)
+        coEvery { repository.searchApple(cloud, any(), any()) } returns listOf(appleHit)
+        coEvery { repository.streamApple(cloud, any(), any()) } returns stream(format = "hls", manifest = "hls")
+
+        val result = EclipseAddonStreamResolver(repository).resolve(track())
+
+        assertThat(result?.origin).isEqualTo("addon:eclipse-music-cloud")
+        coVerify(exactly = 1) { repository.searchApple(cloud, any(), any()) }
+    }
+
+    @Test
+    fun `a third-party addon never calls Apple`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val nebula = resolveOnly("nebula")
+        coEvery { repository.enabledNow() } returns listOf(nebula)
+        coEvery { repository.resolve(nebula, any(), any(), any(), any()) } returns null
+
+        assertThat(EclipseAddonStreamResolver(repository).resolve(track())).isNull()
+        coVerify(exactly = 0) { repository.searchApple(any(), any(), any()) }
+        coVerify(exactly = 0) { repository.streamApple(any(), any(), any()) }
+    }
+
+    @Test
+    fun `a dead Apple stream id is dropped, so the next play searches again`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        coEvery { repository.resolve(cloud, any(), any(), any(), any()) } returns null
+        coEvery { repository.searchApple(cloud, any(), any()) } returns listOf(appleHit)
+        coEvery { repository.streamApple(cloud, "6812560833", any()) } throws
+            EclipseAddonException.HttpFailure(404)
+        val resolver = cachedResolver(repository)
+
+        assertThat(resolver.resolve(track())).isNull()
+        assertThat(resolver.resolve(track())).isNull()
+
+        // The first play cached the id, its 404 dropped it, the second searched again.
+        coVerify(exactly = 2) { repository.searchApple(cloud, any(), any()) }
+    }
+
+    @Test
+    fun `the Apple track id is cached, so the second play skips the iTunes search`() = runTest {        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        coEvery { repository.resolve(cloud, any(), any(), any(), any()) } returns null
+        coEvery { repository.searchApple(cloud, any(), any()) } returns listOf(appleHit)
+        coEvery { repository.streamApple(cloud, "6812560833", any()) } returns stream(format = "hls")
+        val resolver = cachedResolver(repository)
+
+        resolver.resolve(track())
+        resolver.resolve(track())
+
+        coVerify(exactly = 1) { repository.searchApple(cloud, any(), any()) }
+        coVerify(exactly = 2) { repository.streamApple(cloud, "6812560833", any()) }
+    }
+
+    // ── Cloud fastest-source (raced Tidal + Apple) ─────────────────────────
+
+    private fun fastResolver(
+        repository: EclipseAddonRepository,
+        cache: EclipseAddonResolveCache = EclipseAddonResolveCache(),
+    ) = EclipseAddonStreamResolver.forTest(repository, cache, cloudFastestSource = { true })
+
+    private fun slowResolver(
+        repository: EclipseAddonRepository,
+        cache: EclipseAddonResolveCache = EclipseAddonResolveCache(),
+    ) = EclipseAddonStreamResolver.forTest(repository, cache, cloudFastestSource = { false })
+
+    private val mario = TrackEntity(
+        title = "Mario",
+        artist = "David Guetta & Jast",
+        durationMs = 120_238,
+    )
+
+    private val marioHit = EclipseAppleTrack(
+        trackId = 555_000_001L,
+        trackName = "Mario",
+        artistName = "David Guetta, Jast",
+        trackTimeMillis = 120_238,
+    )
+
+    @Test
+    fun `fast mode serves the strong Apple match while Tidal is still looking`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        // Tidal is slow and misses; iTunes matches exactly.
+        coEvery { repository.resolve(cloud, any(), any(), any(), any()) } coAnswers {
+            kotlinx.coroutines.delay(2_000)
+            null
+        }
+        coEvery { repository.searchApple(cloud, any(), any()) } returns listOf(marioHit)
+        coEvery { repository.streamApple(cloud, "555000001", any()) } returns stream(format = "hls")
+
+        val result = fastResolver(repository).resolve(mario)
+
+        assertThat(result?.origin).isEqualTo("addon:eclipse-music-cloud")
+        coVerify(exactly = 1) { repository.streamApple(cloud, "555000001", any()) }
+        coVerify(exactly = 0) { repository.stream(any(), any()) }
+    }
+
+    @Test
+    fun `fast mode prefers Tidal when it answers first, and does not stream Apple`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        coEvery { repository.resolve(cloud, any(), any(), any(), any()) } returns EclipseAddonTrack(id = "r1")
+        coEvery { repository.stream(cloud, "r1") } returns stream()
+        coEvery { repository.searchApple(cloud, any(), any()) } coAnswers {
+            kotlinx.coroutines.delay(2_000)
+            listOf(marioHit)
+        }
+
+        val result = fastResolver(repository).resolve(mario)
+
+        assertThat(result?.origin).isEqualTo("addon:eclipse-music-cloud")
+        coVerify(exactly = 1) { repository.stream(cloud, "r1") }
+        coVerify(exactly = 0) { repository.streamApple(any(), any(), any()) }
+    }
+
+    @Test
+    fun `fast mode will not start Apple for an ambiguous or weak match`() = runTest {
+        for (hits in listOf(
+            // Two strong candidates: ambiguous.
+            listOf(marioHit, marioHit.copy(trackId = 555_000_002L)),
+            // Unknown duration: not strong.
+            listOf(marioHit.copy(trackId = 555_000_003L, trackTimeMillis = 0)),
+            // Weak artist: not strong.
+            listOf(marioHit.copy(trackId = 555_000_004L, artistName = "Someone Else")),
+        )) {
+            val repository: EclipseAddonRepository = mockk()
+            val cloud = resolveOnly("eclipse-music-cloud")
+            coEvery { repository.enabledNow() } returns listOf(cloud)
+            coEvery { repository.resolve(cloud, any(), any(), any(), any()) } coAnswers {
+                kotlinx.coroutines.delay(2_000)
+                null
+            }
+            coEvery { repository.searchApple(cloud, any(), any()) } returns hits
+
+            assertThat(fastResolver(repository).resolve(mario)).isNull()
+            coVerify(exactly = 0) { repository.streamApple(any(), any(), any()) }
+        }
+    }
+
+    @Test
+    fun `a non-Cloud addon never calls Apple, fast mode or not`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val nebula = resolveOnly("nebula")
+        coEvery { repository.enabledNow() } returns listOf(nebula)
+        coEvery { repository.resolve(nebula, any(), any(), any(), any()) } returns null
+
+        assertThat(fastResolver(repository).resolve(mario)).isNull()
+        coVerify(exactly = 0) { repository.searchApple(any(), any(), any()) }
+        coVerify(exactly = 0) { repository.streamApple(any(), any(), any()) }
+    }
+
+    @Test
+    fun `a Cloud Tidal miss is cached for six hours, a normal addon miss for five minutes`() = runTest {
+        // Cloud: a second play an hour later does not pay the Tidal lookup again.
+        var now = 1_000_000_000_000L
+        val cloudCache = EclipseAddonResolveCache(clock = { now })
+        val cloudRepo: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        coEvery { cloudRepo.enabledNow() } returns listOf(cloud)
+        coEvery { cloudRepo.resolve(cloud, any(), any(), any(), any()) } returns null
+        coEvery { cloudRepo.searchApple(cloud, any(), any()) } returns emptyList()
+        val cloudResolver = slowResolver(cloudRepo, cloudCache)
+        cloudResolver.resolve(mario)
+        now += 60 * 60_000L
+        cloudResolver.resolve(mario)
+        coVerify(exactly = 1) { cloudRepo.resolve(cloud, any(), any(), any(), any()) }
+
+        // A normal addon's miss expires after five minutes as before.
+        var normalNow = 1_000_000_000_000L
+        val normalCache = EclipseAddonResolveCache(clock = { normalNow })
+        val normalRepo: EclipseAddonRepository = mockk()
+        val nebula = resolveOnly("nebula")
+        coEvery { normalRepo.enabledNow() } returns listOf(nebula)
+        coEvery { normalRepo.resolve(nebula, any(), any(), any(), any()) } returns null
+        val normalResolver = slowResolver(normalRepo, normalCache)
+        normalResolver.resolve(mario)
+        normalNow += 10 * 60_000L
+        normalResolver.resolve(mario)
+        coVerify(exactly = 2) { normalRepo.resolve(nebula, any(), any(), any(), any()) }
+    }
+
+    // ── Persistent Apple lookup + queue warming ────────────────────────────
+
+    @Test
+    fun `a quality change still uses the cached Apple id, without another iTunes search`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        var enabled = listOf(cloud)
+        coEvery { repository.enabledNow() } answers { enabled }
+        coEvery { repository.resolve(any(), any(), any(), any(), any()) } returns null
+        coEvery { repository.searchApple(any(), any(), any()) } returns listOf(appleHit)
+        coEvery { repository.streamApple(any(), "6812560833", any()) } returns stream()
+        val resolver = cachedResolver(repository)
+
+        resolver.resolve(track())
+        // The user changes the Apple/Tidal quality: the Apple key has no settings snapshot.
+        enabled = listOf(cloud.copy(settings = mapOf("appleQuality" to "LOSSLESS")))
+        resolver.resolve(track())
+
+        coVerify(exactly = 1) { repository.searchApple(any(), any(), any()) }
+        coVerify(exactly = 2) { repository.streamApple(any(), "6812560833", any()) }
+    }
+
+    @Test
+    fun `an Apple id cached on disk is used without an iTunes search`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        coEvery { repository.resolve(cloud, any(), any(), any(), any()) } returns null
+        coEvery { repository.streamApple(cloud, "555000001", any()) } returns stream()
+        val lookup: EclipseAppleLookupStore = mockk()
+        coEvery { lookup.get("eclipse-music-cloud", any()) } returns
+            com.stash.core.data.addons.AppleLookup("555000001", Long.MAX_VALUE)
+        coEvery { lookup.put(any(), any(), any()) } returns Unit
+        coEvery { lookup.remove(any(), any()) } returns Unit
+        val resolver = EclipseAddonStreamResolver.forTest(
+            repository,
+            EclipseAddonResolveCache(),
+            cloudFastestSource = { false },
+            appleLookup = lookup,
+        )
+
+        assertThat(resolver.resolve(mario)).isNotNull()
+        coVerify(exactly = 0) { repository.searchApple(any(), any(), any()) }
+        coVerify(exactly = 1) { repository.streamApple(cloud, "555000001", any()) }
+    }
+
+    @Test
+    fun `a dead Apple id from the persistent cache is dropped and searched again`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        coEvery { repository.resolve(any(), any(), any(), any(), any()) } returns null
+        coEvery { repository.streamApple(any(), any(), any()) } throws EclipseAddonException.HttpFailure(404)
+        coEvery { repository.searchApple(any(), any(), any()) } returns emptyList()
+
+        var disk: com.stash.core.data.addons.AppleLookup? =
+            com.stash.core.data.addons.AppleLookup("555000001", Long.MAX_VALUE)
+        val lookup: EclipseAppleLookupStore = mockk()
+        coEvery { lookup.get(any(), any()) } answers { disk }
+        coEvery { lookup.remove(any(), any()) } answers {
+            disk = null
+            Unit
+        }
+        coEvery { lookup.put(any(), any(), any()) } returns Unit
+        val resolver = EclipseAddonStreamResolver.forTest(
+            repository,
+            EclipseAddonResolveCache(),
+            cloudFastestSource = { false },
+            appleLookup = lookup,
+        )
+
+        assertThat(resolver.resolve(mario)).isNull()
+        coVerify(exactly = 1) { lookup.remove(any(), any()) }
+
+        // The next play no longer has the id and searches iTunes once.
+        assertThat(resolver.resolve(mario)).isNull()
+        coVerify(exactly = 1) { repository.searchApple(any(), any(), any()) }
+    }
+
+    @Test
+    fun `a disabled or removed Cloud addon never uses the cached Apple id`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        coEvery { repository.enabledNow() } returns emptyList()
+        val resolver = cachedResolver(repository)
+
+        assertThat(resolver.resolve(mario)).isNull()
+        coVerify(exactly = 0) { repository.searchApple(any(), any(), any()) }
+        coVerify(exactly = 0) { repository.streamApple(any(), any(), any()) }
+    }
+
+    @Test
+    fun `queue warming looks up Apple ids only, skipping files and cloud songs`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        every { repository.addonGeneration } returns kotlinx.coroutines.flow.MutableStateFlow(0L)
+        coEvery { repository.searchApple(cloud, any(), any()) } returns listOf(appleHit)
+        val resolver = cachedResolver(repository)
+
+        resolver.warmAppleIds(
+            listOf(
+                track().copy(id = 1, isDownloaded = true),
+                track().copy(id = 2, source = com.stash.core.model.MusicSource.CLOUD),
+                track().copy(id = 3, title = "Another Song"),
+            ),
+        )
+
+        coVerify(exactly = 1) { repository.searchApple(cloud, any(), any()) }
+        coVerify(exactly = 0) { repository.streamApple(any(), any(), any()) }
+        // A second warm sees the memory cache and searches nothing.
+        resolver.warmAppleIds(listOf(track().copy(id = 3, title = "Another Song")))
+        coVerify(exactly = 1) { repository.searchApple(cloud, any(), any()) }
+    }
+
+    @Test
+    fun `a Qobuz etsp expiry is used when exp is absent`() {
+        val mapped = mapStream(
+            EclipseAddonStream(
+                url = "https://streaming-qobuz-std.akamaized.net/file?etsp=1762000000&uid=1",
+                codec = "flac",
+                manifest = "none",
+                sampleRate = 44_100,
+                bitDepth = 24,
+            ),
+            nowMs = now,
+        )!!
+
+        assertThat(mapped.expiresAtMs).isEqualTo(1_762_000_000_000L)
+        assertThat(mapped.isHls).isFalse()
+    }
+
+    @Test
+    fun `a persistent URL is served without calling Cloud`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        val stored = StreamUrl(
+            url = "https://cdn.test/file.flac?etsp=1762000000",
+            expiresAtMs = Long.MAX_VALUE,
+            codec = "flac",
+            origin = "addon:eclipse-music-cloud",
+        )
+        val store: EclipseStreamUrlStore = mockk()
+        coEvery { store.get(any(), any(), any()) } returns stored
+        val memory: StreamUrlCache = mockk(relaxed = true)
+        every { memory.get(any()) } returns null
+        val diskResolver = EclipseAddonStreamResolver.forTest(
+            repository,
+            EclipseAddonResolveCache(),
+            cloudFastestSource = { false },
+            appleLookup = null,
+            urlCache = memory,
+            streamUrlStore = store,
+        )
+
+        val result = diskResolver.resolve(mario)
+
+        assertThat(result?.url).isEqualTo(stored.url)
+        io.mockk.coVerify(exactly = 0) { repository.resolve(any(), any(), any(), any(), any()) }
+        io.mockk.coVerify(exactly = 0) { repository.streamApple(any(), any(), any()) }
+        io.mockk.verify { memory.put(mario.id, stored) }
+    }
+
+    @Test
+    fun `a disabled addon does not read the persistent URL store`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        coEvery { repository.enabledNow() } returns emptyList()
+        val store: EclipseStreamUrlStore = mockk(relaxed = true)
+        val resolver = EclipseAddonStreamResolver.forTest(
+            repository,
+            EclipseAddonResolveCache(),
+            cloudFastestSource = { false },
+            streamUrlStore = store,
+        )
+
+        assertThat(resolver.resolve(mario)).isNull()
+        io.mockk.coVerify(exactly = 0) { store.get(any(), any(), any()) }
+    }
+
+    @Test
+    fun `a served addon URL is written to both caches`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val nebula = addon("nebula", resources = listOf("stream", "search"))
+        coEvery { repository.enabledNow() } returns listOf(nebula)
+        coEvery { repository.search(nebula, any(), any()) } returns listOf(
+            EclipseAddonTrack(id = "n1", title = "Blinding Lights", artist = "The Weeknd", duration = 200),
+        )
+        coEvery { repository.stream(nebula, "n1") } returns stream()
+        val store: EclipseStreamUrlStore = mockk(relaxed = true)
+        coEvery { store.get(any(), any(), any()) } returns null
+        val memory: StreamUrlCache = mockk(relaxed = true)
+        every { memory.get(any()) } returns null
+        val resolver = EclipseAddonStreamResolver.forTest(
+            repository,
+            EclipseAddonResolveCache(),
+            cloudFastestSource = { false },
+            urlCache = memory,
+            streamUrlStore = store,
+        )
+
+        assertThat(resolver.resolve(track())).isNotNull()
+        io.mockk.coVerify(exactly = 1) { store.put(nebula.id, any(), any(), any()) }
+        io.mockk.verify(exactly = 1) { memory.put(track().id, any()) }
+    }
+
+    private fun track() = TrackEntity(title = "Blinding Lights", artist = "The Weeknd", durationMs = 200_000)
+}

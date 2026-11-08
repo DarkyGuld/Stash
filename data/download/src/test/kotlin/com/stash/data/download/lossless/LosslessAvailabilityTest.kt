@@ -1,6 +1,8 @@
 package com.stash.data.download.lossless
 
 import com.google.common.truth.Truth.assertThat
+import com.stash.core.data.addons.EclipseAddon
+import com.stash.core.data.addons.EclipseAddonRepository
 import com.stash.data.download.lossless.qbdlx.QbdlxCredentialStore
 import com.stash.data.download.lossless.quota.LosslessQuota
 import com.stash.data.download.lossless.relay.LosslessConfigFetcher
@@ -20,6 +22,7 @@ class LosslessAvailabilityTest {
     private val custom = MutableStateFlow<String?>(null)
     private val tidalServer = MutableStateFlow<String?>(null)
     private val loginEmail = MutableStateFlow<String?>(null)
+    private val eclipseAddons = MutableStateFlow<List<EclipseAddon>>(emptyList())
     private val store: QbdlxCredentialStore = mockk {
         every { hasLogin } returns login
         every { connectedEmailFlow } returns loginEmail
@@ -32,7 +35,10 @@ class LosslessAvailabilityTest {
     private val relayClient: LosslessRelayClient = mockk()
     private var now = 1_000_000_000_000L
     private val quota = LosslessQuota.inMemory { now }
-    private val a = LosslessAvailability(store, config, prefs, relayClient, quota)
+    private val eclipseRepository: EclipseAddonRepository = mockk {
+        every { addons } returns eclipseAddons
+    }
+    private val a = LosslessAvailability(store, config, prefs, relayClient, quota, eclipseRepository)
 
     private fun stubNow(loginLive: Boolean = false, customNow: String? = null, cooled: Set<String> = emptySet()) {
         coEvery { store.loginLive() } returns loginLive
@@ -98,6 +104,42 @@ class LosslessAvailabilityTest {
         assertThat(a.anyUserOwnedNow()).isTrue()
         assertThat(a.qbdlxEnabledNow()).isTrue()
         assertThat(a.fileUrlAvailableNow()).isFalse()
+    }
+
+    // ── Installed Eclipse addons ───────────────────────────────────────────
+
+    private fun addon(id: String = "eclipse-music-cloud", enabled: Boolean = true) =
+        EclipseAddon(
+            id = id,
+            name = id,
+            version = "1",
+            manifestUrl = "https://addons.test/$id/manifest.json",
+            enabled = enabled,
+        )
+
+    @Test fun `an enabled Eclipse addon counts as a lossless source, so there is no warning`() = runTest {
+        eclipseAddons.value = listOf(addon())
+
+        assertThat(a.qbdlxEnabledNow()).isTrue()
+        assertThat(a.anyUserOwnedNow()).isTrue()
+        assertThat(row("eclipse-addon").label).isEqualTo("Eclipse addon")
+        assertThat(row("eclipse-addon").detail).isEqualTo("1 enabled")
+        assertThat(row("eclipse-addon").state).isEqualTo(RoutingState.CONFIGURED)
+        // After the relays, where streaming asks it (before JioSaavn).
+        assertThat(rows().map { it.id }).containsExactly("qobuz", "relay", "eclipse-addon").inOrder()
+    }
+
+    @Test fun `a disabled Eclipse addon changes nothing`() = runTest {
+        eclipseAddons.value = listOf(addon(enabled = false))
+
+        assertThat(a.qbdlxEnabledNow()).isFalse()
+        assertThat(a.anyUserOwnedNow()).isFalse()
+        assertThat(rows().map { it.id }).doesNotContain("eclipse-addon")
+    }
+
+    @Test fun `two enabled addons say so in the routing row`() = runTest {
+        eclipseAddons.value = listOf(addon("eclipse-music-cloud"), addon("nebula"))
+        assertThat(row("eclipse-addon").detail).isEqualTo("2 enabled")
     }
 
     // ── routingRows: what Settings › Audio renders ──────────────────────────

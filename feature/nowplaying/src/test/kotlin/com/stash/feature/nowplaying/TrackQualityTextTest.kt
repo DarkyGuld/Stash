@@ -13,9 +13,11 @@ class TrackQualityTextTest {
         rate: Int? = null,
         kbps: Int = 0,
         filePath: String? = null,
+        downloaded: Boolean = false,
     ) = Track(
         id = 1L, title = "t", artist = "a", fileFormat = format, bitsPerSample = bits,
         sampleRateHz = rate, qualityKbps = kbps, streamOrigin = origin, filePath = filePath,
+        isDownloaded = downloaded,
     )
 
     /** The quality line never names Qobuz or Tidal: the signal-path sheet does. */
@@ -37,6 +39,31 @@ class TrackQualityTextTest {
     @Test fun `lossy fallbacks keep the old suffixes`() {
         assertEquals("AAC · via JioSaavn", trackQualityText(track("aac", origin = "jiosaavn")))
         assertEquals("OPUS · 160 kbps · via YT", trackQualityText(track("opus", origin = "youtube", kbps = 160)))
+    }
+
+    /**
+     * A stream that hasn't resolved yet still carries the DB default
+     * fileFormat ("opus"). The line must stay empty instead of flashing
+     * OPUS and then disappearing when the real format lands.
+     */
+    @Test fun `an unresolved stream renders no line`() {
+        assertEquals(null, trackQualityText(track("opus")))
+        assertEquals(null, trackQualityText(track("opus", kbps = 160)))
+    }
+
+    @Test fun `a downloaded file without a path still shows its format`() {
+        assertEquals("FLAC", trackQualityText(track("flac", downloaded = true)))
+    }
+
+    @Test fun `an addon stream names the addon that served it`() {
+        assertEquals(
+            "FLAC · 24-bit/96.0 kHz · via Nebula",
+            trackQualityText(
+                track("flac", origin = "addon:Nebula", bits = 24, rate = 96_000),
+            ),
+        )
+        // A nameless stamp still says it came from the addon rung.
+        assertEquals("FLAC · via Addon", trackQualityText(track("flac", origin = "addon:")))
     }
 
     @Test fun `a downloaded file names no service`() {

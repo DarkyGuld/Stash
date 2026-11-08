@@ -54,6 +54,9 @@ class SettingsViewModelTest {
 
     private val likePreferences = mockk<com.stash.core.data.prefs.LikePreferences>(relaxed = true)
 
+    /** Stream URLs cached for the player; addon changes must invalidate them. */
+    private val streamUrlCache = mockk<com.stash.core.media.streaming.StreamUrlCache>(relaxed = true)
+
     private var themePreference: com.stash.core.data.prefs.ThemePreference = mockk(relaxed = true)
 
     private fun newVm(losslessConfigured: Boolean = true) = SettingsViewModel(
@@ -109,6 +112,12 @@ class SettingsViewModelTest {
         discordRpcCoordinator = mockk(relaxed = true),
         syncStateManager = com.stash.core.data.sync.SyncStateManager(),
         likeCoordinator = mockk(relaxed = true),
+        eclipseAddonRepository = mockk(relaxed = true) { every { addons } returns flowOf(emptyList()) },
+        eclipseAccountManager = mockk(relaxed = true) {
+            every { tokenPresent } returns flowOf(false)
+            every { user } returns flowOf(null)
+        },
+        streamUrlCache = streamUrlCache,
     )
 
     // -- Display size (UI scale) ---------------------------------------------
@@ -160,6 +169,34 @@ class SettingsViewModelTest {
         vm.refreshStorageUsage()
 
         verify(exactly = 1) { librarySizeHolder.refresh() }
+    }
+
+    @Test fun `addon changes clear the cached stream URLs`() = runTest {
+        val vm = newVm()
+
+        vm.onToggleAddon("eclipse-music-cloud", false)
+        advanceUntilIdle()
+        vm.onRemoveAddon("eclipse-music-cloud")
+        advanceUntilIdle()
+        vm.onAddonSettingChanged("eclipse-music-cloud", "quality", "LOSSLESS")
+        advanceUntilIdle()
+
+        // A cached addon URL must never outlive the addon that answered it.
+        verify(exactly = 3) { streamUrlCache.clear() }
+    }
+
+    @Test fun `only the Eclipse addon source switch clears cached URLs`() = runTest {
+        val vm = newVm()
+
+        vm.onSourceEnabledChanged(com.stash.core.data.prefs.StreamSourceToggle.QOBUZ, false)
+        advanceUntilIdle()
+        verify(exactly = 0) { streamUrlCache.clear() }
+
+        vm.onSourceEnabledChanged(com.stash.core.data.prefs.StreamSourceToggle.ECLIPSE_ADDONS, false)
+        advanceUntilIdle()
+        vm.onSourceEnabledChanged(com.stash.core.data.prefs.StreamSourceToggle.ECLIPSE_ADDONS, true)
+        advanceUntilIdle()
+        verify(exactly = 2) { streamUrlCache.clear() }
     }
 
     @Test fun `qbdlxExpired is true when no lossless path is configured`() = runTest {

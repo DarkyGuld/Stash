@@ -65,6 +65,7 @@ class EncryptedTokenStore @Inject constructor(
         val YOUTUBE = stringPreferencesKey("youtube_token")
         val DISCORD = stringPreferencesKey("discord_token")
         val SOUNDCLOUD = stringPreferencesKey("soundcloud_session")
+        val ECLIPSE = stringPreferencesKey("eclipse_account_token")
     }
 
     // ── Spotify ──────────────────────────────────────────────────────────
@@ -177,6 +178,30 @@ class EncryptedTokenStore @Inject constructor(
         context.authDataStore.edit { it.remove(Keys.SOUNDCLOUD) }
     }
 
+    // ── Eclipse Music account ────────────────────────────────────────────
+    //
+    // One account-wide token (the web session's), encrypted like every other
+    // credential. It is never exposed to the addon itself: EclipseAddonClient
+    // uses it only to mint a short-lived X-Eclipse-Access header.
+
+    /** Emits the stored Eclipse account token, or null when there is none / it can't be decrypted. */
+    val eclipseToken: Flow<String?> = context.authDataStore.data.map { prefs ->
+        prefs[Keys.ECLIPSE]?.let(::decryptString)
+    }
+
+    /** The stored Eclipse account token, read once. */
+    suspend fun getEclipseToken(): String? = eclipseToken.first()
+
+    /** Stores the Eclipse account token as an encrypted blob. */
+    suspend fun saveEclipseToken(token: String) {
+        saveBlob(Keys.ECLIPSE, encryptString(token))
+    }
+
+    /** Forgets the Eclipse account token. */
+    suspend fun clearEclipseToken() {
+        context.authDataStore.edit { it.remove(Keys.ECLIPSE) }
+    }
+
     private fun cloudKey(accountKey: String): Preferences.Key<String> {
         require(accountKey.matches(CLOUD_ACCOUNT_KEY)) { "bad cloud account key" }
         return stringPreferencesKey(CLOUD_PREFIX + accountKey)
@@ -195,6 +220,7 @@ class EncryptedTokenStore @Inject constructor(
                 prefs.remove(Keys.YOUTUBE)
                 prefs.remove(Keys.DISCORD)
                 prefs.remove(Keys.SOUNDCLOUD)
+                prefs.remove(Keys.ECLIPSE)
                 prefs.asMap().keys.map { it.name }.filter { it.startsWith(CLOUD_PREFIX) }
                     .forEach { prefs.remove(stringPreferencesKey(it)) }
             }
@@ -212,6 +238,18 @@ class EncryptedTokenStore @Inject constructor(
         val plaintext = json.encodeToString(StoredToken.serializer(), stored).toByteArray()
         val encrypted = encryption.encrypt(plaintext)
         return Base64.encodeToString(encrypted, Base64.NO_WRAP)
+    }
+
+    /** A single opaque secret (the Eclipse account token), sealed the same way as the service blobs. */
+    private fun encryptString(plaintext: String): String =
+        Base64.encodeToString(encryption.encrypt(plaintext.toByteArray(Charsets.UTF_8)), Base64.NO_WRAP)
+
+    /** Null on a blank blob or any decryption failure (an old keyset, a tampered file). */
+    private fun decryptString(encrypted: String): String? = try {
+        String(encryption.decrypt(Base64.decode(encrypted, Base64.NO_WRAP)), Charsets.UTF_8)
+            .takeIf { it.isNotBlank() }
+    } catch (_: Exception) {
+        null
     }
 
     /**

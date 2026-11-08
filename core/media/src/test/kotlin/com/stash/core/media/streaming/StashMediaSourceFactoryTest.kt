@@ -58,8 +58,78 @@ class StashMediaSourceFactoryTest {
         }
     }
 
-    private val streamingFactory: StreamingMediaSourceFactory = mockk(relaxed = true)
+    /** The playback pick with the addon hint on: an addon HLS answer must get the HLS child. */
+    @Test fun `an addon HLS answer picks the HLS child when the addon hint is on`() {
+        val streaming = mockk<StreamingMediaSourceFactory>(relaxed = true)
+        val resolver = mockk<StreamSourceRegistry>()
+        val dao = mockk<com.stash.core.data.db.dao.TrackDao>()
+        val stream = StreamUrl(
+            "https://cdn.test/api/tidal/hls/1.m3u8?exp=1762000000",
+            System.currentTimeMillis() + 300_000,
+            codec = "flac", origin = "addon", isHls = true,
+        )
+        val cache = StreamUrlCache()
+        io.mockk.coEvery { dao.getById(42) } returns com.stash.core.data.db.entity.TrackEntity(
+            id = 42, title = "Song", artist = "Artist")
+        io.mockk.coEvery { resolver.resolve(any(), any(), any(), any()) } returns stream
+        val item = MediaItem.Builder().setMediaId("42").setUri("stash-resolve://track/42").build()
+        val kid = mockk<MediaSource>(relaxed = true) {
+            every { mediaItem } returns item.buildUpon().setUri(stream.url).build()
+        }
+        every { streaming.createHlsMediaSource(any(), stream) } returns kid
 
+        val factory = StashMediaSourceFactory(
+            ApplicationProvider.getApplicationContext(), streaming,
+            { null }, { false }, OkHttpClient(), resolver, cache, dao,
+            resolveBeforeSourcePick = { true },
+            resolveDispatcher = kotlinx.coroutines.Dispatchers.Unconfined,
+        )
+        val source = factory.createMediaSource(item)
+        val caller = MediaSource.MediaSourceCaller { _, _ -> }
+        source.prepareSource(caller, null, androidx.media3.exoplayer.analytics.PlayerId.UNSET)
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+
+        verify(exactly = 1) { streaming.createHlsMediaSource(any(), stream) }
+        source.releaseSource(caller)
+    }
+
+    /** An addon direct file (Cloud's Qobuz FLAC) must take the cache-backed progressive child. */
+    @Test fun `an addon progressive answer picks the cache-backed child`() {
+        val streaming = mockk<StreamingMediaSourceFactory>(relaxed = true)
+        val resolver = mockk<StreamSourceRegistry>()
+        val dao = mockk<com.stash.core.data.db.dao.TrackDao>()
+        val stream = StreamUrl(
+            "https://streaming-qobuz-std.akamaized.net/file?etsp=1",
+            System.currentTimeMillis() + 300_000,
+            codec = "flac", origin = "addon:Cloud", isHls = false,
+        )
+        val cache = StreamUrlCache()
+        io.mockk.coEvery { dao.getById(42) } returns com.stash.core.data.db.entity.TrackEntity(
+            id = 42, title = "Song", artist = "Artist")
+        io.mockk.coEvery { resolver.resolve(any(), any(), any(), any()) } returns stream
+        val item = MediaItem.Builder().setMediaId("42").setUri("stash-resolve://track/42").build()
+        val kid = mockk<MediaSource>(relaxed = true) {
+            every { mediaItem } returns item.buildUpon().setUri(stream.url).build()
+        }
+        every { streaming.createAddonProgressive(any(), stream, 42L) } returns kid
+
+        val factory = StashMediaSourceFactory(
+            ApplicationProvider.getApplicationContext(), streaming,
+            { null }, { false }, OkHttpClient(), resolver, cache, dao,
+            resolveBeforeSourcePick = { true },
+            resolveDispatcher = kotlinx.coroutines.Dispatchers.Unconfined,
+        )
+        val source = factory.createMediaSource(item)
+        val caller = MediaSource.MediaSourceCaller { _, _ -> }
+        source.prepareSource(caller, null, androidx.media3.exoplayer.analytics.PlayerId.UNSET)
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+
+        verify(exactly = 1) { streaming.createAddonProgressive(any(), stream, 42L) }
+        verify(exactly = 0) { streaming.createHlsMediaSource(any(), any()) }
+        source.releaseSource(caller)
+    }
+
+    private val streamingFactory: StreamingMediaSourceFactory = mockk(relaxed = true)
     private fun item(uri: String): MediaItem = MediaItem.fromUri(uri)
 
     private fun newFactory(

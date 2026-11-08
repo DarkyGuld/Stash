@@ -103,6 +103,8 @@ class StreamSourceRegistry internal constructor(
      * tests (Qobuz first). Read with [qualityPolicy]'s tier: without a policy, Qobuz stays first too.
      */
     private val availability: LosslessAvailability? = null,
+    /** Eclipse addons as a streaming rung; null in hand-built tests (rung absent). */
+    private val addons: EclipseAddonStreamResolver? = null,
 ) {
     @Inject
     constructor(
@@ -121,10 +123,11 @@ class StreamSourceRegistry internal constructor(
         cloudCopies: CloudCopyFinder,
         soundCloud: SoundCloudStreamResolver,
         availability: LosslessAvailability,
+        addons: EclipseAddonStreamResolver,
     ) : this(
         kennyy, qobuz, qbdlx, jiosaavn, youtube, streamingPreference,
         losslessSourceHealth, losslessPrefs, Dispatchers.IO, diagnosticsLog, tidal, losslessQuota,
-        qualityPolicy, cloudCopies, soundCloud, availability,
+        qualityPolicy, cloudCopies, soundCloud, availability, addons,
     )
     /**
      * The user's own lossless copy of [track] in their cloud storage, as a [StreamUrl] whose url is
@@ -301,6 +304,18 @@ class StreamSourceRegistry internal constructor(
         // gets asked first; everything else in the normal chain is unchanged. The force-qbdlx
         // toggle outranks it (both on is contradictory; the older instrument wins).
         val skipQobuz = streamingPreference.isSkipQobuz()
+        // "Play from Eclipse addons first": the addons lead the chain, so a Cloud
+        // addon starts without waiting on Qobuz/Tidal misses. Not exclusive.
+        val addonsFirst = streamingPreference.isAddonsFirst()
+        // Per-source switches (Settings): all on by default. A disabled source leaves
+        // the chain entirely; all off means an empty chain and a null resolve. The
+        // debug force-test branches below deliberately ignore these switches — they
+        // are explicit test instruments, not user routing.
+        val qobuzOn = streamingPreference.isQobuzEnabled()
+        val tidalOn = streamingPreference.isTidalEnabled()
+        val eclipseAddonsOn = streamingPreference.isEclipseAddonsEnabled()
+        val jiosaavnOn = streamingPreference.isJiosaavnEnabled()
+        val youtubeOn = streamingPreference.isYoutubeEnabled()
         val resolvers = buildList<Pair<String, suspend (TrackEntity) -> StreamUrl?>> {
             if (streamingPreference.isForceQbdlxOnly()) {
                 // Test toggle: qbdlx (direct-Qobuz) ONLY — skip every other source
@@ -331,6 +346,14 @@ class StreamSourceRegistry internal constructor(
                 // add("kennyy" to kennyy::resolve)
                 // add("squid" to qobuz::resolve)
 
+                // Eclipse addons: the user's installed addons, in their order. With
+                // "Play from Eclipse addons first" on they lead the chain; otherwise
+                // they sit after the lossless relays and before JioSaavn. Foreground/
+                // next-up only (allowYtDlp), and only with Lossless on and Data saver
+                // not applying: an addon may serve lossy, so it is not a LOSSLESS_RUNG.
+                val addonRung = addons?.takeIf { allowYtDlp && losslessRungs && eclipseAddonsOn }
+                if (addonsFirst && addonRung != null) add("addon" to addonRung::resolve)
+
                 // Prefer Tidal AAC: Tidal's 320 kbps AAC (`?aac=only&hires=0`, the AAC
                 // download mode's request) ahead of Qobuz, for a listener saving data. Only
                 // where the Tidal rung itself runs (foreground, Lossless on, a relay set), and
@@ -340,7 +363,7 @@ class StreamSourceRegistry internal constructor(
                 // Kept where Data saver applies: AAC 320 is not FLAC, and the user who turned
                 // this on chose to spend the daily allowance on it (Data saver alone never does).
                 val tidalAacRung = tidal
-                if (preferTidalAac && allowYtDlp && lossless && tidalAacRung != null) {
+                if (tidalOn && preferTidalAac && allowYtDlp && lossless && tidalAacRung != null) {
                     // Speculative: like the Tidal rung, never make the relay search for a
                     // look-ahead. Stopping here (rather than skipping) keeps a Qobuz FLAC from
                     // being cached for a track the real play would stream as AAC.
@@ -355,7 +378,7 @@ class StreamSourceRegistry internal constructor(
                 // signed config. Same gates as qbdlx (foreground only, Lossless switch
                 // on, Data saver not applying): it spends a Tidal account. Off (returns null at once) when no
                 // server is configured.
-                val tidalRung = tidal?.takeIf { allowYtDlp && losslessRungs }
+                val tidalRung = tidal?.takeIf { allowYtDlp && losslessRungs && tidalOn }
                 // The user's own server, with none of their own Qobuz set up, goes
                 // BEFORE qbdlx, whose file URL would otherwise come from Stash's shared
                 // relay before their server was ever asked; qbdlx stays the fallback
@@ -376,7 +399,7 @@ class StreamSourceRegistry internal constructor(
                 // never the speculative background fill.
                 // qbdlx self-gates on LosslessAvailability (BYO / custom endpoint
                 // / relay); no build gate.
-                if (allowYtDlp && losslessRungs && !skipQobuz) {
+                if (qobuzOn && allowYtDlp && losslessRungs && !skipQobuz) {
                     add("qbdlx" to qbdlx::resolve)
                 }
                 if (tidalRung != null && ownTidalFirst) {
@@ -394,15 +417,18 @@ class StreamSourceRegistry internal constructor(
                         add("tidal" to { t: TrackEntity -> tidalRung.resolve(t) })
                     }
                 }
+                // Eclipse addons, in their place after the relays unless addons-first
+                // moved them to the front above.
+                if (!addonsFirst && addonRung != null) add("addon" to addonRung::resolve)
                 // AAC fallback at the policy's LossyQuality (320; 160 or 96 where Data saver
                 // applies). Foreground/next-up only: a
                 // speculative full-queue fill must not turn into one metadata
                 // search + media probe per track. Any miss/outage continues to
                 // the existing YouTube fallback below.
-                if (allowYouTube && allowYtDlp) {
+                if (jiosaavnOn && allowYouTube && allowYtDlp) {
                     add("jiosaavn" to jiosaavn::resolve)
                 }
-                if (allowYouTube) add("youtube" to { t: TrackEntity -> youtube.resolve(t, allowYtDlp) })
+                if (youtubeOn && allowYouTube) add("youtube" to { t: TrackEntity -> youtube.resolve(t, allowYtDlp) })
             }
         }
         // Which sources are actually IN PLAY for this resolve, and why.
@@ -433,8 +459,8 @@ class StreamSourceRegistry internal constructor(
         // consults JioSaavn first (its rank is unchanged), then the fast lane, and
         // only then the yt-dlp-capable rung. Foreground resolves only: the
         // speculative background fill keeps its cheap sequential chain.
-        val hedged = allowYouTube && allowYtDlp && resolvers.size > 1 && resolvers.last().first == "youtube" &&
-            resolvers.none { it.first == TIDAL_DEFERRED }
+        val hedged = allowYouTube && allowYtDlp && youtubeOn && resolvers.size > 1 &&
+            resolvers.last().first == "youtube" && resolvers.none { it.first == TIDAL_DEFERRED }
 
         // For the diagnostics bundle's "Recent resolves": the rung that served, set at each
         // exit below. Still null when the walk ends means every rung missed.

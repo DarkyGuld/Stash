@@ -1,6 +1,7 @@
 package com.stash.data.download.lossless
 
 import com.google.common.truth.Truth.assertThat
+import com.stash.core.data.addons.EclipseAddonRepository
 import com.stash.data.download.lossless.qbdlx.QbdlxCredentialStore
 import com.stash.data.download.lossless.quota.LosslessQuota
 import com.stash.data.download.lossless.relay.LosslessConfigFetcher
@@ -56,6 +57,7 @@ class LosslessSourceRegistryTest {
         prefs = prefs,
         relayClient = mockk(),
         quota = LosslessQuota.inMemory { 0L },
+        eclipseAddons = mockk { every { addons } returns MutableStateFlow(emptyList()) },
     )
 
     private val query = TrackQuery(artist = "A", title = "B")

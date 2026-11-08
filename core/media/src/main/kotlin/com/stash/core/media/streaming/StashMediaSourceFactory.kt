@@ -207,7 +207,8 @@ class StashMediaSourceFactory(
         if (uri?.scheme == STASH_RESOLVE_SCHEME) {
             val trackId = uri.lastPathSegment?.toLongOrNull()
             if (trackId != null && !isRowOverride(uri) && streamAllowed() &&
-                (resolveBeforeSourcePick() || uri.getQueryParameter("sc") == "1" || urlCache.get(trackId)?.origin == "soundcloud")) {
+                (resolveBeforeSourcePick() || uri.getQueryParameter("sc") == "1" ||
+                    urlCache.get(trackId)?.origin == "soundcloud" || urlCache.get(trackId)?.isHls == true)) {
                 return ResolveFirstMediaSource(
                     mediaItem = mediaItem,
                     scope = resolveScope,
@@ -225,10 +226,14 @@ class StashMediaSourceFactory(
                         }
                     },
                     childFor = { item, resolved ->
+                        val addon = resolved?.origin?.startsWith("${EclipseAddonStreamResolver.ORIGIN}") == true
                         if (resolved?.isHls == true) {
                             streamingFactory.createHlsMediaSource(item, resolved)
                         } else if (resolved?.isDash == true) {
                             streamingFactory.createDashMediaSource(item, resolved.url)
+                        } else if (resolved != null && addon) {
+                            // Addon progressive file: cache it under the stable addon key.
+                            streamingFactory.createAddonProgressive(item, resolved, trackId)
                         } else {
                             lazyFactory.createMediaSource(item)
                         }

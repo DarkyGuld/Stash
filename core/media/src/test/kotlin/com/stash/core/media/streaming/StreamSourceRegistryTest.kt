@@ -1,6 +1,7 @@
 package com.stash.core.media.streaming
 
 import com.google.common.truth.Truth.assertThat
+import com.stash.core.data.addons.EclipseAddonRepository
 import com.stash.core.data.db.entity.TrackEntity
 import com.stash.core.data.prefs.StreamingPreference
 import com.stash.core.media.diagnostics.PlaybackDiagnosticsLog
@@ -44,6 +45,12 @@ class StreamSourceRegistryTest {
         // Default: no test toggle on. Individual tests override as needed.
         coEvery { isForceQbdlxOnly() } returns false
         coEvery { isSkipQobuz() } returns false
+        coEvery { isAddonsFirst() } returns false
+        coEvery { isQobuzEnabled() } returns true
+        coEvery { isTidalEnabled() } returns true
+        coEvery { isEclipseAddonsEnabled() } returns true
+        coEvery { isJiosaavnEnabled() } returns true
+        coEvery { isYoutubeEnabled() } returns true
     }
 
     private val losslessPrefs: LosslessSourcePreferences = mockk {
@@ -68,6 +75,14 @@ class StreamSourceRegistryTest {
     private fun registryWithTidal(tidal: TidalStreamResolver) = StreamSourceRegistry(
         kennyy, qobuz, qbdlx, jiosaavn, youtube, streamingPreference,
         LosslessSourceHealth(), losslessPrefs, Dispatchers.IO, log, tidal,
+    )
+
+    private fun registryWithAddon(
+        addon: EclipseAddonStreamResolver,
+        tidal: TidalStreamResolver? = null,
+    ) = StreamSourceRegistry(
+        kennyy, qobuz, qbdlx, jiosaavn, youtube, streamingPreference,
+        LosslessSourceHealth(), losslessPrefs, Dispatchers.IO, log, tidal, addons = addon,
     )
 
     private fun registryPreferringAac(tidal: TidalStreamResolver, prefer: Boolean) = StreamSourceRegistry(
@@ -393,9 +408,208 @@ class StreamSourceRegistryTest {
         coVerify { youtube.resolve(track, allowYtDlp = false) }
     }
 
+    // ── Eclipse addons first ────────────────────────────────────────────────
+
     @Test
-    fun `normal foreground chain tries jiosaavn before youtube`() = runTest {
+    fun `addons first asks the Eclipse addon before qbdlx and Tidal`() = runTest {
+        coEvery { streamingPreference.isAddonsFirst() } returns true
         coEvery { streamingPreference.isForceYouTubeFallback() } returns false
+        coEvery { qbdlx.resolve(any()) } returns stubStreamUrl("qbdlx")
+        coEvery { youtube.resolve(any(), any()) } returns null
+        val tidal: TidalStreamResolver = mockk {
+            coEvery { resolve(any()) } returns null
+        }
+        val addon: EclipseAddonStreamResolver = mockk {
+            coEvery { resolve(any()) } returns null
+        }
+
+        val result = registryWithAddon(addon, tidal).resolve(stubTrack())
+
+        // The addon missed first; Qobuz answered next.
+        assertThat(result!!.origin).isEqualTo("qbdlx")
+        coVerifyOrder {
+            addon.resolve(any())
+            qbdlx.resolve(any())
+        }
+    }
+
+    @Test
+    fun `addons last keeps qbdlx ahead of the Eclipse addon`() = runTest {
+        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
+        coEvery { qbdlx.resolve(any()) } returns null
+        coEvery { youtube.resolve(any(), any()) } returns null
+        val tidal: TidalStreamResolver = mockk { coEvery { resolve(any()) } returns null }
+        val addon: EclipseAddonStreamResolver = mockk {
+            coEvery { resolve(any()) } returns stubStreamUrl("addon")
+        }
+
+        val result = registryWithAddon(addon, tidal).resolve(stubTrack())
+
+        assertThat(result!!.origin).isEqualTo("addon")
+        coVerifyOrder {
+            qbdlx.resolve(any())
+            addon.resolve(any())
+        }
+    }
+
+    @Test
+    fun `addons first still falls back to jiosaavn when every lossless rung misses`() = runTest {
+        coEvery { streamingPreference.isAddonsFirst() } returns true
+        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
+        coEvery { qbdlx.resolve(any()) } returns null
+        coEvery { jiosaavn.resolve(any()) } returns stubStreamUrl("jiosaavn")
+        coEvery { youtube.resolve(any(), any()) } returns null
+        val addon: EclipseAddonStreamResolver = mockk { coEvery { resolve(any()) } returns null }
+
+        val result = registryWithAddon(addon).resolve(stubTrack())
+
+        assertThat(result!!.origin).isEqualTo("jiosaavn")
+    }
+
+    @Test
+    fun `addons first still falls back to youtube when jiosaavn and every lossless rung miss`() = runTest {
+        coEvery { streamingPreference.isAddonsFirst() } returns true
+        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
+        coEvery { qbdlx.resolve(any()) } returns null
+        coEvery { jiosaavn.resolve(any()) } returns null
+        coEvery { youtube.resolve(any(), any()) } returns stubStreamUrl("youtube")
+        val addon: EclipseAddonStreamResolver = mockk { coEvery { resolve(any()) } returns null }
+
+        val result = registryWithAddon(addon).resolve(stubTrack())
+
+        assertThat(result!!.origin).isEqualTo("youtube")
+    }
+
+    // ── Per-source switches ─────────────────────────────────────────────────
+
+    @Test
+    fun `a disabled qbdlx rung is never asked, even when it would have served`() = runTest {
+        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
+        coEvery { streamingPreference.isQobuzEnabled() } returns false
+        coEvery { qbdlx.resolve(any()) } returns stubStreamUrl("qbdlx")
+        coEvery { jiosaavn.resolve(any()) } returns stubStreamUrl("jiosaavn")
+        coEvery { youtube.resolve(any(), any()) } returns null
+
+        val result = registry().resolve(stubTrack())
+
+        assertThat(result!!.origin).isEqualTo("jiosaavn")
+        coVerify(exactly = 0) { qbdlx.resolve(any()) }
+    }
+
+    @Test
+    fun `a disabled Tidal source skips both the AAC and the FLAC rungs`() = runTest {
+        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
+        coEvery { streamingPreference.isTidalEnabled() } returns false
+        coEvery { qbdlx.resolve(any()) } returns null
+        coEvery { jiosaavn.resolve(any()) } returns stubStreamUrl("jiosaavn")
+        coEvery { youtube.resolve(any(), any()) } returns null
+        val tidal: TidalStreamResolver = mockk {
+            coEvery { resolveAacOnly(any()) } returns stubStreamUrl("tidal")
+            coEvery { resolveLossless(any()) } returns stubStreamUrl("tidal")
+            coEvery { resolve(any()) } returns stubStreamUrl("tidal")
+        }
+
+        val result = registryPreferringAac(tidal, prefer = true).resolve(stubTrack())
+
+        assertThat(result!!.origin).isEqualTo("jiosaavn")
+        coVerify(exactly = 0) { tidal.resolveAacOnly(any()) }
+        coVerify(exactly = 0) { tidal.resolveLossless(any()) }
+        coVerify(exactly = 0) { tidal.resolve(any()) }
+    }
+
+    @Test
+    fun `a disabled Eclipse addon rung never asks the addon`() = runTest {
+        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
+        coEvery { streamingPreference.isEclipseAddonsEnabled() } returns false
+        coEvery { qbdlx.resolve(any()) } returns stubStreamUrl("qbdlx")
+        coEvery { youtube.resolve(any(), any()) } returns null
+        val addon: EclipseAddonStreamResolver = mockk {
+            coEvery { resolve(any()) } returns stubStreamUrl("addon")
+        }
+
+        val result = registryWithAddon(addon).resolve(stubTrack())
+
+        assertThat(result!!.origin).isEqualTo("qbdlx")
+        coVerify(exactly = 0) { addon.resolve(any()) }
+    }
+
+    @Test
+    fun `with JioSaavn and YouTube off there is no lossy fallback`() = runTest {
+        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
+        coEvery { streamingPreference.isQobuzEnabled() } returns false
+        coEvery { streamingPreference.isJiosaavnEnabled() } returns false
+        coEvery { streamingPreference.isYoutubeEnabled() } returns false
+        coEvery { jiosaavn.resolve(any()) } returns stubStreamUrl("jiosaavn")
+        coEvery { youtube.resolve(any(), any()) } returns stubStreamUrl("youtube")
+
+        val result = registry().resolve(stubTrack())
+
+        assertThat(result).isNull()
+        coVerify(exactly = 0) { jiosaavn.resolve(any()) }
+        coVerify(exactly = 0) { youtube.resolve(any(), any()) }
+    }
+
+    @Test
+    fun `every source off means an empty chain and a null resolve`() = runTest {
+        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
+        coEvery { streamingPreference.isQobuzEnabled() } returns false
+        coEvery { streamingPreference.isTidalEnabled() } returns false
+        coEvery { streamingPreference.isEclipseAddonsEnabled() } returns false
+        coEvery { streamingPreference.isJiosaavnEnabled() } returns false
+        coEvery { streamingPreference.isYoutubeEnabled() } returns false
+        coEvery { qbdlx.resolve(any()) } returns stubStreamUrl("qbdlx")
+
+        assertThat(registry().resolve(stubTrack())).isNull()
+        coVerify(exactly = 0) { qbdlx.resolve(any()) }
+        coVerify(exactly = 0) { jiosaavn.resolve(any()) }
+        coVerify(exactly = 0) { youtube.resolve(any(), any()) }
+    }
+
+    @Test
+    fun `the hedged lanes do not consult a disabled JioSaavn`() = runTest {
+        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
+        coEvery { streamingPreference.isJiosaavnEnabled() } returns false
+        coEvery { qbdlx.resolve(any()) } returns null
+        coEvery { jiosaavn.resolve(any()) } returns stubStreamUrl("jiosaavn")
+        coEvery { youtube.resolve(any(), any()) } returns stubStreamUrl("youtube")
+
+        val result = registry().resolve(stubTrack())
+
+        assertThat(result!!.origin).isEqualTo("youtube")
+        coVerify(exactly = 0) { jiosaavn.resolve(any()) }
+    }
+
+    @Test
+    fun `a disabled YouTube means no hedge and JioSaavn still serves in its turn`() = runTest {
+        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
+        coEvery { streamingPreference.isYoutubeEnabled() } returns false
+        coEvery { qbdlx.resolve(any()) } returns null
+        coEvery { jiosaavn.resolve(any()) } returns stubStreamUrl("jiosaavn")
+        coEvery { youtube.resolve(any(), any()) } returns stubStreamUrl("youtube")
+
+        val result = registry().resolve(stubTrack())
+
+        assertThat(result!!.origin).isEqualTo("jiosaavn")
+        coVerify(exactly = 0) { youtube.resolve(any(), allowYtDlp = true) }
+    }
+
+    @Test
+    fun `a speculative next-up still asks the addon rung`() = runTest {
+        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
+        coEvery { qbdlx.resolve(any()) } returns null
+        coEvery { youtube.resolve(any(), any()) } returns null
+        val addon: EclipseAddonStreamResolver = mockk {
+            coEvery { resolve(any()) } returns stubStreamUrl("addon")
+        }
+
+        val result = registryWithAddon(addon).resolve(stubTrack(), speculative = true)
+
+        assertThat(result!!.origin).isEqualTo("addon")
+        coVerify(exactly = 1) { addon.resolve(any()) }
+    }
+
+    @Test
+    fun `normal foreground chain tries jiosaavn before youtube`() = runTest {        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
         coEvery { qbdlx.resolve(any()) } returns null
         coEvery { jiosaavn.resolve(any()) } returns null
         coEvery { youtube.resolve(any(), any()) } returns null
@@ -829,6 +1043,7 @@ class StreamSourceRegistryTest {
             prefs = losslessPrefs,
             relayClient = mockk(),
             quota = mockk(),
+            eclipseAddons = mockk { every { addons } returns MutableStateFlow(emptyList()) },
         )
         return StreamSourceRegistry(
             kennyy, qobuz, qbdlx, jiosaavn, youtube, streamingPreference,

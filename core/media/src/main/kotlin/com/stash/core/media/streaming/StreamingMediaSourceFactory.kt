@@ -4,6 +4,7 @@ import androidx.annotation.OptIn
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.datasource.cache.CacheDataSink
 import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.cache.SimpleCache
@@ -66,6 +67,13 @@ class StreamingMediaSourceFactory @Inject constructor(
     private val resolver: StreamSourceRegistry,
     private val urlCache: StreamUrlCache,
     private val trackDao: TrackDao,
+    /**
+     * The app-wide client, for addon HLS only: its connection pool is the one
+     * [com.stash.core.data.addons.EclipseAddonClient] already warmed for the
+     * `/applemusic/stream` answer, so the m3u8 and its segments reuse that
+     * DNS/TCP/TLS connection instead of opening a fresh one each.
+     */
+    okHttpClient: okhttp3.OkHttpClient,
 ) {
     /**
      * False in Download mode, read when each source opens ([DownloadModeGate]): the playback service sets it once. Every
@@ -73,6 +81,19 @@ class StreamingMediaSourceFactory @Inject constructor(
      */
     @Volatile
     var streamAllowed: () -> Boolean = { true }
+
+    /**
+     * HLS transport: the shared client's pool with the old DefaultHttpDataSource
+     * timeouts, and no cross-protocol redirects (OkHttp follows same-protocol
+     * ones, `followSslRedirects = false` blocks https↔http). No headers are
+     * added here; the shared client carries no Eclipse Authorization interceptor.
+     */
+    private val hlsHttpClient = okHttpClient.newBuilder()
+        .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+        .writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+        .followSslRedirects(false)
+        .build()
 
     fun create(trackId: Long): MediaSource.Factory {
         val cachedFactory = CacheDataSource.Factory()
@@ -117,18 +138,45 @@ class StreamingMediaSourceFactory @Inject constructor(
         return DashMediaSource.Factory(DownloadModeGate.gate(httpFactory, { streamAllowed() })).createMediaSource(item)
     }
 
+    /**
+     * A progressive addon file (Cloud's direct Qobuz FLAC) over the shared
+     * [SimpleCache]: keyed by track/addon/quality/path (signed query ignored), so
+     * the player and the first-chunk prefetcher read and write the same entry.
+     * No `FLAG_BLOCK_ON_CACHE`: the player reads cached spans and fetches the
+     * rest, even while a prefetch is still filling the tail.
+     */
+    fun createAddonProgressive(
+        mediaItem: MediaItem,
+        stream: StreamUrl,
+        trackId: Long?,
+    ): MediaSource {
+        val cacheFactory = CacheDataSource.Factory()
+            .setCache(streamCache)
+            .setUpstreamDataSourceFactory(OkHttpDataSource.Factory(hlsHttpClient))
+            .setCacheKeyFactory(EclipseAddonCacheKeyFactory(trackId, stream))
+            .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+        val item = mediaItem.buildUpon().setUri(stream.url).build()
+        return DefaultMediaSourceFactory(DownloadModeGate.gate(cacheFactory, { streamAllowed() }))
+            .createMediaSource(item)
+    }
+
     fun createHlsMediaSource(mediaItem: MediaItem, stream: StreamUrl): MediaSource {
         val current = java.util.concurrent.atomic.AtomicReference(stream.url)
         val trackId = mediaItem.mediaId.toLongOrNull()
-        val http = DefaultHttpDataSource.Factory().setConnectTimeoutMs(10_000).setReadTimeoutMs(30_000)
-            .setAllowCrossProtocolRedirects(false)
+        val http = OkHttpDataSource.Factory(hlsHttpClient)
         val source = DataSource.Factory {
             HlsManifestDataSource(http.createDataSource(), stream.url, current, { streamAllowed() },
                 refresh = {
                     if (trackId == null) null else kotlinx.coroutines.runBlocking(kotlinx.coroutines.Dispatchers.IO) {
                         kotlinx.coroutines.withTimeoutOrNull(30_000) {
                             trackDao.getById(trackId)?.let { resolver.resolve(it) }
-                                ?.takeIf { it.isHls && it.origin == "soundcloud" && it.codec == stream.codec && it.isPreview == stream.isPreview }
+                                ?.takeIf {
+                                    it.isHls &&
+                                        (it.origin == "soundcloud" ||
+                                            it.origin == EclipseAddonStreamResolver.ORIGIN ||
+                                            it.origin?.startsWith("${EclipseAddonStreamResolver.ORIGIN}:") == true) &&
+                                        it.codec == stream.codec && it.isPreview == stream.isPreview
+                                }
                                 ?.also { urlCache.put(trackId, it) }?.url
                         }
                     }

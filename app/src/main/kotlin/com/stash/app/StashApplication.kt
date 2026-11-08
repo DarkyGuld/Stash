@@ -165,6 +165,10 @@ class StashApplication : Application(), Configuration.Provider {
     @Inject
     lateinit var streamingPreference: com.stash.core.data.prefs.StreamingPreference
 
+    /** One-time Cloud Apple-quality migration (HI_RES->HI_RES_MAX) on upgrade. */
+    @Inject
+    lateinit var eclipseAddonPreferences: com.stash.core.data.addons.EclipseAddonPreferences
+
     @Inject
     lateinit var streamingQualityPreferences: com.stash.data.download.prefs.StreamingQualityPreferences
 
@@ -475,6 +479,12 @@ class StashApplication : Application(), Configuration.Provider {
         applicationScope.launch {
             runCatching { musicRepository.ensureDownloadsMixSeeded() }
                 .onFailure { Log.w("StashStartup", "ensureDownloadsMixSeeded failed", it) }
+        }
+        // Cloud's fast Apple tier (direct Qobuz FLAC instead of Tidal HLS) for installs
+        // made before it was the default; runs once, the store keeps the flag.
+        applicationScope.launch {
+            runCatching { eclipseAddonPreferences.migrateCloudAppleQualityOnce() }
+                .onFailure { Log.w("StashStartup", "cloud apple-quality migration failed", it) }
         }
         // A wrong-match swap cut short by the app being killed (#531): put the
         // old file back, or drop its set-aside copy, before any swap runs.
