@@ -107,11 +107,20 @@ class StashPlaybackService : MediaLibraryService() {
     private fun markLatencyStart(item: MediaItem?) {
         val mediaItem = item ?: return
         val id = latencyTrackId(mediaItem) ?: return
+        val origin = mediaItem.mediaMetadata.extras?.getString(EXTRA_STREAM_ORIGIN)
         stashLatency.start(
             trackId = id,
             title = mediaItem.mediaMetadata.title?.toString(),
-            origin = mediaItem.mediaMetadata.extras?.getString(EXTRA_STREAM_ORIGIN),
+            origin = origin,
         )
+        // Known-at-start cases: a local file or a warm URL. A cold resolve reports later.
+        val scheme = mediaItem.localConfiguration?.uri?.scheme?.lowercase()
+        val source = when {
+            scheme in setOf("file", "content", "android.resource") -> "local"
+            streamUrlCache.get(id) != null -> "memory"
+            else -> null
+        }
+        if (source != null) stashLatency.urlAvailable(id, origin, source)
     }
 
     private fun latencyFirstAudio(player: Player?) {
@@ -699,7 +708,11 @@ class StashPlaybackService : MediaLibraryService() {
 
         override fun onPlaybackStateChanged(playbackState: Int) {
             refreshPlayerIdle()
-            if (playbackState == Player.STATE_READY) latencyFirstAudio(crossfadeEngine?.masterPlayer)
+            if (playbackState == Player.STATE_READY) {
+                val master = crossfadeEngine?.masterPlayer
+                stashLatency.ready(latencyTrackId(master?.currentMediaItem))
+                latencyFirstAudio(master)
+            }
         }
 
         override fun onPlayerError(error: PlaybackException) {

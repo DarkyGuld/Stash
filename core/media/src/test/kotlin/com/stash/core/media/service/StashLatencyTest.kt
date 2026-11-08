@@ -71,6 +71,25 @@ class StashLatencyTest {
     }
 
     @Test
+    fun `url and ready phases are logged with their offsets`() {
+        val latency = latency()
+        latency.start(trackId = 42, title = "Mario", origin = "addon:Cloud")
+        now = 100
+        latency.urlAvailable(42, "addon:Cloud", "memory")
+        now = 600
+        latency.ready(42)
+        now = 800
+        latency.firstAudio(42)
+
+        assertThat(lines).hasSize(3)
+        assertThat(lines[0]).contains("url available from memory in 100 ms")
+        assertThat(lines[1]).contains("STATE_READY in 600 ms")
+        assertThat(lines[2]).contains("first audio in 800 ms")
+        assertThat(lines[2]).contains("url=100 ms from memory")
+        assertThat(lines[2]).contains("ready=600 ms")
+    }
+
+    @Test
     fun `no valid track id means no measurement`() {
         val latency = latency()
         latency.start(trackId = 0, title = "None", origin = null)
