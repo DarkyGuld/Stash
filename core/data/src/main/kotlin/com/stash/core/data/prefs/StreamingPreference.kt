@@ -57,6 +57,7 @@ class StreamingPreference @Inject constructor(
     private val skipQobuzKey = booleanPreferencesKey("test_skip_qobuz")
     private val addonsFirstKey = booleanPreferencesKey("eclipse_addons_first")
     private val cloudFastestSourceKey = booleanPreferencesKey("eclipse_cloud_fastest_source")
+    private val prefetchSearchResultsKey = booleanPreferencesKey("prefetch_search_results")
     private val qobuzEnabledKey = booleanPreferencesKey("stream_source_qobuz")
     private val tidalEnabledKey = booleanPreferencesKey("stream_source_tidal")
     private val addonsEnabledKey = booleanPreferencesKey("stream_source_eclipse_addons")
@@ -138,6 +139,11 @@ class StreamingPreference @Inject constructor(
         prefs[cloudFastestSourceKey] ?: true
     }
 
+    /** "Prefetch search results": warm the likely tap's URL/first chunk, on by default. */
+    val prefetchSearchResults: Flow<Boolean> = context.streamingDataStore.data.map { prefs ->
+        prefs[prefetchSearchResultsKey] ?: true
+    }
+
     // Per-source switches in the streaming chain. All on by default: the chain
     // behaves exactly as before until the user turns one off (the UI's way to
     // force a source, e.g. only Cloud). No dev gate: these are user settings.
@@ -211,6 +217,8 @@ class StreamingPreference @Inject constructor(
     /** Whether Cloud races Tidal and Apple (first strong result wins). */
     suspend fun isCloudFastestSource(): Boolean = cloudFastestSource.first()
 
+    suspend fun isPrefetchSearchResults(): Boolean = prefetchSearchResults.first()
+
     suspend fun isQobuzEnabled(): Boolean = qobuzEnabled.first()
 
     suspend fun isTidalEnabled(): Boolean = tidalEnabled.first()
@@ -247,6 +255,10 @@ class StreamingPreference @Inject constructor(
 
     suspend fun setCloudFastestSource(value: Boolean) {
         context.streamingDataStore.edit { it[cloudFastestSourceKey] = value }
+    }
+
+    suspend fun setPrefetchSearchResults(value: Boolean) {
+        context.streamingDataStore.edit { it[prefetchSearchResultsKey] = value }
     }
 
     suspend fun setQobuzEnabled(value: Boolean) {

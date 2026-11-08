@@ -3,6 +3,7 @@ package com.stash.core.media.streaming
 import android.util.Log
 import com.stash.core.data.addons.EclipseAddon
 import com.stash.core.data.addons.EclipseAddonException
+import com.stash.core.data.addons.EclipseAddonQuery
 import com.stash.core.data.addons.EclipseAddonRepository
 import com.stash.core.data.addons.EclipseAddonStream
 import com.stash.core.data.addons.EclipseAddonTrack
@@ -64,7 +65,7 @@ class EclipseAddonStreamResolver private constructor(
     internal constructor(repository: EclipseAddonRepository) :
         this(repository, EclipseAddonResolveCache(), { false }, null, null, null)
 
-    suspend fun resolve(track: TrackEntity): StreamUrl? {
+    suspend fun resolve(track: TrackEntity, speculative: Boolean = false): StreamUrl? {
         val query = "${track.artist} ${track.title}".trim()
         if (query.isEmpty()) return null
         val startedNs = System.nanoTime()
@@ -79,7 +80,7 @@ class EclipseAddonStreamResolver private constructor(
                 if (addon.isEclipseCloud) {
                     // Cloud: Tidal and the Apple catalog are looked up together, so a
                     // Tidal miss does not pay the iTunes search latency.
-                    cloudResolve(addon, track, startedNs)?.let { return it }
+                    cloudResolve(addon, track, startedNs, speculative)?.let { return it }
                     continue
                 }
 
@@ -113,11 +114,12 @@ class EclipseAddonStreamResolver private constructor(
         addon: EclipseAddon,
         track: TrackEntity,
         startedNs: Long,
+        speculative: Boolean,
     ): StreamUrl? =
         if (cloudFastestSource()) {
-            fastestCloudResolve(addon, track, startedNs)
+            fastestCloudResolve(addon, track, startedNs, speculative)
         } else {
-            tidalFirstCloudResolve(addon, track, startedNs)
+            tidalFirstCloudResolve(addon, track, startedNs, speculative)
         }
 
     /** Tidal-first (the switch off): today's behaviour, Apple only after a Tidal miss. */
@@ -125,11 +127,12 @@ class EclipseAddonStreamResolver private constructor(
         addon: EclipseAddon,
         track: TrackEntity,
         startedNs: Long,
+        speculative: Boolean,
     ): StreamUrl? = coroutineScope {
         val tidalKey = resolveCacheKey(addon, track)
         val appleKey = appleCacheKey(addon, track)
 
-        val appleSearch = async { appleHits(addon, track, appleKey) }
+        val appleSearch = async { appleHits(addon, track, appleKey, speculative) }
         val tidalLookup = async { cachedResolveId(addon, track, tidalKey, CLOUD_TIDAL_MISS_TTL_MS) }
 
         val tidalId = try {
@@ -171,12 +174,13 @@ class EclipseAddonStreamResolver private constructor(
         addon: EclipseAddon,
         track: TrackEntity,
         startedNs: Long,
+        speculative: Boolean,
     ): StreamUrl? = coroutineScope {
         val tidalKey = resolveCacheKey(addon, track)
         val appleKey = appleCacheKey(addon, track)
 
         val tidal = async { tidalRace(addon, track, tidalKey, startedNs) }
-        val apple = async { appleRace(addon, track, appleKey, startedNs) }
+        val apple = async { appleRace(addon, track, appleKey, startedNs, speculative) }
 
         val first = kotlinx.coroutines.selects.select<Pair<kotlinx.coroutines.Deferred<CloudRace?>, CloudRace?>> {
             tidal.onAwait { tidal to it }
@@ -243,9 +247,10 @@ class EclipseAddonStreamResolver private constructor(
         track: TrackEntity,
         appleKey: String,
         startedNs: Long,
+        speculative: Boolean,
     ): CloudRace? =
         try {
-            val hits = appleHits(addon, track, appleKey) ?: return null
+            val hits = appleHits(addon, track, appleKey, speculative) ?: return null
             val strongId = strongAppleId(track, hits) ?: return null
             val url = mapStream(streamAppleWithRetry(addon, strongId, track.isrc))
                 ?.let { served(addon, track, it, startedNs) }
@@ -341,10 +346,18 @@ class EclipseAddonStreamResolver private constructor(
         addon: EclipseAddon,
         track: TrackEntity,
         key: String,
+        speculative: Boolean,
     ): List<EclipseAppleTrack>? {
         val cached = cachedAppleId(addon, track, key)
         if (cached != null) {
-            val id = cached.appleId ?: return null
+            val id = cached.appleId
+            // A cached MISS may only spare a speculative lookup. A user play always
+            // searches again: one stale negative (a bad query, a catalog that has
+            // since gained the track) must not bend playback to another source.
+            if (id == null) {
+                if (speculative) return null
+                Log.d(TAG, "ignoring cached Apple miss for foreground play; searching")
+            } else {
             val trackId = id.toLongOrNull() ?: return null
             // A synthetic hit that matches itself, so the Apple path needs no re-search.
             return listOf(
@@ -355,6 +368,7 @@ class EclipseAddonStreamResolver private constructor(
                     trackTimeMillis = track.durationMs,
                 ),
             )
+            }
         }
         return try {
             repository.searchApple(addon, track.title, track.artist)
@@ -387,7 +401,11 @@ class EclipseAddonStreamResolver private constructor(
     private suspend fun rememberAppleId(addon: EclipseAddon, track: TrackEntity, appleId: String?) {
         val key = appleCacheKey(addon, track)
         resolveCache.put(key, appleId)
-        appleLookup?.put(addon.id, identityKey(track), appleId)
+        // Negatives are in-memory only: a persistent 24 h miss once hid a playable
+        // track for a day. Positives are stable and do go to disk.
+        if (appleId != null) {
+            appleLookup?.put(addon.id, identityKey(track), appleId)
+        }
         Log.d(TAG, "apple id for ${track.id} ${if (appleId == null) "recorded as a miss" else "cached"}")
     }
 
@@ -555,6 +573,26 @@ class EclipseAddonStreamResolver private constructor(
                 throw e
             } catch (e: Exception) {
                 Log.d(TAG, "addon '${addon.name}' resolve-isrc missed for ${track.id}: ${failureSummary(e)}")
+            }
+        }
+        // Version suffixes and multi-artist credits break some catalogs' search;
+        // the cleaned variants are only tried after the full query missed. The id
+        // goes into the same track-identity cache entry as a full-query hit.
+        if (addon.supportsResolve) {
+            for ((title, artist) in EclipseAddonQuery.variants(track.title, track.artist).drop(1)) {
+                try {
+                    repository.resolve(
+                        addon = addon,
+                        title = title,
+                        artist = artist,
+                        durationMs = track.durationMs.takeIf { it > 0 },
+                        isrc = null,
+                    )?.let { return it.id }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.d(TAG, "addon '${addon.name}' variant resolve missed for ${track.id}: ${failureSummary(e)}")
+                }
             }
         }
         return null
@@ -802,12 +840,19 @@ internal object EclipseAddonMatcher {
 
         val title = normalize(track.title)
         if (title.isEmpty()) return null
+        // A version suffix ("Stay - Ely Oaks Version") may be stripped by the
+        // catalog; the plain title is accepted as an alias. The marker check below
+        // still rejects Remix/Live/Instrumental, which are different recordings.
+        val cleanedTitle = normalize(EclipseAddonQuery.cleanedTitle(track.title))
         val trackMarkers = markers(track.title)
 
         return candidates
             .asSequence()
             .filter { candidate -> candidate.id.isNotBlank() }
-            .filter { candidate -> normalize(candidate.title) == title }
+            .filter { candidate ->
+                val candidateTitle = normalize(candidate.title)
+                candidateTitle == title || (cleanedTitle != title && candidateTitle == cleanedTitle)
+            }
             .filter { candidate -> markers(candidate.title) == trackMarkers }
             .filter { candidate -> artistMatches(track.artist, candidate.artist) }
             .filter { candidate ->

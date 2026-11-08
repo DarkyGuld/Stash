@@ -169,6 +169,10 @@ class StashApplication : Application(), Configuration.Provider {
     @Inject
     lateinit var eclipseAddonPreferences: com.stash.core.data.addons.EclipseAddonPreferences
 
+    /** One-time drop of stale negative Apple-id entries (positives stay). */
+    @Inject
+    lateinit var eclipseAppleLookupStore: com.stash.core.data.addons.EclipseAppleLookupStore
+
     @Inject
     lateinit var streamingQualityPreferences: com.stash.data.download.prefs.StreamingQualityPreferences
 
@@ -485,6 +489,12 @@ class StashApplication : Application(), Configuration.Provider {
         applicationScope.launch {
             runCatching { eclipseAddonPreferences.migrateCloudAppleQualityOnce() }
                 .onFailure { Log.w("StashStartup", "cloud apple-quality migration failed", it) }
+        }
+        // A stored Apple negative used to be able to hide a playable Apple track.
+        // Drop negatives once; positives stay.
+        applicationScope.launch {
+            runCatching { eclipseAppleLookupStore.migrateDropNegativesOnce() }
+                .onFailure { Log.w("StashStartup", "apple negative-cache migration failed", it) }
         }
         // A wrong-match swap cut short by the app being killed (#531): put the
         // old file back, or drop its set-aside copy, before any swap runs.

@@ -64,6 +64,8 @@ class AlbumDetailViewModel @Inject constructor(
     private val connectivityMonitor: ConnectivityMonitor,
     /** Start radio from a song's menu (null in tests that don't need it). */
     private val radioStarter: com.stash.core.media.RadioStarter? = null,
+    /** List warmup; null in hand-built tests. */
+    private val rowsWarmer: com.stash.core.media.streaming.VisibleRowsWarmer? = null,
 ) : ViewModel() {
 
     /** The album name extracted from the navigation route arguments. */
@@ -348,4 +350,9 @@ class AlbumDetailViewModel @Inject constructor(
     /** Snackbar-targeted roll-up messages from the batch actions. */
     val userMessages: kotlinx.coroutines.flow.SharedFlow<String> =
         _userMessages.asSharedFlow()
+    /** Settled visible rows warm the likely first tap (debounced inside). */
+    private val rowsWarmJob = viewModelScope.launch {
+        uiState.collect { state -> rowsWarmer?.onVisibleRowsChanged(viewModelScope, state.tracks.map { it.id }) }
+    }
+
 }

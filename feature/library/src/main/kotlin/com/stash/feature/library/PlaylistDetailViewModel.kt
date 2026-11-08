@@ -100,6 +100,8 @@ class PlaylistDetailViewModel @Inject constructor(
     private val orderDao: com.stash.core.data.db.dao.PlaylistOrderDao,
     /** Start radio from a song's menu (null in tests that don't need it). */
     private val radioStarter: com.stash.core.media.RadioStarter? = null,
+    /** List warmup; null in hand-built tests. */
+    private val rowsWarmer: com.stash.core.media.streaming.VisibleRowsWarmer? = null,
 ) : ViewModel() {
 
     /** The playlist ID extracted from the navigation route arguments. */
@@ -735,4 +737,9 @@ class PlaylistDetailViewModel @Inject constructor(
         /** Playlist types whose page has a Download button (#474). */
         val DOWNLOAD_BUTTON_TYPES = setOf(PlaylistType.DAILY_MIX, PlaylistType.CUSTOM)
     }
+    /** Settled visible rows warm the likely first tap (debounced inside). */
+    private val rowsWarmJob = viewModelScope.launch {
+        uiState.collect { state -> rowsWarmer?.onVisibleRowsChanged(viewModelScope, state.tracks.map { it.id }) }
+    }
+
 }

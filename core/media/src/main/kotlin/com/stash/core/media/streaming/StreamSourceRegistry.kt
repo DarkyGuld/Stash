@@ -352,7 +352,7 @@ class StreamSourceRegistry internal constructor(
                 // next-up only (allowYtDlp), and only with Lossless on and Data saver
                 // not applying: an addon may serve lossy, so it is not a LOSSLESS_RUNG.
                 val addonRung = addons?.takeIf { allowYtDlp && losslessRungs && eclipseAddonsOn }
-                if (addonsFirst && addonRung != null) add("addon" to addonRung::resolve)
+                if (addonsFirst && addonRung != null) add("addon" to { t: TrackEntity -> addonRung.resolve(t, speculative) })
 
                 // Prefer Tidal AAC: Tidal's 320 kbps AAC (`?aac=only&hires=0`, the AAC
                 // download mode's request) ahead of Qobuz, for a listener saving data. Only
@@ -419,7 +419,7 @@ class StreamSourceRegistry internal constructor(
                 }
                 // Eclipse addons, in their place after the relays unless addons-first
                 // moved them to the front above.
-                if (!addonsFirst && addonRung != null) add("addon" to addonRung::resolve)
+                if (!addonsFirst && addonRung != null) add("addon" to { t: TrackEntity -> addonRung.resolve(t, speculative) })
                 // AAC fallback at the policy's LossyQuality (320; 160 or 96 where Data saver
                 // applies). Foreground/next-up only: a
                 // speculative full-queue fill must not turn into one metadata

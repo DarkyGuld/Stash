@@ -407,6 +407,8 @@ class SearchViewModelTest {
             on { recent } doReturn kotlinx.coroutines.flow.flowOf(emptyList())
         },
         savedStateHandle: SavedStateHandle = SavedStateHandle(),
+        prefetchOrchestrator: com.stash.core.media.streaming.PrefetchOrchestrator = mock(),
+        trackDao: com.stash.core.data.db.dao.TrackDao = mock(),
     ): SearchViewModel = SearchViewModel(
         api = api,
         prefetcher = prefetcher,
@@ -416,6 +418,8 @@ class SearchViewModelTest {
         streamingPreference = streamingPreference,
         recentSearchesStore = recentSearchesStore,
         savedStateHandle = savedStateHandle,
+        prefetchOrchestrator = prefetchOrchestrator,
+        trackDao = trackDao,
     )
 
     private fun sampleTrack(): TrackItem = TrackItem(

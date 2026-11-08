@@ -12,6 +12,8 @@ import com.stash.core.media.equalizer.EqStore
 import com.stash.core.media.equalizer.LegacyEqualizerStore
 import com.stash.core.media.equalizer.LegacyEqualizerStoreImpl
 import com.stash.core.media.equalizer.LoudnessStore
+import com.stash.core.media.streaming.EclipseLosslessSource
+import com.stash.data.download.lossless.LosslessSource
 import dagger.Binds
 import dagger.Module
 import dagger.Provides
@@ -59,6 +61,15 @@ abstract class MediaModule {
     @Binds
     @IntoSet
     abstract fun bindPlaybackDiagnostics(impl: PlaybackDiagnosticsContributor): DiagnosticsContributor
+
+    /**
+     * Eclipse addons as a download source. Bound here (core/media depends on
+     * data:download, not the other way round), into the same multibinding the
+     * download registry consumes.
+     */
+    @Binds
+    @IntoSet
+    abstract fun bindEclipseLosslessSource(impl: EclipseLosslessSource): LosslessSource
 
     companion object {
 

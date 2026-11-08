@@ -520,6 +520,12 @@ class StashPlaybackService : MediaLibraryService() {
     /** How far before the song's end the spare was primed (for the handoff log). */
     private var earlyPrimeAtMs: Long = 0
 
+    /** A restored session/queue just landed; prime the spare (paused) for an instant resume. */
+    @Volatile private var restoredPrimePending = false
+
+    /** mediaId the spare holds for the restored current item; null once consumed/invalidated. */
+    @Volatile private var restoredPrimeId: String? = null
+
     /** The crossfade preference as last read; [crossfadeEnabled] is this AND not suspended. */
     @Volatile private var crossfadePrefEnabled = false
 
@@ -631,6 +637,8 @@ class StashPlaybackService : MediaLibraryService() {
                 Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED -> {
                     crossfadeEngine?.cancelTransition()
                     crossfadePreparedId = null
+                    restoredPrimePending = false
+                    restoredPrimeId = null
                 }
             }
             updateCustomLayout()
@@ -672,6 +680,7 @@ class StashPlaybackService : MediaLibraryService() {
         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
             headphoneResumeGate.onPlayWhenReadyChanged(playWhenReady, reason)
             refreshPlayerIdle()
+            if (playWhenReady) maybeUseRestoredPrime()
         }
 
         override fun onPlaybackStateChanged(playbackState: Int) {
@@ -707,6 +716,7 @@ class StashPlaybackService : MediaLibraryService() {
                 ResumePlayGate.Action.PLAY -> master.play()
                 ResumePlayGate.Action.NONE -> Unit
             }
+            maybePrimeRestored(master)
         }
 
         override fun onRepeatModeChanged(repeatMode: Int) = updateCustomLayout()
@@ -1751,6 +1761,60 @@ class StashPlaybackService : MediaLibraryService() {
      * Cast, Listen Together, bit-perfect and the end-of-track sleep hold all
      * fall back to the normal auto-advance.
      */
+    /** Prime the spare on the restored current item (paused, silent) once its queue lands. */
+    private fun maybePrimeRestored(player: Player) {
+        if (!restoredPrimePending) return
+        if (player.isPlaying || player.mediaItemCount == 0) return
+        val engine = crossfadeEngine ?: return
+        val item = player.currentMediaItem ?: return
+        val position = player.currentPosition.coerceAtLeast(0)
+        engine.prepareResume(item, position)
+        restoredPrimeId = item.mediaId
+        restoredPrimePending = false
+        android.util.Log.d(
+            "Crossfade",
+            "restored session primed at $position ms item=${item.mediaId} (no autoplay)",
+        )
+    }
+
+    /**
+     * The user pressed play on a restored session: if the spare is already READY
+     * on that same item (and no hold forbids it), the handoff is instantaneous
+     * instead of ExoPlayer preparing the master from scratch.
+     */
+    private fun maybeUseRestoredPrime() {
+        val id = restoredPrimeId ?: return
+        val engine = crossfadeEngine ?: return
+        val master = engine.masterPlayer
+        if (master.currentMediaItem?.mediaId != id) {
+            restoredPrimeId = null
+            return
+        }
+        val held = crossfadeEnabled || isCasting || crossfadeSuspended ||
+            crossfadeHeldForBitPerfect || crossfadeHeldForSleep
+        if (held || !engine.isPreparedForResume(id)) {
+            restoredPrimeId = null
+            return
+        }
+        crossfadePollJob?.cancel()
+        crossfadePollJob = null
+        val startedNs = System.nanoTime()
+        val swapped = engine.performResumeSwap { newMaster -> onCrossfadeSwap(newMaster) }
+        restoredPrimeId = null
+        if (swapped) {
+            val newMaster = crossfadeEngine?.masterPlayer
+            markLatencyStart(newMaster?.currentMediaItem)
+            stashLatency.firstAudio(latencyTrackId(newMaster?.currentMediaItem))
+            android.util.Log.i(
+                "Crossfade",
+                "restore resume handoff in ${(System.nanoTime() - startedNs) / 1_000_000} ms",
+            )
+        } else {
+            android.util.Log.i("Crossfade", "restore resume fallback: spare not ready")
+            startCrossfadePoll(master)
+        }
+    }
+
     @OptIn(UnstableApi::class)
     private fun evaluateEarlyHandoff(player: Player) {
         val engine = crossfadeEngine ?: return
@@ -3332,6 +3396,7 @@ class StashPlaybackService : MediaLibraryService() {
                     // Force play once the queue lands iff this is a real play
                     // request (not boot-time notification population).
                     resumePlayGate.arm(isForPlayback)
+                    restoredPrimePending = true
                     return@future MediaSession.MediaItemsWithStartPosition(
                         ImmutableList.copyOf(items),
                         plan.startIndex,
@@ -3347,6 +3412,7 @@ class StashPlaybackService : MediaLibraryService() {
 
                 if (item != null) {
                     resumePlayGate.arm(isForPlayback)
+                    restoredPrimePending = true
                     MediaSession.MediaItemsWithStartPosition(
                         ImmutableList.of(item),
                         /* startIndex= */ 0,

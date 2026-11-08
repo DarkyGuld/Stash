@@ -428,7 +428,7 @@ class StreamSourceRegistryTest {
         // The addon missed first; Qobuz answered next.
         assertThat(result!!.origin).isEqualTo("qbdlx")
         coVerifyOrder {
-            addon.resolve(any())
+            addon.resolve(any(), any())
             qbdlx.resolve(any())
         }
     }
@@ -440,7 +440,7 @@ class StreamSourceRegistryTest {
         coEvery { youtube.resolve(any(), any()) } returns null
         val tidal: TidalStreamResolver = mockk { coEvery { resolve(any()) } returns null }
         val addon: EclipseAddonStreamResolver = mockk {
-            coEvery { resolve(any()) } returns stubStreamUrl("addon")
+            coEvery { resolve(any(), any()) } returns stubStreamUrl("addon")
         }
 
         val result = registryWithAddon(addon, tidal).resolve(stubTrack())
@@ -448,7 +448,7 @@ class StreamSourceRegistryTest {
         assertThat(result!!.origin).isEqualTo("addon")
         coVerifyOrder {
             qbdlx.resolve(any())
-            addon.resolve(any())
+            addon.resolve(any(), any())
         }
     }
 
@@ -524,13 +524,13 @@ class StreamSourceRegistryTest {
         coEvery { qbdlx.resolve(any()) } returns stubStreamUrl("qbdlx")
         coEvery { youtube.resolve(any(), any()) } returns null
         val addon: EclipseAddonStreamResolver = mockk {
-            coEvery { resolve(any()) } returns stubStreamUrl("addon")
+            coEvery { resolve(any(), any()) } returns stubStreamUrl("addon")
         }
 
         val result = registryWithAddon(addon).resolve(stubTrack())
 
         assertThat(result!!.origin).isEqualTo("qbdlx")
-        coVerify(exactly = 0) { addon.resolve(any()) }
+        coVerify(exactly = 0) { addon.resolve(any(), any()) }
     }
 
     @Test
@@ -599,13 +599,13 @@ class StreamSourceRegistryTest {
         coEvery { qbdlx.resolve(any()) } returns null
         coEvery { youtube.resolve(any(), any()) } returns null
         val addon: EclipseAddonStreamResolver = mockk {
-            coEvery { resolve(any()) } returns stubStreamUrl("addon")
+            coEvery { resolve(any(), any()) } returns stubStreamUrl("addon")
         }
 
         val result = registryWithAddon(addon).resolve(stubTrack(), speculative = true)
 
         assertThat(result!!.origin).isEqualTo("addon")
-        coVerify(exactly = 1) { addon.resolve(any()) }
+        coVerify(exactly = 1) { addon.resolve(any(), any()) }
     }
 
     @Test

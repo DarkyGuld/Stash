@@ -73,6 +73,9 @@ class StreamQualityPolicy @Inject constructor(
      */
     suspend fun dataSaverApplies(): Boolean = snapshot().dataSaver
 
+    /** True on mobile data / metered Wi-Fi (the same reading Data saver uses). */
+    suspend fun isMeteredNetwork(): Boolean = connectivity.isMetered()
+
     /**
      * What the lossy rungs (JioSaavn, YouTube) ask for. Read here, not from the preferences, so the
      * cache-clearing below sees a flip of the switch, the Lossless switch or the network too.

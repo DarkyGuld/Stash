@@ -101,4 +101,63 @@ class EclipseAddonMatcherTest {
     fun `no candidate at all is a null match`() {
         assertThat(EclipseAddonMatcher.best(track, emptyList())).isNull()
     }
+
+    @Test
+    fun `a trailing version suffix accepts the plain title as an alias`() {
+        val versioned = TrackEntity(
+            title = "Stay - Ely Oaks Version",
+            artist = "Ely Oaks, Misdemeanor",
+            durationMs = 159_246,
+        )
+        val best = EclipseAddonMatcher.best(
+            versioned,
+            listOf(
+                EclipseAddonTrack(
+                    id = "plain",
+                    title = "Stay",
+                    artist = "Ely Oaks & Misdemeanor",
+                    duration = 159_246,
+                ),
+            ),
+        )
+
+        assertThat(best?.id).isEqualTo("plain")
+    }
+
+    @Test
+    fun `a bracketed remix with a multi-artist credit matches the same recording`() {
+        val track = TrackEntity(
+            title = "Dancin (feat. Luvli) - southstar Remix",
+            artist = "Aaron Smith, Luvli, southstar",
+            durationMs = 173_333,
+        )
+        val best = EclipseAddonMatcher.best(
+            track,
+            listOf(
+                EclipseAddonTrack(
+                    id = "apple",
+                    title = "Dancin (feat. Luvli) [southstar Remix]",
+                    artist = "Aaron Smith & southstar",
+                    duration = 173_333,
+                ),
+            ),
+        )
+
+        assertThat(best?.id).isEqualTo("apple")
+    }
+
+    @Test
+    fun `remix and live titles never alias to the plain song`() {
+        for ((trackTitle, candidateTitle) in listOf(
+            "Song - Remix" to "Song",
+            "Song (Live)" to "Song",
+            "Song - Remix Version" to "Song",
+        )) {
+            val best = EclipseAddonMatcher.best(
+                TrackEntity(title = trackTitle, artist = "Artist", durationMs = 200_000),
+                listOf(EclipseAddonTrack(id = "plain", title = candidateTitle, artist = "Artist", duration = 200)),
+            )
+            assertThat(best).isNull()
+        }
+    }
 }

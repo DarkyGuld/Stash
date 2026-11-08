@@ -9,6 +9,7 @@ import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import org.junit.Test
@@ -152,7 +153,7 @@ class PrefetchOrchestratorTest {
         advanceUntilIdle()
 
         assertThat(cache.get(5L)).isEqualTo(addonUrl)
-        coVerify(exactly = 1) { firstChunk.warm(5L, addonUrl) }
+        coVerify(exactly = 1) { firstChunk.warm(5L, addonUrl, any()) }
 
         // A second call sees the memory hit and does not resolve again.
         orchestrator.prefetchUrlsAhead(this, listOf(5L))
@@ -160,6 +161,141 @@ class PrefetchOrchestratorTest {
         coVerify(exactly = 1) {
             streamResolver.resolve(track, allowYouTube = true, allowYtDlp = true, speculative = true)
         }
+    }
+
+    @Test
+    fun warm_search_results_warms_apple_for_top_three_and_urls_for_top_two() = runTest {
+        val dao = mockk<TrackDao>()
+        coEvery { dao.getById(any()) } answers {
+            val id = firstArg<Long>()
+            TrackEntity(id = id, title = "Song $id", artist = "Artist", durationMs = 200_000, isStreamable = true)
+        }
+        val url = StreamUrl(
+            url = "https://cdn.test/file.flac",
+            expiresAtMs = Long.MAX_VALUE,
+            codec = "flac",
+            origin = "addon:Cloud",
+        )
+        coEvery {
+            streamResolver.resolve(any(), allowYouTube = true, allowYtDlp = true, speculative = true)
+        } returns url
+        val apple: EclipseAddonStreamResolver = mockk(relaxed = true)
+        val orchestrator = PrefetchOrchestrator(
+            streamResolver = streamResolver,
+            streamUrlCache = StreamUrlCache(),
+            trackDao = dao,
+            eclipseStreamResolver = apple,
+        )
+
+        orchestrator.warmSearchResults(this, listOf(1, 2, 3, 4))
+        advanceUntilIdle()
+
+        coVerify(exactly = 1) { apple.warmAppleIds(match { ids -> ids.map { it.id } == listOf(1L, 2L, 3L) }) }
+        // Only the top two get their URL resolved.
+        coVerify(exactly = 2) {
+            streamResolver.resolve(any(), allowYouTube = true, allowYtDlp = true, speculative = true)
+        }
+    }
+
+    @Test
+    fun warm_search_results_replaces_the_previous_query_work() = runTest {
+        val dao = mockk<TrackDao>()
+        coEvery { dao.getById(any()) } answers {
+            val id = firstArg<Long>()
+            TrackEntity(id = id, title = "Song $id", artist = "Artist", durationMs = 200_000, isStreamable = true)
+        }
+        val slow = StreamUrl(url = "https://cdn.test/slow.flac", expiresAtMs = Long.MAX_VALUE, origin = "addon:Cloud")
+        val fast = StreamUrl(url = "https://cdn.test/fast.flac", expiresAtMs = Long.MAX_VALUE, origin = "addon:Cloud")
+        coEvery {
+            streamResolver.resolve(match { it.id == 1L }, allowYouTube = true, allowYtDlp = true, speculative = true)
+        } coAnswers {
+            delay(10_000)
+            slow
+        }
+        coEvery {
+            streamResolver.resolve(match { it.id == 2L }, allowYouTube = true, allowYtDlp = true, speculative = true)
+        } returns fast
+        val cache = StreamUrlCache()
+        val orchestrator = PrefetchOrchestrator(
+            streamResolver = streamResolver,
+            streamUrlCache = cache,
+            trackDao = dao,
+        )
+
+        orchestrator.warmSearchResults(this, listOf(1))
+        orchestrator.warmSearchResults(this, listOf(2))
+        advanceUntilIdle()
+
+        assertThat(cache.get(1L)).isNull()
+        assertThat(cache.get(2L)).isEqualTo(fast)
+    }
+
+    @Test
+    fun warm_search_results_respects_data_saver_for_the_url_warm() = runTest {
+        val dao = mockk<TrackDao>()
+        coEvery { dao.getById(any()) } answers {
+            val id = firstArg<Long>()
+            TrackEntity(id = id, title = "Song $id", artist = "Artist", durationMs = 200_000, isStreamable = true)
+        }
+        val policy: StreamQualityPolicy = mockk { coEvery { dataSaverApplies() } returns true }
+        val apple: EclipseAddonStreamResolver = mockk(relaxed = true)
+        val orchestrator = PrefetchOrchestrator(
+            streamResolver = streamResolver,
+            streamUrlCache = StreamUrlCache(),
+            trackDao = dao,
+            qualityPolicy = policy,
+            eclipseStreamResolver = apple,
+        )
+
+        orchestrator.warmSearchResults(this, listOf(1, 2))
+        advanceUntilIdle()
+
+        coVerify(exactly = 0) {
+            streamResolver.resolve(any(), allowYouTube = true, allowYtDlp = true, speculative = true)
+        }
+        // The Apple-id search itself is metadata-only and still runs.
+        coVerify(exactly = 1) { apple.warmAppleIds(any()) }
+    }
+
+    @Test
+    fun next_track_full_file_warm_follows_the_network() = runTest {
+        val track = TrackEntity(
+            id = 5L,
+            title = "Next Up",
+            artist = "Artist",
+            durationMs = 200_000L,
+            isStreamable = true,
+        )
+        coEvery { trackDao.getById(5L) } returns track
+        val url = StreamUrl(
+            url = "https://cdn.test/file.flac",
+            expiresAtMs = Long.MAX_VALUE,
+            codec = "flac",
+            origin = "addon:Cloud",
+        )
+        coEvery {
+            streamResolver.resolve(track, allowYouTube = true, allowYtDlp = true, speculative = true)
+        } returns url
+
+        val unmeteredPolicy: StreamQualityPolicy = mockk {
+            coEvery { dataSaverApplies() } returns false
+            coEvery { isMeteredNetwork() } returns false
+        }
+        val fullWarmer: EclipseFirstChunkPrefetcher = mockk(relaxed = true)
+        PrefetchOrchestrator(streamResolver, StreamUrlCache(), trackDao, unmeteredPolicy, firstChunk = fullWarmer)
+            .prefetchUrlsAhead(this, listOf(5L))
+        advanceUntilIdle()
+        coVerify(exactly = 1) { fullWarmer.warm(5L, url, full = true) }
+
+        val meteredPolicy: StreamQualityPolicy = mockk {
+            coEvery { dataSaverApplies() } returns false
+            coEvery { isMeteredNetwork() } returns true
+        }
+        val chunkWarmer: EclipseFirstChunkPrefetcher = mockk(relaxed = true)
+        PrefetchOrchestrator(streamResolver, StreamUrlCache(), trackDao, meteredPolicy, firstChunk = chunkWarmer)
+            .prefetchUrlsAhead(this, listOf(5L))
+        advanceUntilIdle()
+        coVerify(exactly = 1) { chunkWarmer.warm(5L, url, full = false) }
     }
 
     @Test

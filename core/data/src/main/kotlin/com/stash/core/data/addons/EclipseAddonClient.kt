@@ -372,8 +372,20 @@ class EclipseAddonClient @Inject constructor(
      */
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     suspend fun searchAppleTracks(title: String, artist: String): List<EclipseAppleTrack> {
-        val term = "$title $artist".trim()
-        if (term.isEmpty()) return emptyList()
+        // Full query first; a version suffix or a full artist list often returns
+        // nothing, so the cleaned variants are tried only after a miss.
+        for ((variantTitle, variantArtist) in EclipseAddonQuery.variants(title, artist)) {
+            val term = "$variantTitle $variantArtist".trim()
+            if (term.isEmpty()) continue
+            val hits = searchAppleTerm(term)
+            if (hits.isNotEmpty()) return hits
+        }
+        return emptyList()
+    }
+
+    /** One term across the device country and the US fallback (concurrently when they differ). */
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    private suspend fun searchAppleTerm(term: String): List<EclipseAppleTrack> {
         val localeCountry = java.util.Locale.getDefault().country.takeIf { it.length == 2 } ?: APPLE_FALLBACK_COUNTRY
         if (localeCountry == APPLE_FALLBACK_COUNTRY) return fetchAppleSearch(term, localeCountry)
 

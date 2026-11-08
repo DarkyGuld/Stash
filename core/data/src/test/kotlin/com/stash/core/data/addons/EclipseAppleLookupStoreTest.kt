@@ -54,7 +54,7 @@ class EclipseAppleLookupStoreTest {
     }
 
     @Test
-    fun `a positive id never expires and a negative lives twenty-four hours`() = runTest {
+    fun `a positive id never expires and a stored negative lives an hour`() = runTest {
         val store = store()
         store.put("eclipse-music-cloud", "hit", "1")
         store.put("eclipse-music-cloud", "miss", null)
@@ -65,7 +65,7 @@ class EclipseAppleLookupStoreTest {
 
         now = 1_000_000_000_000L
         store.put("eclipse-music-cloud", "miss2", null)
-        now += 24L * 60 * 60_000L - 1
+        now += 60L * 60_000L - 1
         assertThat(store.get("eclipse-music-cloud", "miss2")).isNotNull()
         now += 2
         assertThat(store.get("eclipse-music-cloud", "miss2")).isNull()

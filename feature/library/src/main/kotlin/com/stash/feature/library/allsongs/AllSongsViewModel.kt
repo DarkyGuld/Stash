@@ -38,6 +38,8 @@ class AllSongsViewModel @Inject constructor(
     private val scanner: AllSongsScanner,
     private val player: PlayerRepository,
     private val covers: ScannedCoverStore,
+    /** List warmup; null in hand-built tests. */
+    private val rowsWarmer: com.stash.core.media.streaming.VisibleRowsWarmer? = null,
 ) : ViewModel() {
 
     val folders: StateFlow<List<ScanFolderEntity>> = dao.observeFolders()
@@ -293,4 +295,9 @@ class AllSongsViewModel @Inject constructor(
     private companion object {
         const val TAG = "AllSongs"
     }
+    /** Settled visible rows warm the likely first tap (debounced inside). */
+    private val rowsWarmJob = viewModelScope.launch {
+        songs.collect { rows -> rowsWarmer?.onVisibleRowsChanged(viewModelScope, rows.map { it.id }) }
+    }
+
 }

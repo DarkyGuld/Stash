@@ -6,11 +6,13 @@ import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.stash.core.common.perf.PerfLog
+import com.stash.core.data.db.dao.TrackDao
 import com.stash.core.data.prefs.StreamingPreference
 import com.stash.core.media.PlayerRepository
 import com.stash.core.media.StreamRoutingResult
 import com.stash.core.media.actions.TrackActionsDelegate
 import com.stash.core.media.preview.LosslessUrlPrefetcher
+import com.stash.core.media.streaming.PrefetchOrchestrator
 import com.stash.core.model.Playlist
 import com.stash.core.model.TrackItem
 import com.stash.data.ytmusic.YTMusicApiClient
@@ -70,6 +72,9 @@ class SearchViewModel @Inject constructor(
      * in the field and its results searched again.
      */
     private val savedStateHandle: SavedStateHandle,
+    /** Search-result warmup (URL, first chunk, Apple id) — the playback prefetch, reused. */
+    private val prefetchOrchestrator: PrefetchOrchestrator,
+    private val trackDao: TrackDao,
 ) : ViewModel() {
 
     companion object {
@@ -83,6 +88,9 @@ class SearchViewModel @Inject constructor(
 
         /** Max number of tracks to pre-warm URLs for on a fresh results page. */
         private const val PREFETCH_TOP_N = 6
+
+        /** How many search rows are cross-referenced for the playback warmup. */
+        private const val WARM_SEARCH_ROWS = 3
 
         /** [SavedStateHandle] key of the typed query. */
         internal const val KEY_QUERY = "search_query"
@@ -299,6 +307,8 @@ class SearchViewModel @Inject constructor(
         // we have to cancel them explicitly or they burn CPU/bandwidth
         // resolving URLs the user no longer cares about.
         prefetcher.cancelAll()
+        // A new keystroke invalidates the previous results' warmup as well.
+        prefetchOrchestrator.cancelSearchWarmups()
         if (query.length < MIN_QUERY_LENGTH) {
             emit(SearchStatus.Idle)
             return@flow
@@ -321,6 +331,7 @@ class SearchViewModel @Inject constructor(
                 }
                 prefetchTopN(sections)
                 refreshDownloadedIds(sections)
+                warmLikelySearchResults(sections)
             }
         } catch (t: Throwable) {
             // Null for a cancellation (a newer keystroke): rethrown, never shown.
@@ -417,6 +428,32 @@ class SearchViewModel @Inject constructor(
         }
         if (ids.isEmpty()) return
         prefetcher.prefetch(ids.take(PREFETCH_TOP_N).distinct())
+    }
+
+    /**
+     * Search-result warmup: the row the user is most likely to tap, so playback
+     * starts warm. Only rows that already have a DB track id are used (never a
+     * stub row), the top three get their Apple id looked up and the top two their
+     * URL + first chunk warmed through the same [PrefetchOrchestrator] the player
+     * uses. Cancelled by the next query, and off with "Prefetch search results".
+     */
+    private suspend fun warmLikelySearchResults(sections: List<SearchResultSection>) {
+        if (!streamingPreference.isPrefetchSearchResults()) return
+        val videoIds = mutableListOf<String>()
+        sections.forEach { section ->
+            when (section) {
+                is SearchResultSection.Top -> (section.item as? TopResultItem.TrackTop)
+                    ?.track?.videoId?.let { videoIds.add(it) }
+                is SearchResultSection.Songs -> videoIds.addAll(section.tracks.map { it.videoId })
+                else -> Unit
+            }
+        }
+        if (videoIds.isEmpty()) return
+        val ids = videoIds.distinct().take(WARM_SEARCH_ROWS).mapNotNull { videoId ->
+            runCatching { trackDao.findByYoutubeId(videoId)?.id }.getOrNull()?.takeIf { it > 0 }
+        }
+        if (ids.isEmpty()) return
+        prefetchOrchestrator.warmSearchResults(viewModelScope, ids)
     }
 
     /**

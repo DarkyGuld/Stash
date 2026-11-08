@@ -61,6 +61,8 @@ class PrefetchOrchestrator @Inject constructor(
     private val eclipseAddons: com.stash.core.data.addons.EclipseAddonRepository? = null,
     /** First-chunk file warm into the shared cache; null in hand-built tests. */
     private val firstChunk: EclipseFirstChunkPrefetcher? = null,
+    /** Apple-id search warm for search results; null in hand-built tests. */
+    private val eclipseStreamResolver: EclipseAddonStreamResolver? = null,
 ) {
     /**
      * Track ids for which a prefetch resolve has been attempted in the
@@ -73,6 +75,10 @@ class PrefetchOrchestrator @Inject constructor(
 
     /** The in-flight "URL for the next tracks" warm; a queue change cancels it. */
     private var urlPrefetchJob: Job? = null
+
+    /** Search-result warmups, replaced on every results change. */
+    private var searchUrlJob: Job? = null
+    private var searchAppleJob: Job? = null
 
     /**
      * Warms the resolved stream URL for the next [trackIds] — as soon as they are
@@ -98,14 +104,64 @@ class PrefetchOrchestrator @Inject constructor(
                     return@launch
                 }
                 streamUrlCache.put(id, resolved)
-                // Progressive addon file (Cloud's direct Qobuz FLAC): warm its first
-                // ~2 MB into the same cache the player will read. HLS/DASH skip this.
+                // Progressive addon file (Cloud's direct Qobuz FLAC): warm it into the
+                // same cache the player reads — whole file (60 MB cap) on unmetered,
+                // first ~2 MB on mobile data. HLS/DASH skip this.
                 if (resolved.origin?.startsWith("${EclipseAddonStreamResolver.ORIGIN}") == true) {
-                    firstChunk?.warm(id, resolved)
+                    val unmetered = qualityPolicy?.isMeteredNetwork() == false
+                    firstChunk?.warm(id, resolved, full = unmetered)
                 }
                 Log.d(TAG, "Prefetched stream URL for upcoming track $id")
             }
         }
+    }
+
+    /**
+     * Search results changed: warm the likely tap. Apple ids for the top three
+     * (search only) and the resolved URL + first chunk for the top two, using the
+     * same caches as playback. Replaced on every call, so a new query cancels the
+     * previous work; only rows that already exist in the DB are passed in.
+     */
+    fun warmVisibleRows(scope: CoroutineScope, trackIds: List<Long>) {
+        searchUrlJob?.cancel()
+        searchAppleJob?.cancel()
+        val ids = trackIds.filter { it > 0 }.distinct()
+        if (ids.isEmpty()) return
+
+        searchAppleJob = scope.launch {
+            val tracks = ids.take(SEARCH_APPLE_WARM).mapNotNull { trackDao.getById(it) }
+                .filter { !it.skipForUrlPrefetch() }
+            eclipseStreamResolver?.warmAppleIds(tracks)
+        }
+        searchUrlJob = scope.launch {
+            if (qualityPolicy?.dataSaverApplies() == true) return@launch
+            val generationBefore = eclipseAddons?.addonGeneration?.value
+            for (id in ids.take(SEARCH_URL_WARM)) {
+                if (streamUrlCache.get(id) != null) continue
+                val track = trackDao.getById(id) ?: continue
+                if (track.skipForUrlPrefetch()) continue
+                val resolved = streamResolver.resolve(track, speculative = true) ?: continue
+                if (generationBefore != null && eclipseAddons?.addonGeneration?.value != generationBefore) {
+                    return@launch
+                }
+                streamUrlCache.put(id, resolved)
+                if (resolved.origin?.startsWith("${EclipseAddonStreamResolver.ORIGIN}") == true) {
+                    firstChunk?.warm(id, resolved)
+                }
+            }
+        }
+    }
+
+    /** Search results entry point: same warmup as a settled list (kept by name for callers). */
+    fun warmSearchResults(scope: CoroutineScope, trackIds: List<Long>) =
+        warmVisibleRows(scope, trackIds)
+
+    /** A new query/results set arrived: drop any warmup still running. */
+    fun cancelSearchWarmups() {
+        searchUrlJob?.cancel()
+        searchUrlJob = null
+        searchAppleJob?.cancel()
+        searchAppleJob = null
     }
 
     /** The same rows the next-up prefetch skips: a file, a cloud song, or a known-unplayable row. */
@@ -199,6 +255,10 @@ class PrefetchOrchestrator @Inject constructor(
 
     private companion object {
         const val TAG = "StashPrefetch"
+
+        /** Search warmup sizes: Apple ids for three rows, resolved URL/first chunk for two. */
+        const val SEARCH_APPLE_WARM = 3
+        const val SEARCH_URL_WARM = 2
 
         /**
          * Pre-fetch fires once playback crosses this fraction of the

@@ -40,19 +40,25 @@ class EclipseFirstChunkPrefetcher @Inject constructor(
         .followSslRedirects(false)
         .build()
 
-    suspend fun warm(trackId: Long, stream: StreamUrl) {
+    /**
+     * @param full true warms the whole file up to [FULL_FILE_CAP_BYTES] (Wi-Fi,
+     *   next track only); false warms [FIRST_CHUNK_BYTES]. Mobile data keeps the
+     *   small chunk.
+     */
+    suspend fun warm(trackId: Long, stream: StreamUrl, full: Boolean = false) {
         if (stream.isHls || stream.isDash || stream.url.isBlank()) return
+        val cap = if (full) FULL_FILE_CAP_BYTES else FIRST_CHUNK_BYTES
         val key = addonCacheKey(trackId, stream, stream.url)
-        val before = cache.getCachedBytes(key, 0, FIRST_CHUNK_BYTES)
-        if (before >= FIRST_CHUNK_BYTES) {
-            Log.d(TAG, "first chunk already cached ($before bytes)")
+        val before = cache.getCachedBytes(key, 0, cap)
+        if (before >= cap) {
+            Log.d(TAG, "addon file already cached ($before bytes, full=$full)")
             return
         }
 
         val dataSpec = DataSpec.Builder()
             .setUri(stream.url)
             .setPosition(0)
-            .setLength(FIRST_CHUNK_BYTES)
+            .setLength(cap)
             .build()
         val cacheSource = CacheDataSource.Factory()
             .setCache(cache)
@@ -73,13 +79,16 @@ class EclipseFirstChunkPrefetcher @Inject constructor(
             writer.cancel()
             cacheSource.close()
         }
-        val cached = cache.getCachedBytes(key, 0, FIRST_CHUNK_BYTES)
-        Log.d(TAG, "first chunk $cached bytes warmed (${if (cached >= FIRST_CHUNK_BYTES) "hit" else "partial"})")
+        val cached = cache.getCachedBytes(key, 0, cap)
+        Log.d(TAG, "addon ${if (full) "file" else "first chunk"} $cached bytes warmed (${if (cached >= cap) "hit" else "partial"})")
     }
 
     private companion object {
         const val TAG = "EclipseAddonStream"
         const val FIRST_CHUNK_BYTES = 2L * 1024 * 1024
+
+        /** Wi-Fi next-track warm: enough for a whole song, never a playlist. */
+        const val FULL_FILE_CAP_BYTES = 60L * 1024 * 1024
         const val BUFFER_BYTES = 64 * 1024
     }
 }

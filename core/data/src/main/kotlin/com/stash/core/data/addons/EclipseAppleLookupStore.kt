@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.datastore.core.DataStore
 import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
 import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.stringPreferencesKey
@@ -57,6 +58,7 @@ class EclipseAppleLookupStore internal constructor(
     constructor(@ApplicationContext context: Context) : this(context.eclipseAppleLookupDataStore)
 
     private val key = stringPreferencesKey("apple_lookups_json")
+    private val negativesDroppedKey = booleanPreferencesKey("apple_negatives_dropped_v1")
     private val json = Json { ignoreUnknownKeys = true }
 
     /** The live entry for [addonId] + [identity], or null when absent/expired. */
@@ -96,6 +98,20 @@ class EclipseAppleLookupStore internal constructor(
         }
     }
 
+    /**
+     * One-time cleanup: a stored long-lived negative used to suppress the iTunes
+     * search for a track the catalog had since gained. Positives are kept; every
+     * negative is dropped once, so existing installs are unstuck.
+     */
+    suspend fun migrateDropNegativesOnce() {
+        store.edit { prefs ->
+            if (prefs[negativesDroppedKey] == true) return@edit
+            val entries = prefs[key].decode().entries.filterValues { it.appleId != null }
+            prefs[key] = json.encodeToString(StoredLookups(entries))
+            prefs[negativesDroppedKey] = true
+        }
+    }
+
     private suspend fun read(): StoredLookups = store.data.first()[key].decode()
 
     private fun String?.decode(): StoredLookups {
@@ -111,7 +127,8 @@ class EclipseAppleLookupStore internal constructor(
 
     private companion object {
         /** Positives do not expire; Long.MAX_VALUE keeps the stored shape finite. */
-        const val NEGATIVE_TTL_MS = 24L * 60 * 60_000L
+        /** Only if a caller ever stores one: an hour at most, never a day. */
+        const val NEGATIVE_TTL_MS = 60L * 60_000L
         const val MAX_ENTRIES = 5_000
     }
 }

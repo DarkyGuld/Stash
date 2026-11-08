@@ -609,6 +609,38 @@ class EclipseAddonClientTest {
         }
 
     @Test
+    fun `apple search falls back to the cleaned title and primary artist`() = kotlinx.coroutines.test.runTest {
+        val previous = java.util.Locale.getDefault()
+        try {
+            java.util.Locale.setDefault(java.util.Locale.US)
+            server.dispatcher = object : okhttp3.mockwebserver.Dispatcher() {
+                override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest): MockResponse {
+                    val term = request.requestUrl!!.queryParameter("term")
+                    return if (term == "Stay Ely Oaks") {
+                        MockResponse().setBody(
+                            """{"resultCount":1,"results":[{"trackId":6766866994,"trackName":"Stay (Ely Oaks Version)",
+                               "artistName":"Ely Oaks & Misdemeanor","trackTimeMillis":159246}]}""",
+                        )
+                    } else {
+                        MockResponse().setBody("""{"resultCount":0,"results":[]}""")
+                    }
+                }
+            }
+
+            val hits = client.searchAppleTracks("Stay - Ely Oaks Version", "Ely Oaks, Misdemeanor")
+
+            assertThat(hits.map { it.trackId }).containsExactly(6766866994L)
+            val terms = List(server.requestCount) { server.takeRequest().requestUrl!!.queryParameter("term") }
+            assertThat(terms).containsExactly(
+                "Stay - Ely Oaks Version Ely Oaks, Misdemeanor",
+                "Stay Ely Oaks",
+            ).inOrder()
+        } finally {
+            java.util.Locale.setDefault(previous)
+        }
+    }
+
+    @Test
     fun `cloud apple stream uses the Apple route with the Cloud headers`() = kotlinx.coroutines.test.runTest {
         coEvery { tokenStore.getEclipseToken() } returns "acct-fake"
         server.enqueue(

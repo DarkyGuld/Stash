@@ -236,6 +236,62 @@ class CrossfadeEngine(
     fun isNextReady(): Boolean =
         ::playerB.isInitialized && playerB.playbackState == Player.STATE_READY
 
+    /** Prime the spare on the CURRENT restored item at [positionMs], paused and silent. */
+    fun prepareResume(item: MediaItem, positionMs: Long) {
+        val spare = playerB
+        spare.stop()
+        spare.clearMediaItems()
+        spare.playWhenReady = false
+        spare.volume = 0f
+        spare.playbackParameters = playerA.playbackParameters
+        spare.setMediaItem(item, positionMs.coerceAtLeast(0))
+        spare.prepare()
+        android.util.Log.d("Crossfade", "prepareResume: spare primed at $positionMs ms item=${item.mediaId}")
+    }
+
+    /** True when the spare is READY on exactly [mediaId] (a restored-session resume). */
+    fun isPreparedForResume(mediaId: String?): Boolean =
+        mediaId != null && isPreparedFor(mediaId) && playerB.playbackState == Player.STATE_READY
+
+    /**
+     * Swap onto a spare primed on the SAME current item (restored session, no
+     * autoplay). The spare keeps its prepared position; the outgoing's queue is
+     * transferred around that same current index. False when not safe.
+     */
+    fun performResumeSwap(onSwap: (ExoPlayer) -> Unit): Boolean {
+        if (transitioning || !::playerB.isInitialized || playerB.mediaItemCount == 0) return false
+        val outgoing = playerA
+        val incoming = playerB
+        val currentId = outgoing.currentMediaItem?.mediaId ?: return false
+        if (incoming.currentMediaItem?.mediaId != currentId) return false
+        if (incoming.playbackState != Player.STATE_READY) return false
+        val index = outgoing.currentMediaItemIndex
+        if (index == C.INDEX_UNSET) return false
+
+        transitioning = true
+        outgoing.volume = 0f
+        incoming.volume = 1f
+        incoming.playbackParameters = outgoing.playbackParameters
+        incoming.playWhenReady = true
+        incoming.play()
+        transferQueue(from = outgoing, to = incoming, incomingIndex = index)
+        outgoing.removeListener(masterFocusListener)
+        incoming.addListener(masterFocusListener)
+        incoming.pauseAtEndOfMediaItems = false
+        playerA = incoming
+        playerB = outgoing
+        if (incoming.playWhenReady) requestFocus()
+        onSwap(playerA)
+        outgoing.pauseAtEndOfMediaItems = false
+        outgoing.playWhenReady = false
+        outgoing.stop()
+        outgoing.clearMediaItems()
+        outgoing.volume = 1f
+        transitioning = false
+        android.util.Log.i("Crossfade", "resume handoff: prepared spare became master")
+        return true
+    }
+
     /** Diagnostics: the spare's current playbackState and primed item. */
     fun spareState(): Int = if (::playerB.isInitialized) playerB.playbackState else -1
     fun spareId(): String? = if (::playerB.isInitialized) playerB.currentMediaItem?.mediaId else null

@@ -70,6 +70,20 @@ class EclipseFirstChunkPrefetcherTest {
     }
 
     @Test
+    fun `full mode warms beyond the first chunk`() = runTest {
+        val body = ByteArray(5 * 1024 * 1024) { 7 }
+        server.enqueue(MockResponse().setBody(Buffer().write(body)))
+        val stream = stream()
+
+        prefetcher.warm(trackId = 42, stream = stream, full = true)
+
+        val key = addonCacheKey(42, stream, stream.url)
+        val cached = cache.getCachedBytes(key, 0, body.size.toLong())
+        assertThat(cached).isEqualTo(body.size.toLong())
+        assertThat(cached).isGreaterThan(cap)
+    }
+
+    @Test
     fun `cancellation stops the warm promptly`() = runTest {
         server.enqueue(
             MockResponse()

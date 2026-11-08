@@ -29,6 +29,7 @@ class CrossfadeEngineHardCutTest {
     private fun master(queue: List<MediaItem>, current: Int) = mockk<ExoPlayer>(relaxed = true) {
         every { mediaItemCount } returns queue.size
         every { getMediaItemAt(any()) } answers { queue[firstArg()] }
+        every { currentMediaItem } returns queue[current]
         every { currentMediaItemIndex } returns current
         every { nextMediaItemIndex } returns current + 1
     }
@@ -88,6 +89,39 @@ class CrossfadeEngineHardCutTest {
         val engine = engine(backgroundScope, out, inc)
 
         assertThat(engine.performHardCut { swapped = it }).isFalse()
+        assertThat(swapped).isNull()
+        assertThat(engine.masterPlayer).isSameInstanceAs(out)
+    }
+
+    @Test
+    fun `a restored session primes the spare on the current item, then hands over on play`() = runTest {
+        val queue = listOf(item("a"), item("b"), item("c"))
+        val out = master(queue, current = 1)
+        val inc = spare(queue[1])
+        var swapped: ExoPlayer? = null
+        val engine = engine(backgroundScope, out, inc)
+
+        engine.prepareResume(queue[1], positionMs = 42_000)
+        assertThat(engine.isPreparedFor("b")).isTrue()
+        verify { inc.setMediaItem(queue[1], 42_000L) }
+        verify { inc.playWhenReady = false }
+
+        assertThat(engine.performResumeSwap { swapped = it }).isTrue()
+        assertThat(swapped).isSameInstanceAs(inc)
+        assertThat(engine.masterPlayer).isSameInstanceAs(inc)
+        verify { inc.play() }
+        verify { out.stop() }
+    }
+
+    @Test
+    fun `a resume swap is refused when the spare is not on the same current item`() = runTest {
+        val queue = listOf(item("a"), item("b"))
+        val out = master(queue, current = 0)
+        val inc = spare(queue[1])
+        var swapped: ExoPlayer? = null
+        val engine = engine(backgroundScope, out, inc)
+
+        assertThat(engine.performResumeSwap { swapped = it }).isFalse()
         assertThat(swapped).isNull()
         assertThat(engine.masterPlayer).isSameInstanceAs(out)
     }

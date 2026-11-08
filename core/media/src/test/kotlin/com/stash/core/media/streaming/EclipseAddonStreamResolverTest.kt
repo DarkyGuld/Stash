@@ -632,7 +632,10 @@ class EclipseAddonStreamResolverTest {
         cloudResolver.resolve(mario)
         now += 60 * 60_000L
         cloudResolver.resolve(mario)
-        coVerify(exactly = 1) { cloudRepo.resolve(cloud, any(), any(), any(), any()) }
+        // Variant retries are part of the first play; the cached negative skips the full query.
+        coVerify(exactly = 1) {
+            cloudRepo.resolve(cloud, "Mario", "David Guetta & Jast", any(), any())
+        }
 
         // A normal addon's miss expires after five minutes as before.
         var normalNow = 1_000_000_000_000L
@@ -645,7 +648,9 @@ class EclipseAddonStreamResolverTest {
         normalResolver.resolve(mario)
         normalNow += 10 * 60_000L
         normalResolver.resolve(mario)
-        coVerify(exactly = 2) { normalRepo.resolve(nebula, any(), any(), any(), any()) }
+        coVerify(exactly = 2) {
+            normalRepo.resolve(nebula, "Mario", "David Guetta & Jast", any(), any())
+        }
     }
 
     // ── Persistent Apple lookup + queue warming ────────────────────────────
@@ -851,6 +856,77 @@ class EclipseAddonStreamResolverTest {
         assertThat(resolver.resolve(track())).isNotNull()
         io.mockk.coVerify(exactly = 1) { store.put(nebula.id, any(), any(), any()) }
         io.mockk.verify(exactly = 1) { memory.put(track().id, any()) }
+    }
+
+    @Test
+    fun `a version suffix and multi-artist credit fall back to the cleaned Tidal query, then cache`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        coEvery {
+            repository.resolve(cloud, "Stay - Ely Oaks Version", "Ely Oaks, Misdemeanor", any(), any())
+        } returns null
+        coEvery { repository.resolve(cloud, "Stay", "Ely Oaks", any(), null) } returns
+            EclipseAddonTrack(id = "488516610", title = "Stay", artist = "Ely Oaks", isrc = "FAKEISRC")
+        coEvery { repository.stream(cloud, "488516610") } returns stream()
+        val resolver = cachedResolver(repository)
+        val stay = TrackEntity(
+            title = "Stay - Ely Oaks Version",
+            artist = "Ely Oaks, Misdemeanor",
+            durationMs = 159_246,
+        )
+
+        assertThat(resolver.resolve(stay)).isNotNull()
+        coVerify(exactly = 1) { repository.resolve(cloud, "Stay", "Ely Oaks", any(), null) }
+
+        // The found id is cached under the normal track identity: no second search.
+        resolver.resolve(stay)
+        coVerify(exactly = 1) {
+            repository.resolve(cloud, "Stay - Ely Oaks Version", "Ely Oaks, Misdemeanor", any(), any())
+        }
+        coVerify(exactly = 1) { repository.resolve(cloud, "Stay", "Ely Oaks", any(), null) }
+    }
+
+    @Test
+    fun `a foreground play ignores a stored Apple negative and searches iTunes`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        coEvery { repository.resolve(any(), any(), any(), any(), any()) } returns null
+        coEvery { repository.searchApple(any(), any(), any()) } returns listOf(appleHit)
+        coEvery { repository.streamApple(any(), "6812560833", any()) } returns stream(format = "hls")
+        val lookup: EclipseAppleLookupStore = mockk(relaxed = true)
+        coEvery { lookup.get(any(), any()) } returns
+            com.stash.core.data.addons.AppleLookup(null, Long.MAX_VALUE)
+        val resolver = EclipseAddonStreamResolver.forTest(
+            repository,
+            EclipseAddonResolveCache(),
+            cloudFastestSource = { false },
+            appleLookup = lookup,
+        )
+
+        assertThat(resolver.resolve(track())).isNotNull()
+        coVerify(exactly = 1) { repository.searchApple(any(), any(), any()) }
+    }
+
+    @Test
+    fun `a speculative resolve may use the stored Apple negative`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        coEvery { repository.resolve(any(), any(), any(), any(), any()) } returns null
+        val lookup: EclipseAppleLookupStore = mockk(relaxed = true)
+        coEvery { lookup.get(any(), any()) } returns
+            com.stash.core.data.addons.AppleLookup(null, Long.MAX_VALUE)
+        val resolver = EclipseAddonStreamResolver.forTest(
+            repository,
+            EclipseAddonResolveCache(),
+            cloudFastestSource = { false },
+            appleLookup = lookup,
+        )
+
+        assertThat(resolver.resolve(track(), speculative = true)).isNull()
+        coVerify(exactly = 0) { repository.searchApple(any(), any(), any()) }
     }
 
     private fun track() = TrackEntity(title = "Blinding Lights", artist = "The Weeknd", durationMs = 200_000)
