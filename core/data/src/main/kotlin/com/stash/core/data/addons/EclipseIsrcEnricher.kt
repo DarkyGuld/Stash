@@ -38,12 +38,20 @@ class EclipseIsrcEnricher @Inject constructor(
     private val json = Json { ignoreUnknownKeys = true }
     private val memory = ConcurrentHashMap<String, String>()
 
+    /** Log the backoff decision once per process, not once per track. */
+    private val backoffLogged = java.util.concurrent.atomic.AtomicBoolean(false)
+
     suspend fun isrcFor(track: TrackEntity): String? {
         track.isrc?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
         val key = cacheKey(track)
         memory[key]?.let { return it }
 
-        val fromSpotify = try {
+        val backoffUntil = gate.backoffUntilMs()
+        val spotifyCoolingDown = System.currentTimeMillis() < backoffUntil
+        if (spotifyCoolingDown && backoffLogged.compareAndSet(false, true)) {
+            Log.d(TAG, "Spotify ISRC backoff active; using Deezer for lookups until it lifts")
+        }
+        val fromSpotify = if (spotifyCoolingDown) null else try {
             val id = spotifyTrackId(track.spotifyUri)
             if (id == null) null else {
                 gate.beginForeground()
@@ -96,8 +104,23 @@ class EclipseIsrcEnricher @Inject constructor(
     }
 
     private suspend fun deezerIsrc(track: TrackEntity): String? = withContext(Dispatchers.IO) {
+        // The full "title + every credited artist" query is often empty at Deezer;
+        // mirror the iTunes variant order, plus a title-only last resort.
+        val queries = EclipseAddonQuery.variants(track.title, track.artist)
+            .map { (title, artist) -> "$title $artist".trim() }
+            .plus(track.title.trim())
+            .filter { it.isNotEmpty() }
+            .distinct()
+        for (query in queries) {
+            val found = deezerSearch(query, track)
+            if (found != null) return@withContext found
+        }
+        null
+    }
+
+    private fun deezerSearch(query: String, track: TrackEntity): String? {
         val url = "https://api.deezer.com/search".toHttpUrlOrNull()!!.newBuilder()
-            .addQueryParameter("q", "${track.title} ${track.artist}".trim())
+            .addQueryParameter("q", query)
             .addQueryParameter("limit", "10")
             .build()
         val body = runCatching {
@@ -105,27 +128,31 @@ class EclipseIsrcEnricher @Inject constructor(
                 if (!response.isSuccessful) return@use null
                 response.body?.string()
             }
-        }.getOrNull() ?: return@withContext null
-        val root = runCatching { json.parseToJsonElement(body) as? JsonObject }.getOrNull() ?: return@withContext null
-        val rows = root["data"] as? JsonArray ?: return@withContext null
+        }.getOrNull() ?: return null
+        val root = runCatching { json.parseToJsonElement(body) as? JsonObject }.getOrNull() ?: return null
+        val rows = root["data"] as? JsonArray ?: return null
         val wantTitle = normalize(track.title)
+        val cleanedTitle = normalize(EclipseAddonQuery.cleanedTitle(track.title))
         val wantArtist = normalize(track.artist)
+        val primaryArtist = normalize(EclipseAddonQuery.primaryArtist(track.artist))
         val wantMs = track.durationMs
         for (row in rows) {
             val obj = row as? JsonObject ?: continue
             val title = (obj["title"] as? JsonPrimitive)?.contentOrNull ?: continue
             val artist = ((obj["artist"] as? JsonObject)?.get("name") as? JsonPrimitive)?.contentOrNull ?: continue
             val isrc = (obj["isrc"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() } ?: continue
-            if (normalize(title) != wantTitle) continue
+            val candidateTitle = normalize(title)
+            if (candidateTitle != wantTitle && candidateTitle != cleanedTitle) continue
             val candidateArtist = normalize(artist)
-            if (candidateArtist != wantArtist &&
-                !candidateArtist.contains(wantArtist) && !wantArtist.contains(candidateArtist)
-            ) continue
+            val artistOk = candidateArtist == wantArtist || candidateArtist == primaryArtist ||
+                candidateArtist.contains(wantArtist) || wantArtist.contains(candidateArtist) ||
+                candidateArtist.contains(primaryArtist) || primaryArtist.contains(candidateArtist)
+            if (!artistOk) continue
             val seconds = (obj["duration"] as? JsonPrimitive)?.contentOrNull?.toLongOrNull() ?: 0
             if (wantMs > 0 && seconds > 0 && kotlin.math.abs(wantMs - seconds * 1_000) > 10_000) continue
-            return@withContext isrc
+            return isrc
         }
-        null
+        return null
     }
 
     private fun normalize(raw: String): String =

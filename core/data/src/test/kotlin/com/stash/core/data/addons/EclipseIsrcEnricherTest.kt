@@ -6,6 +6,7 @@ import com.stash.core.data.db.entity.TrackEntity
 import com.stash.data.spotify.SpotifyApiClient
 import io.mockk.coEvery
 import io.mockk.coVerify
+import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.test.runTest
 import okhttp3.HttpUrl
@@ -22,7 +23,9 @@ class EclipseIsrcEnricherTest {
     private lateinit var http: OkHttpClient
     private val spotify: SpotifyApiClient = mockk()
     private val dao: TrackDao = mockk(relaxed = true)
-    private val gate: SpotifyIsrcGate = mockk(relaxed = true)
+    private val gate: SpotifyIsrcGate = mockk(relaxed = true) {
+        every { backoffUntilMs() } returns 0L
+    }
 
     @Before
     fun setUp() {
@@ -91,6 +94,31 @@ class EclipseIsrcEnricherTest {
 
         assertThat(enricher.isrcFor(noUri)).isEqualTo("BEIW12600564")
         coVerify(exactly = 0) { spotify.getTracksIsrc(any()) }
+    }
+
+    @Test
+    fun `an active Spotify backoff skips Spotify and uses the cleaned Deezer query`() = runTest {
+        every { gate.backoffUntilMs() } returns System.currentTimeMillis() + 3_600_000L
+        val queries = mutableListOf<String>()
+        server.dispatcher = object : okhttp3.mockwebserver.Dispatcher() {
+            override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest): MockResponse {
+                val q = request.requestUrl!!.queryParameter("q").orEmpty()
+                queries += q
+                return if (q.contains("Dimitri Vegas") && !q.contains("Maddix")) {
+                    MockResponse().setBody(
+                        """{"data":[{"title":"Feel Love","artist":{"name":"Dimitri Vegas & Like Mike"},
+                           "duration":171,"isrc":"BEIW12600564"}]}""",
+                    )
+                } else {
+                    MockResponse().setBody("""{"data":[]}""")
+                }
+            }
+        }
+
+        assertThat(enricher().isrcFor(track().copy(spotifyUri = null))).isEqualTo("BEIW12600564")
+        coVerify(exactly = 0) { spotify.getTracksIsrc(any()) }
+        assertThat(queries.first()).contains("Dimitri Vegas & Like Mike")
+        assertThat(queries.first()).doesNotContain("Maddix")
     }
 
     @Test
