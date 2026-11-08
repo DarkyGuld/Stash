@@ -39,6 +39,7 @@ import okio.sink
 class LosslessUrlDownloader @Inject constructor(
     httpClient: OkHttpClient,
     private val dashDownloader: DashFlacDownloader,
+    private val hlsDownloader: HlsFlacDownloader,
 ) {
     // Whole-file lossless fetches are large (a Hi-Res FLAC runs 70-140 MB). The
     // shared client's 30 s read timeout is an inter-byte stall limit — fine for
@@ -81,6 +82,16 @@ class LosslessUrlDownloader @Inject constructor(
             return@withContext dashDownloader.download(
                 client = fetchClient,
                 mpdUrl = source.downloadUrl,
+                headers = source.downloadHeaders,
+                destination = destination,
+                onProgress = onProgress,
+            )
+        }
+        // HLS (Tidal through an Eclipse addon): init + segments concatenated.
+        if (source.isHls) {
+            return@withContext hlsDownloader.download(
+                client = fetchClient,
+                playlistUrl = source.downloadUrl,
                 headers = source.downloadHeaders,
                 destination = destination,
                 onProgress = onProgress,

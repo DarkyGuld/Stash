@@ -3,6 +3,8 @@ package com.stash.core.media.streaming
 import android.util.Log
 import com.stash.core.data.addons.EclipseAddonRepository
 import com.stash.core.data.db.dao.TrackDao
+import com.stash.core.data.db.entity.TrackEntity
+import com.stash.core.model.MusicSource
 import com.stash.data.download.lossless.AudioFormat
 import com.stash.data.download.lossless.LosslessSource
 import com.stash.data.download.lossless.RateLimitState
@@ -41,46 +43,83 @@ class EclipseLosslessSource @Inject constructor(
         }
 
     override suspend fun resolve(query: TrackQuery, bypassRateLimit: Boolean): SourceResult? {
-        // The resolver works on the real row (metadata, ISRC, duration) — not the query copy.
-        val trackId = query.trackId ?: return null
-        val row = try {
-            trackDao.getById(trackId)
-        } catch (e: kotlinx.coroutines.CancellationException) {
-            throw e
-        } catch (e: Exception) {
+        // The registry checks this too; keep a direct miss honest for callers/tests.
+        if (!isEnabled()) return null
+        // A search result has no DB row: resolve from the query metadata with a
+        // transient entity (id 0). The resolver keys on identity, so no write is needed.
+        val trackId = query.trackId
+        val row = if (trackId != null && trackId > 0) {
+            try {
+                trackDao.getById(trackId)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                null
+            }
+        } else {
             null
-        } ?: return null
+        }
+        val track = row ?: transientTrack(query)
+        val label = if (row != null) "trackId=$trackId" else "transient"
+        Log.d(
+            TAG,
+            "resolve $label '${query.artist} - ${query.title}' " +
+                "duration=${query.durationMs ?: 0} isrc=${if (query.isrc.isNullOrBlank()) "none" else "yes"}",
+        )
 
         val stream = try {
-            resolver.resolve(row)
+            resolver.resolve(track)
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
             // A 403/404 already reads as a miss inside the resolver; anything else is one too.
-            Log.d(TAG, "addon resolve failed for ${row.id}: ${e::class.java.simpleName}")
+            Log.d(TAG, "addon resolve failed for $label: ${e::class.java.simpleName}")
             null
-        } ?: return null
+        }
+        val outcome = when {
+            stream == null -> "null"
+            stream.isHls -> "hls"
+            stream.isDash -> "dash"
+            else -> "direct"
+        }
+        Log.d(TAG, "resolve $label -> $outcome (codec=${stream?.codec ?: "none"})")
+        if (stream == null) return null
 
-        if (stream.isHls || stream.isDash || stream.url.isBlank()) return null
+        if (stream.isDash || stream.url.isBlank()) return null
         val codec = stream.codec?.lowercase()?.takeIf { it.isNotBlank() } ?: extensionFor(stream.url)
+        // HLS (Tidal via Cloud) is fragmented MP4; the downloader concatenates
+        // init + segments. The finalizer accepts .m4a (its known audio formats).
+        val fileExtension = if (stream.isHls) "m4a" else extensionFor(stream.url, codec)
         return SourceResult(
             sourceId = id,
             downloadUrl = stream.url,
-            // A direct, already-signed Qobuz/file URL needs no headers of ours.
+            // A direct, already-signed Qobuz/HLS URL needs no headers of ours.
             downloadHeaders = emptyMap(),
             format = AudioFormat(
                 codec = codec,
                 bitrateKbps = stream.bitrateKbps ?: 0,
                 sampleRateHz = stream.sampleRateHz ?: 0,
                 bitsPerSample = stream.bitsPerSample ?: 0,
-                fileExtension = extensionFor(stream.url, codec),
+                fileExtension = fileExtension,
             ),
             confidence = 1.0f,
+            isHls = stream.isHls,
         )
     }
 
     /** Not an aggregator: nothing to throttle, always idle. */
     override suspend fun rateLimitState(): RateLimitState = IDLE
+
+    /** Query metadata as a TrackEntity for a row that isn't in the DB (id 0, never persisted). */
+    private fun transientTrack(query: TrackQuery): TrackEntity = TrackEntity(
+        id = 0,
+        title = query.title,
+        artist = query.artist,
+        album = query.album.orEmpty(),
+        durationMs = query.durationMs ?: 0,
+        isrc = query.isrc,
+        source = MusicSource.SPOTIFY,
+    )
 
     private fun extensionFor(url: String, codec: String? = null): String {
         val candidate = codec ?: url.substringBefore('?').substringAfterLast('.', "").lowercase()

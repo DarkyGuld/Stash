@@ -285,6 +285,12 @@ data class SourceResult(
      * itself; [LosslessUrlDownloader] then fetches the segments and remuxes.
      */
     val isDash: Boolean = false,
+
+    /**
+     * True when [downloadUrl] is an HLS media playlist (fMP4/FLAC): the downloader
+     * fetches #EXT-X-MAP init + every segment and concatenates them.
+     */
+    val isHls: Boolean = false,
 )
 
 /**

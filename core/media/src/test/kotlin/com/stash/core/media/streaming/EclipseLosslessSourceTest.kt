@@ -13,7 +13,9 @@ import kotlinx.coroutines.test.runTest
 import org.junit.Test
 
 class EclipseLosslessSourceTest {
-    private val repository: EclipseAddonRepository = mockk()
+    private val repository: EclipseAddonRepository = mockk {
+        coEvery { enabledNow() } returns listOf(cloud())
+    }
     private val resolver: EclipseAddonStreamResolver = mockk()
     private val dao: TrackDao = mockk()
 
@@ -61,10 +63,18 @@ class EclipseLosslessSourceTest {
     }
 
     @Test
-    fun `HLS and DASH answers are not downloadable here`() = runTest {
+    fun `HLS answers are downloadable as fragmented MP4, DASH is not`() = runTest {
         coEvery { dao.getById(7) } returns row
         coEvery { resolver.resolve(row) } returns progressive().copy(isHls = true)
-        assertThat(source().resolve(query)).isNull()
+
+        val hls = source().resolve(query)!!
+        assertThat(hls.isHls).isTrue()
+        assertThat(hls.downloadUrl).isEqualTo(progressive().url)
+        assertThat(hls.format.codec).isEqualTo("flac")
+        assertThat(hls.format.bitsPerSample).isEqualTo(24)
+        assertThat(hls.format.sampleRateHz).isEqualTo(44_100)
+        assertThat(hls.format.fileExtension).isEqualTo("m4a")
+        assertThat(hls.confidence).isEqualTo(1.0f)
 
         coEvery { resolver.resolve(row) } returns progressive().copy(isDash = true)
         assertThat(source().resolve(query)).isNull()
@@ -86,13 +96,47 @@ class EclipseLosslessSourceTest {
     }
 
     @Test
-    fun `a resolver miss or a row without an id is a normal miss`() = runTest {
+    fun `a resolver miss is a normal miss`() = runTest {
         coEvery { dao.getById(7) } returns row
-        coEvery { resolver.resolve(row) } returns null
-        assertThat(source().resolve(query)).isNull()
+        coEvery { resolver.resolve(any()) } returns null
 
+        assertThat(source().resolve(query)).isNull()
         assertThat(source().resolve(query.copy(trackId = null))).isNull()
         assertThat(source().resolve(query.copy(trackId = 99))).isNull()
+    }
+
+    @Test
+    fun `a search result with no DB row resolves from query metadata`() = runTest {
+        val query = TrackQuery(
+            artist = "Artist",
+            title = "Makina Time",
+            album = "Album",
+            durationMs = 200_000,
+            isrc = "FAKEISRC",
+            trackId = null,
+        )
+        coEvery { resolver.resolve(match { it.id == 0L && it.title == "Makina Time" && it.artist == "Artist" }) } returns
+            progressive().copy(isHls = true)
+
+        val result = source().resolve(query)!!
+
+        assertThat(result.isHls).isTrue()
+        assertThat(result.format.codec).isEqualTo("flac")
+        assertThat(result.format.fileExtension).isEqualTo("m4a")
+        // No DB row is written or looked up for a search result.
+        io.mockk.coVerify(exactly = 0) { dao.getById(any()) }
+    }
+
+    @Test
+    fun `a missing row falls back to the query metadata, and direct stays direct`() = runTest {
+        coEvery { dao.getById(7) } returns null
+        coEvery { resolver.resolve(match { it.id == 0L && it.title == "Song" }) } returns progressive()
+
+        val result = source().resolve(query)!!
+
+        assertThat(result.isHls).isFalse()
+        assertThat(result.format.fileExtension).isEqualTo("flac")
+        io.mockk.coVerify(exactly = 1) { dao.getById(7) }
     }
 
     @Test

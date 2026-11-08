@@ -26,7 +26,7 @@ class LosslessUrlDownloaderTest {
 
     @Before fun setUp() {
         server = MockWebServer().also { it.start() }
-        downloader = LosslessUrlDownloader(OkHttpClient(), io.mockk.mockk(relaxed = true))
+        downloader = LosslessUrlDownloader(OkHttpClient(), io.mockk.mockk(relaxed = true), HlsFlacDownloader())
     }
 
     @After fun tearDown() = server.shutdown()
