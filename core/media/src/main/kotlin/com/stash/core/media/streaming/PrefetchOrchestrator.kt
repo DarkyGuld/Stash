@@ -113,8 +113,12 @@ class PrefetchOrchestrator @Inject constructor(
                     // The next track always gets its first chunk. The whole file only
                     // with the explicit preference on (and unmetered).
                     val unmetered = qualityPolicy?.isMeteredNetwork() == false
-                    val wholeFile = unmetered && streamingPreference?.isPrefetchWholeFile() == true
-                    firstChunk?.warm(id, resolved, full = wholeFile)
+                    if (resolved.isHls) {
+                        firstChunk?.warmHls(id, resolved)
+                    } else {
+                        val wholeFile = unmetered && streamingPreference?.isPrefetchWholeFile() == true
+                        firstChunk?.warm(id, resolved, full = wholeFile)
+                    }
                 }
                 Log.d(TAG, "Prefetched stream URL for upcoming track $id")
             }

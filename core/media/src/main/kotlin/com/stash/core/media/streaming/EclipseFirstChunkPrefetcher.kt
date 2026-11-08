@@ -49,6 +49,7 @@ class EclipseFirstChunkPrefetcher @Inject constructor(
         if (stream.isHls || stream.isDash || stream.url.isBlank()) return
         val cap = if (full) FULL_FILE_CAP_BYTES else FIRST_CHUNK_BYTES
         val key = addonCacheKey(trackId, stream, stream.url)
+        Log.d(TAG, "warm invoked track=$trackId full=$full cap=$cap key=$key")
         val before = cache.getCachedBytes(key, 0, cap)
         if (before >= cap) {
             Log.d(TAG, "addon file already cached ($before bytes, full=$full)")
@@ -81,6 +82,46 @@ class EclipseFirstChunkPrefetcher @Inject constructor(
         }
         val cached = cache.getCachedBytes(key, 0, cap)
         Log.d(TAG, "addon ${if (full) "file" else "first chunk"} $cached bytes warmed (${if (cached >= cap) "hit" else "partial"})")
+    }
+
+    /**
+     * HLS next-track warm: fetch the small `.m3u8` into the same cache and under
+     * the same key the player's HlsMediaSource will read. Segments are left to
+     * playback (and the player's own cache), never fetched as a playlist.
+     */
+    suspend fun warmHls(trackId: Long, stream: StreamUrl) {
+        if (!stream.isHls || stream.url.isBlank()) return
+        val key = addonCacheKey(trackId, stream, stream.url)
+        if (cache.isCached(key, 0, 1)) {
+            Log.d(TAG, "hls manifest already cached track=$trackId key=$key")
+            return
+        }
+        Log.d(TAG, "hls warm invoked track=$trackId key=$key")
+        val dataSpec = DataSpec.Builder()
+            .setUri(stream.url)
+            .setPosition(0)
+            .setLength(-1L) // the manifest is small; read to its end
+            .build()
+        val cacheSource = CacheDataSource.Factory()
+            .setCache(cache)
+            .setUpstreamDataSourceFactory(OkHttpDataSource.Factory(httpClient))
+            .setCacheWriteDataSinkFactory(CacheDataSink.Factory().setCache(cache))
+            .setCacheKeyFactory(EclipseAddonCacheKeyFactory(trackId, stream))
+            .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+            .createDataSource() as CacheDataSource
+        val writer = CacheWriter(cacheSource, dataSpec, ByteArray(BUFFER_BYTES), null)
+        try {
+            withContext(Dispatchers.IO) { runInterruptible { writer.cache() } }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.d(TAG, "hls manifest warm stopped: ${e::class.java.simpleName}")
+        } finally {
+            writer.cancel()
+            cacheSource.close()
+        }
+        val cached = cache.getCachedLength(key, 0, Long.MAX_VALUE)
+        Log.d(TAG, "hls manifest $cached bytes warmed")
     }
 
     private companion object {

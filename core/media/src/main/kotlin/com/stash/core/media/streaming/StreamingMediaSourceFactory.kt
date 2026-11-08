@@ -17,6 +17,7 @@ import androidx.media3.exoplayer.source.MediaSource
 import com.stash.core.data.db.dao.TrackDao
 import javax.inject.Inject
 import javax.inject.Singleton
+import android.util.Log
 
 /**
  * Composed [MediaSource.Factory] for online-streaming playback. Builds the
@@ -88,6 +89,8 @@ class StreamingMediaSourceFactory @Inject constructor(
      * ones, `followSslRedirects = false` blocks https↔http). No headers are
      * added here; the shared client carries no Eclipse Authorization interceptor.
      */
+    private val TAG = "EclipseAddonStream"
+
     private val hlsHttpClient = okHttpClient.newBuilder()
         .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
         .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
@@ -150,8 +153,16 @@ class StreamingMediaSourceFactory @Inject constructor(
         stream: StreamUrl,
         trackId: Long?,
     ): MediaSource {
+        val cacheKey = addonCacheKey(trackId, stream, stream.url)
+        val hit = streamCache.isCached(cacheKey, 0, 1)
+        Log.d(
+            TAG,
+            "addon progressive track=${trackId ?: 0} ${if (hit) "cache hit" else "cache miss"} key=$cacheKey",
+        )
         val cacheFactory = CacheDataSource.Factory()
             .setCache(streamCache)
+            // Without an explicit write sink CacheDataSource only reads the cache.
+            .setCacheWriteDataSinkFactory(CacheDataSink.Factory().setCache(streamCache))
             .setUpstreamDataSourceFactory(OkHttpDataSource.Factory(hlsHttpClient))
             .setCacheKeyFactory(EclipseAddonCacheKeyFactory(trackId, stream))
             .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
@@ -160,12 +171,31 @@ class StreamingMediaSourceFactory @Inject constructor(
             .createMediaSource(item)
     }
 
+    /** Drops every cached manifest/segment of [trackId] (401/403/410 invalidation). */
+    private fun evictAddonCache(trackId: Long) {
+        val prefix = "eclipse|$trackId|"
+        runCatching {
+            streamCache.keys.filter { it.startsWith(prefix) }.forEach(streamCache::removeResource)
+        }.onFailure { Log.d(TAG, "cache eviction failed for track $trackId: ${it::class.java.simpleName}") }
+    }
+
     fun createHlsMediaSource(mediaItem: MediaItem, stream: StreamUrl): MediaSource {
         val current = java.util.concurrent.atomic.AtomicReference(stream.url)
         val trackId = mediaItem.mediaId.toLongOrNull()
-        val http = OkHttpDataSource.Factory(hlsHttpClient)
+        val cacheKey = addonCacheKey(trackId, stream, stream.url)
+        Log.d(
+            TAG,
+            "addon hls track=${trackId ?: 0} ${if (streamCache.isCached(cacheKey, 0, 1)) "cache hit" else "cache miss"} key=$cacheKey",
+        )
+        // Manifest and segments share the cache, keyed by their own paths (signed query ignored).
+        val cachedHttp = CacheDataSource.Factory()
+            .setCache(streamCache)
+            .setCacheWriteDataSinkFactory(CacheDataSink.Factory().setCache(streamCache))
+            .setUpstreamDataSourceFactory(OkHttpDataSource.Factory(hlsHttpClient))
+            .setCacheKeyFactory(EclipseAddonCacheKeyFactory(trackId, stream))
+            .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
         val source = DataSource.Factory {
-            HlsManifestDataSource(http.createDataSource(), stream.url, current, { streamAllowed() },
+            HlsManifestDataSource(cachedHttp.createDataSource(), stream.url, current, { streamAllowed() },
                 refresh = {
                     if (trackId == null) null else kotlinx.coroutines.runBlocking(kotlinx.coroutines.Dispatchers.IO) {
                         kotlinx.coroutines.withTimeoutOrNull(30_000) {
@@ -181,7 +211,11 @@ class StreamingMediaSourceFactory @Inject constructor(
                         }
                     }
                 },
-                invalidate = { trackId?.let(urlCache::invalidate) },
+                invalidate = {
+                    trackId?.let(urlCache::invalidate)
+                    // Stale manifest/segments must not be served again.
+                    trackId?.let(::evictAddonCache)
+                },
             )
         }
         val item = mediaItem.buildUpon().setUri(stream.url).setMimeType(MimeTypes.APPLICATION_M3U8).build()

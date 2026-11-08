@@ -129,6 +129,61 @@ class StashMediaSourceFactoryTest {
         source.releaseSource(caller)
     }
 
+    /** A cached addon progressive URL should select the cache child even with the hint off. */
+    @Test fun `a cached addon progressive URL uses the cache child without the resolve hint`() {
+        val streaming = mockk<StreamingMediaSourceFactory>(relaxed = true)
+        val resolver = mockk<StreamSourceRegistry>()
+        val dao = mockk<com.stash.core.data.db.dao.TrackDao>()
+        val stream = StreamUrl(
+            "https://streaming-qobuz-std.akamaized.net/file?etsp=1",
+            System.currentTimeMillis() + 300_000,
+            codec = "flac", origin = "addon:Cloud",
+        )
+        val cache = StreamUrlCache().apply { put(42, stream) }
+        io.mockk.coEvery { dao.getById(42) } returns com.stash.core.data.db.entity.TrackEntity(
+            id = 42, title = "Song", artist = "Artist")
+        val item = MediaItem.Builder().setMediaId("42").setUri("stash-resolve://track/42").build()
+        val kid = mockk<MediaSource>(relaxed = true) {
+            every { mediaItem } returns item.buildUpon().setUri(stream.url).build()
+        }
+        every { streaming.createAddonProgressive(any(), stream, 42L) } returns kid
+
+        val factory = StashMediaSourceFactory(
+            ApplicationProvider.getApplicationContext(), streaming,
+            { null }, { false }, OkHttpClient(), resolver, cache, dao,
+            resolveDispatcher = kotlinx.coroutines.Dispatchers.Unconfined,
+        )
+        val source = factory.createMediaSource(item)
+        val caller = MediaSource.MediaSourceCaller { _, _ -> }
+        source.prepareSource(caller, null, androidx.media3.exoplayer.analytics.PlayerId.UNSET)
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+
+        verify(exactly = 1) { streaming.createAddonProgressive(any(), stream, 42L) }
+        source.releaseSource(caller)
+    }
+
+    @Test fun `an already-resolved cached addon URL goes straight to the cache child`() {
+        val streaming = mockk<StreamingMediaSourceFactory>(relaxed = true)
+        val resolver = mockk<StreamSourceRegistry>()
+        val dao = mockk<com.stash.core.data.db.dao.TrackDao>()
+        val stream = StreamUrl(
+            "https://streaming-qobuz-std.akamaized.net/file?etsp=1",
+            System.currentTimeMillis() + 300_000,
+            codec = "flac", origin = "addon:Cloud",
+        )
+        val cache = StreamUrlCache().apply { put(42, stream) }
+        val item = MediaItem.Builder().setMediaId("42").setUri(stream.url).build()
+        val kid = mockk<MediaSource>(relaxed = true)
+        every { streaming.createAddonProgressive(any(), stream, 42L) } returns kid
+        val factory = StashMediaSourceFactory(
+            ApplicationProvider.getApplicationContext(), streaming,
+            { null }, { false }, OkHttpClient(), resolver, cache, dao,
+        )
+
+        assertThat(factory.createMediaSource(item)).isSameInstanceAs(kid)
+        verify(exactly = 1) { streaming.createAddonProgressive(any(), stream, 42L) }
+    }
+
     private val streamingFactory: StreamingMediaSourceFactory = mockk(relaxed = true)
     private fun item(uri: String): MediaItem = MediaItem.fromUri(uri)
 

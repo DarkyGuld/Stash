@@ -27,6 +27,25 @@ class EclipseAddonCacheKeyFactoryTest {
     }
 
     @Test
+    fun `an HLS manifest and its segments have distinct stable keys`() {
+        val manifestA = StreamUrl(
+            "https://cdn.test/path/master.m3u8?exp=1&sig=aaa",
+            Long.MAX_VALUE, codec = "flac", origin = "addon:Cloud", isHls = true,
+        )
+        val manifestB = manifestA.copy(
+            url = "https://cdn.test/path/master.m3u8?exp=999&sig=bbb",
+        )
+        val segment = manifestA.copy(
+            url = "https://cdn.test/path/seg-1.m4s?exp=1&sig=aaa",
+        )
+
+        assertThat(addonCacheKey(9, manifestA, manifestA.url))
+            .isEqualTo(addonCacheKey(9, manifestB, manifestB.url))
+        assertThat(addonCacheKey(9, manifestA, manifestA.url))
+            .isNotEqualTo(addonCacheKey(9, segment, segment.url))
+    }
+
+    @Test
     fun `track, addon and quality separate entries`() {
         val base = url("uid=1")
 

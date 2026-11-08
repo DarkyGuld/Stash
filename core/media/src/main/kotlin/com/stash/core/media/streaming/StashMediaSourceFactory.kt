@@ -208,7 +208,8 @@ class StashMediaSourceFactory(
             val trackId = uri.lastPathSegment?.toLongOrNull()
             if (trackId != null && !isRowOverride(uri) && streamAllowed() &&
                 (resolveBeforeSourcePick() || uri.getQueryParameter("sc") == "1" ||
-                    urlCache.get(trackId)?.origin == "soundcloud" || urlCache.get(trackId)?.isHls == true)) {
+                    urlCache.get(trackId)?.origin == "soundcloud" || urlCache.get(trackId)?.isHls == true ||
+                    urlCache.get(trackId)?.isAddonProgressive() == true)) {
                 return ResolveFirstMediaSource(
                     mediaItem = mediaItem,
                     scope = resolveScope,
@@ -242,6 +243,15 @@ class StashMediaSourceFactory(
             }
             return lazyFactory.createMediaSource(mediaItem)
         }
+        // A cached addon progressive file already set as the item's URI: use the
+        // cache-backed source even without a placeholder resolve.
+        val cachedForItem = uri?.let { mediaItem.mediaId.toLongOrNull()?.let(urlCache::get) }
+        if ((uri?.scheme == "https" || uri?.scheme == "http") &&
+            cachedForItem?.isAddonProgressive() == true && cachedForItem.url == uri.toString()
+        ) {
+            return streamingFactory.createAddonProgressive(mediaItem, cachedForItem, mediaItem.mediaId.toLongOrNull())
+        }
+
         // A resolved Tidal MPD (prefetch / foreground tap set the item's URI to it).
         // Keyed on the path, not an extra: the session strips local configuration,
         // and upstream serves every MPD at `/dash/td/<id>.mpd`.
@@ -259,6 +269,9 @@ class StashMediaSourceFactory(
         return localFactory.createMediaSource(mediaItem)
     }
 }
+
+private fun StreamUrl.isAddonProgressive(): Boolean =
+    origin?.startsWith(EclipseAddonStreamResolver.ORIGIN) == true && !isHls && !isDash
 
 /** A stream's source in Download mode: it never opens, so the player skips the song. */
 @OptIn(UnstableApi::class)

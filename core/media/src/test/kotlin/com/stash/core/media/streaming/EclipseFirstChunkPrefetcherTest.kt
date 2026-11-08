@@ -84,6 +84,29 @@ class EclipseFirstChunkPrefetcherTest {
     }
 
     @Test
+    fun `hls warm stores the manifest under the player's key`() = runTest {
+        val playlist = "#EXTM3U\n#EXT-X-VERSION:7\n#EXTINF:4.0,\nseg-1.m4s\n"
+        server.enqueue(MockResponse().setBody(playlist))
+        val hls = StreamUrl(
+            url = server.url("/path/master.m3u8?exp=1&sig=abc").toString(),
+            expiresAtMs = Long.MAX_VALUE,
+            codec = "flac",
+            origin = "addon:Cloud",
+            isHls = true,
+        )
+
+        prefetcher.warmHls(trackId = 11, stream = hls)
+
+        val key = addonCacheKey(11, hls, hls.url)
+        assertThat(cache.isCached(key, 0, 1)).isTrue()
+        assertThat(server.takeRequest().path).startsWith("/path/master.m3u8")
+
+        // A second warm is a cache hit and fetches nothing.
+        prefetcher.warmHls(trackId = 11, stream = hls)
+        assertThat(server.requestCount).isEqualTo(1)
+    }
+
+    @Test
     fun `cancellation stops the warm promptly`() = runTest {
         server.enqueue(
             MockResponse()
