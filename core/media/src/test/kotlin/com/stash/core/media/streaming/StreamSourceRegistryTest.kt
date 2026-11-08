@@ -609,6 +609,21 @@ class StreamSourceRegistryTest {
     }
 
     @Test
+    fun `a definitive miss skips the whole chain on the next retry`() = runTest {
+        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
+        coEvery { qbdlx.resolve(any()) } returns null
+        coEvery { youtube.resolve(any(), any()) } returns null
+        coEvery { jiosaavn.resolve(any()) } returns null
+
+        val registry = registry()
+        assertThat(registry.resolve(stubTrack())).isNull()
+        assertThat(registry.resolve(stubTrack())).isNull()
+
+        // One full walk; the second play is skipped by the short unavailable TTL.
+        coVerify(exactly = 1) { qbdlx.resolve(any()) }
+    }
+
+    @Test
     fun `normal foreground chain tries jiosaavn before youtube`() = runTest {        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
         coEvery { qbdlx.resolve(any()) } returns null
         coEvery { jiosaavn.resolve(any()) } returns null

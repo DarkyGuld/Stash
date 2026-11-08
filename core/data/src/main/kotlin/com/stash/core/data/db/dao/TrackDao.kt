@@ -2453,6 +2453,13 @@ interface TrackDao {
     @Query("UPDATE tracks SET isrc = :isrc WHERE id = :trackId AND (isrc IS NULL OR isrc = '')")
     suspend fun backfillIsrcIfMissing(trackId: Long, isrc: String)
 
+    /** Spotify-backed rows still missing an ISRC, for the background enrichment worker. */
+    @Query(
+        "SELECT * FROM tracks WHERE spotify_uri IS NOT NULL AND spotify_uri != '' " +
+            "AND (isrc IS NULL OR isrc = '') ORDER BY id LIMIT :limit",
+    )
+    suspend fun tracksMissingIsrc(limit: Int): List<TrackEntity>
+
     /**
      * Set the cached canonical ATV/OMV video id for this track. Called once
      * per track by [com.stash.core.data.youtube.YtCanonicalResolver] when it

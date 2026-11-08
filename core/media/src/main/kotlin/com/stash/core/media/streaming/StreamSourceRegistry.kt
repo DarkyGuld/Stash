@@ -182,6 +182,14 @@ class StreamSourceRegistry internal constructor(
          */
         speculative: Boolean = false,
     ): StreamUrl? {
+        // Definitive miss recently: don't re-walk the whole chain on every player retry.
+        unavailableUntilMs[track.id]?.let { until ->
+            if (System.currentTimeMillis() < until) {
+                Log.i(TAG, "no source for ${track.id} (unavailable TTL)")
+                return null
+            }
+            unavailableUntilMs.remove(track.id)
+        }
         // Last line of defence: a cloud song (the user's own file) is never looked up on the
         // lossless relays, JioSaavn or YouTube. Its player item streams from stash-cloud://.
         if (track.soundCloudId != null || track.source == com.stash.core.model.MusicSource.SOUNDCLOUD) return soundCloud?.resolve(track)
@@ -243,7 +251,14 @@ class StreamSourceRegistry internal constructor(
         // Caller cancellation still propagates out of await(), so tap-preemption
         // keeps surfacing as a CancellationException rather than a bogus
         // "Couldn't find this track" — see the chain loop below.
-        return deferred.await()
+        val resolved = deferred.await()
+        if (resolved == null) {
+            unavailableUntilMs[track.id] = System.currentTimeMillis() + UNAVAILABLE_TTL_MS
+            Log.i(TAG, "no source: every rung missed for ${track.id} '${track.title}'")
+        } else {
+            unavailableUntilMs.remove(track.id)
+        }
+        return resolved
     }
 
     /**
@@ -273,6 +288,13 @@ class StreamSourceRegistry internal constructor(
 
     /** In-flight resolves, keyed by [resolveKey]; entries self-remove on completion. */
     private val inFlightResolves = ConcurrentHashMap<String, Deferred<StreamUrl?>>()
+
+    /**
+     * Tracks every source missed for: a brand-new lossless source may appear, but
+     * the player retries the same broken item within seconds. Skipping here turns
+     * five full-chain retries into one attempt plus fast nulls for [UNAVAILABLE_TTL_MS].
+     */
+    private val unavailableUntilMs = ConcurrentHashMap<Long, Long>()
 
     private fun resolveKey(trackId: Long, allowYouTube: Boolean, allowYtDlp: Boolean, speculative: Boolean) =
         "$trackId:$allowYouTube:$allowYtDlp:$speculative"
@@ -568,5 +590,8 @@ class StreamSourceRegistry internal constructor(
         private val LOSSLESS_RUNGS = setOf("qbdlx", "tidal")
         /** A cloud copy's StreamUrl lifetime: its address is stable, so a long one. */
         private const val CLOUD_COPY_TTL_MS = 6 * 60 * 60 * 1000L
+
+        /** How long a definitive all-source miss suppresses the chain for the same track. */
+        private const val UNAVAILABLE_TTL_MS = 10 * 60_000L
     }
 }

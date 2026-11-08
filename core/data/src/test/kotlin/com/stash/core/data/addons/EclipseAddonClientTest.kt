@@ -644,6 +644,21 @@ class EclipseAddonClientTest {
     }
 
     @Test
+    fun `an iTunes 429 backs off instead of retrying or bursting`() = kotlinx.coroutines.test.runTest {
+        val previous = java.util.Locale.getDefault()
+        try {
+            java.util.Locale.setDefault(java.util.Locale.US)
+            server.enqueue(MockResponse().setResponseCode(429))
+
+            assertThat(client.searchAppleTracks("Stay", "Artist")).isEmpty()
+            assertThat(client.searchAppleTracks("Stay", "Artist")).isEmpty()
+            assertThat(server.requestCount).isEqualTo(1)
+        } finally {
+            java.util.Locale.setDefault(previous)
+        }
+    }
+
+    @Test
     fun `cloud apple stream uses the Apple route with the Cloud headers`() = kotlinx.coroutines.test.runTest {
         coEvery { tokenStore.getEclipseToken() } returns "acct-fake"
         server.enqueue(

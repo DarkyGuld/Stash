@@ -228,6 +228,9 @@ class EclipseAddonClient @Inject constructor(
 
     private val json = Json { ignoreUnknownKeys = true }
 
+    /** 429 from iTunes: stop searching for a minute instead of bursting. */
+    @Volatile private var appleCooldownUntilMs = 0L
+
     /** Minted `X-Eclipse-Access` values, per addon id. */
     private val accessTokens = ConcurrentHashMap<String, AccessToken>()
 
@@ -440,7 +443,20 @@ class EclipseAddonClient @Inject constructor(
             .build()
         // The search view, queue warm and variants can otherwise overlap into a burst.
         return appleSearchPermits.withPermit {
-            val body = getBody(url) ?: run {
+            if (System.currentTimeMillis() < appleCooldownUntilMs) {
+                Log.d(TAG, "itunes country=$country cooling down after a 429")
+                return@withPermit emptyList()
+            }
+            val body = try {
+                getBody(url)
+            } catch (e: EclipseAddonException.HttpFailure) {
+                if (e.code == 429) {
+                    appleCooldownUntilMs = System.currentTimeMillis() + APPLE_429_COOLDOWN_MS
+                    Log.d(TAG, "itunes country=$country rate limited; cooling down")
+                    return@withPermit emptyList()
+                }
+                throw e
+            } ?: run {
                 Log.d(TAG, "itunes country=$country empty body")
                 return@withPermit emptyList()
             }
@@ -727,6 +743,9 @@ class EclipseAddonClient @Inject constructor(
 
         /** At most two iTunes searches in flight process-wide. */
         private val appleSearchPermits = Semaphore(2)
+
+        /** After an iTunes 429, no more searches for this long. */
+        private const val APPLE_429_COOLDOWN_MS = 60_000L
 
         /** Minted access tokens are truncated by this much before expiry. */
         private const val EXPIRY_SKEW_MS = 30_000L

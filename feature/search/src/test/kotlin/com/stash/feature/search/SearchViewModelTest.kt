@@ -347,7 +347,7 @@ class SearchViewModelTest {
         vm.userMessages.test {
             vm.onResultTap(sampleTrack())
             val msg = awaitItem()
-            assertTrue(msg.contains("couldn't find", ignoreCase = true))
+            assertTrue(msg.contains("not available", ignoreCase = true))
             cancelAndIgnoreRemainingEvents()
         }
     }

@@ -56,6 +56,10 @@ class SettingsViewModelTest {
 
     /** Stream URLs cached for the player; addon changes must invalidate them. */
     private val streamUrlCache = mockk<com.stash.core.media.streaming.StreamUrlCache>(relaxed = true)
+    private val streamCacheMaintenance =
+        mockk<com.stash.core.media.streaming.StreamCacheMaintenance>(relaxed = true) {
+            every { sizeBytes() } returns 3_500L
+        }
 
     private var themePreference: com.stash.core.data.prefs.ThemePreference = mockk(relaxed = true)
 
@@ -118,6 +122,7 @@ class SettingsViewModelTest {
             every { user } returns flowOf(null)
         },
         streamUrlCache = streamUrlCache,
+        streamCacheMaintenance = streamCacheMaintenance,
     )
 
     // -- Display size (UI scale) ---------------------------------------------
@@ -169,6 +174,25 @@ class SettingsViewModelTest {
         vm.refreshStorageUsage()
 
         verify(exactly = 1) { librarySizeHolder.refresh() }
+    }
+
+    @Test fun `clearing the stream cache clears every layer and refreshes the size`() = runTest {
+        val vm = newVm()
+        vm.refreshStreamCacheSize()
+        assertThat(vm.streamCacheBytes.value).isEqualTo(3_500L)
+
+        vm.onClearStreamCache()
+        advanceUntilIdle()
+
+        coVerify(exactly = 1) { streamCacheMaintenance.clearAll() }
+    }
+
+    @Test fun `signing out of Eclipse clears account-bound caches`() = runTest {
+        val vm = newVm()
+        vm.onEclipseSignOut()
+        advanceUntilIdle()
+
+        coVerify { streamCacheMaintenance.clearAll() }
     }
 
     @Test fun `addon changes clear the cached stream URLs`() = runTest {

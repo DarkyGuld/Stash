@@ -113,6 +113,9 @@ fun SettingsLosslessSourcesScreen(
     val addonError by viewModel.addonError.collectAsStateWithLifecycle()
     val addonsFirst by viewModel.addonsFirst.collectAsStateWithLifecycle()
     val cloudFastestSource by viewModel.cloudFastestSource.collectAsStateWithLifecycle()
+    val streamCacheBytes by viewModel.streamCacheBytes.collectAsStateWithLifecycle()
+    val prefetchWholeFile by viewModel.prefetchWholeFile.collectAsStateWithLifecycle()
+    androidx.compose.runtime.LaunchedEffect(Unit) { viewModel.refreshStreamCacheSize() }
     val qobuzEnabled by viewModel.qobuzEnabled.collectAsStateWithLifecycle()
     val tidalEnabled by viewModel.tidalEnabled.collectAsStateWithLifecycle()
     val eclipseAddonsEnabled by viewModel.eclipseAddonsEnabled.collectAsStateWithLifecycle()
@@ -285,6 +288,8 @@ fun SettingsLosslessSourcesScreen(
                 error = addonError,
                 addonsFirst = addonsFirst,
                 cloudFastestSource = cloudFastestSource,
+                streamCacheBytes = streamCacheBytes,
+                prefetchWholeFile = prefetchWholeFile,
                 tokenPresent = eclipseTokenPresent,
                 tokenError = eclipseTokenError,
                 userEmail = eclipseUserEmail,
@@ -297,6 +302,8 @@ fun SettingsLosslessSourcesScreen(
                 onErrorShown = viewModel::onAddonErrorShown,
                 onAddonsFirstChanged = viewModel::onAddonsFirstChanged,
                 onCloudFastestSourceChanged = viewModel::onCloudFastestSourceChanged,
+                onClearCache = viewModel::onClearStreamCache,
+                onPrefetchWholeFileChanged = viewModel::onPrefetchWholeFileChanged,
                 onTokenCommitted = viewModel::onEclipseTokenCommitted,
                 onPasswordLogin = viewModel::onEclipsePasswordLogin,
                 onSignOut = viewModel::onEclipseSignOut,
@@ -678,6 +685,8 @@ private fun EclipseAddonsSection(
     error: String?,
     addonsFirst: Boolean,
     cloudFastestSource: Boolean,
+    streamCacheBytes: Long,
+    prefetchWholeFile: Boolean,
     tokenPresent: Boolean,
     tokenError: String?,
     userEmail: String?,
@@ -690,6 +699,8 @@ private fun EclipseAddonsSection(
     onErrorShown: () -> Unit,
     onAddonsFirstChanged: (Boolean) -> Unit,
     onCloudFastestSourceChanged: (Boolean) -> Unit,
+    onClearCache: () -> Unit,
+    onPrefetchWholeFileChanged: (Boolean) -> Unit,
     onTokenCommitted: (String) -> Unit,
     onPasswordLogin: (String, String) -> Unit,
     onSignOut: () -> Unit,
@@ -765,6 +776,61 @@ private fun EclipseAddonsSection(
             checked = cloudFastestSource,
             onCheckedChange = onCloudFastestSourceChanged,
         )
+
+        // Stream cache: size, one clear action, and the whole-file warm switch (off by default).
+        Spacer(modifier = Modifier.height(12.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = stringResource(R.string.settings_stream_cache_title),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Text(
+                    text = stringResource(
+                        R.string.settings_stream_cache_size,
+                        com.stash.feature.settings.formatCacheBytes(streamCacheBytes),
+                    ),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Text(
+                text = stringResource(R.string.settings_stream_cache_clear),
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.clickable { onClearCache() }.padding(8.dp),
+            )
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(role = Role.Switch) { onPrefetchWholeFileChanged(!prefetchWholeFile) },
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = stringResource(R.string.settings_prefetch_whole_files_title),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Text(
+                    text = stringResource(R.string.settings_prefetch_whole_files_desc),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Spacer(modifier = Modifier.width(12.dp))
+            StashSwitch(
+                checked = prefetchWholeFile,
+                onCheckedChange = onPrefetchWholeFileChanged,
+            )
+        }
 
         // Account-bound addons (Eclipse Cloud) need a token. The WebView
         // sign-in and the paste fallback both land in the same store; the
@@ -1478,4 +1544,11 @@ private fun SelectSettingField(
             }
         }
     }
+}
+
+/** "12.3 MB" for the Stream cache row. */
+internal fun formatCacheBytes(bytes: Long): String {
+    val mb = bytes.coerceAtLeast(0L) / (1024.0 * 1024.0)
+    return if (mb >= 1.0) String.format(java.util.Locale.US, "%.1f MB", mb)
+    else String.format(java.util.Locale.US, "%.0f KB", bytes.coerceAtLeast(0L) / 1024.0)
 }

@@ -490,6 +490,9 @@ class StashApplication : Application(), Configuration.Provider {
             runCatching { eclipseAddonPreferences.migrateCloudAppleQualityOnce() }
                 .onFailure { Log.w("StashStartup", "cloud apple-quality migration failed", it) }
         }
+        // Spotify-backed rows from older imports may lack their ISRC; fill it in the
+        // background (unmetered, rate-limited) so Cloud's Apple route has it at play time.
+        com.stash.core.data.sync.workers.SpotifyIsrcBackfillWorker.enqueue(this@StashApplication)
         // A stored Apple negative used to be able to hide a playable Apple track.
         // Drop negatives once; positives stay.
         applicationScope.launch {

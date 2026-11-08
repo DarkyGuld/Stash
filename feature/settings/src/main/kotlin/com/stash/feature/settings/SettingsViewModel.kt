@@ -180,6 +180,8 @@ class SettingsViewModel @Inject constructor(
     private val eclipseAccountManager: EclipseAccountManager,
     /** Cached stream URLs: addon changes invalidate every one, or a disabled addon's URL can still play. */
     private val streamUrlCache: com.stash.core.media.streaming.StreamUrlCache,
+    /** Streaming cache size + the clear-every-layer action. */
+    private val streamCacheMaintenance: com.stash.core.media.streaming.StreamCacheMaintenance,
 ) : ViewModel() {
 
     // ── ListenBrainz ────────────────────────────────────────────────────────
@@ -364,6 +366,36 @@ class SettingsViewModel @Inject constructor(
         viewModelScope.launch { streamingPreference.setCloudFastestSource(value) }
     }
 
+    // ── Stream cache ───────────────────────────────────────────────────────
+
+    private val _streamCacheBytes = MutableStateFlow(0L)
+
+    /** The Media3 streaming cache's size, refreshed by [refreshStreamCacheSize]. */
+    val streamCacheBytes: StateFlow<Long> = _streamCacheBytes
+
+    fun refreshStreamCacheSize() {
+        _streamCacheBytes.value = streamCacheMaintenance.sizeBytes()
+    }
+
+    /** Clears every cached stream URL: memory, disk, HLS/segments/first chunks. */
+    fun onClearStreamCache() {
+        viewModelScope.launch {
+            streamCacheMaintenance.clearAll()
+            _streamCacheBytes.value = streamCacheMaintenance.sizeBytes()
+        }
+    }
+
+    /** "Prefetch whole files" (off by default): whole-file next-track warm on Wi-Fi. */
+    val prefetchWholeFile: StateFlow<Boolean> = streamingPreference.prefetchWholeFile.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5_000),
+        initialValue = false,
+    )
+
+    fun onPrefetchWholeFileChanged(value: Boolean) {
+        viewModelScope.launch { streamingPreference.setPrefetchWholeFile(value) }
+    }
+
     // ── Per-source switches in the streaming chain ─────────────────────────
     //
     // All on by default. The UI lane renders them as a row of switches; turning
@@ -432,6 +464,9 @@ class SettingsViewModel @Inject constructor(
     fun onEclipseTokenCommitted(raw: String) {
         viewModelScope.launch {
             eclipseAccountManager.saveToken(raw)
+            // A different account: drop the URLs/Apple ids resolved under the old one.
+            runCatching { streamCacheMaintenance.clearAll() }
+            _streamCacheBytes.value = streamCacheMaintenance.sizeBytes()
             _eclipseTokenError.value = null
             _eclipseTokenTest.value = null
         }
@@ -495,6 +530,9 @@ class SettingsViewModel @Inject constructor(
     fun onEclipseSignOut() {
         viewModelScope.launch {
             eclipseAccountManager.signOut()
+            // Account-bound caches must not outlive the account.
+            runCatching { streamCacheMaintenance.clearAll() }
+            _streamCacheBytes.value = streamCacheMaintenance.sizeBytes()
             _eclipseLoginError.value = null
             _eclipseTokenError.value = null
             _eclipseTokenTest.value = null

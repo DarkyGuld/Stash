@@ -9,6 +9,7 @@ import com.stash.core.data.addons.EclipseAddonStream
 import com.stash.core.data.addons.EclipseAddonTrack
 import com.stash.core.data.addons.EclipseAppleLookupStore
 import com.stash.core.data.addons.EclipseAppleTrack
+import com.stash.core.data.addons.EclipseIsrcEnricher
 import com.stash.core.data.db.entity.TrackEntity
 import java.text.Normalizer
 import javax.inject.Inject
@@ -17,6 +18,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -44,7 +46,12 @@ class EclipseAddonStreamResolver private constructor(
     private val urlCache: StreamUrlCache?,
     /** Resolved addon URLs on disk; null in hand-built tests. */
     private val streamUrlStore: EclipseStreamUrlStore?,
+    /** ISRC enrichment for Cloud's Apple route; null in hand-built tests. */
+    private val isrcEnricher: EclipseIsrcEnricher?,
 ) {
+    /** Apple ids that 404'd at every tier this session: never request them again. */
+    private val deadAppleIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
     @Inject
     constructor(
         repository: EclipseAddonRepository,
@@ -52,6 +59,7 @@ class EclipseAddonStreamResolver private constructor(
         appleLookup: EclipseAppleLookupStore,
         urlCache: StreamUrlCache,
         streamUrlStore: EclipseStreamUrlStore,
+        isrcEnricher: EclipseIsrcEnricher,
     ) : this(
         repository,
         EclipseAddonResolveCache(),
@@ -59,11 +67,12 @@ class EclipseAddonStreamResolver private constructor(
         appleLookup,
         urlCache,
         streamUrlStore,
+        isrcEnricher,
     )
 
     /** Hand-built tests: Tidal-first, as the default switch does. */
     internal constructor(repository: EclipseAddonRepository) :
-        this(repository, EclipseAddonResolveCache(), { false }, null, null, null)
+        this(repository, EclipseAddonResolveCache(), { false }, null, null, null, null)
 
     suspend fun resolve(track: TrackEntity, speculative: Boolean = false): StreamUrl? {
         val query = "${track.artist} ${track.title}".trim()
@@ -91,7 +100,16 @@ class EclipseAddonStreamResolver private constructor(
                 // Only when the manifest advertised it: a resolve-only addon has no search.
                 if (addon.supportsSearch) {
                     val candidates = repository.search(addon, query, SEARCH_LIMIT)
-                    val match = EclipseAddonMatcher.best(track, candidates) ?: continue
+                    val match = EclipseAddonMatcher.best(track, candidates)
+                    if (match == null && candidates.isNotEmpty()) {
+                        Log.d(
+                            TAG,
+                            "addon '${addon.name}' rejected ${candidates.size} search hit(s) for " +
+                                "'${track.title}' / '${track.artist}' / ${track.durationMs} ms",
+                        )
+                        continue
+                    }
+                    if (match == null) continue
                     val url = mapStream(streamWithRetry(addon, match.id)) ?: continue
                     return served(addon, track, url, startedNs)
                 }
@@ -115,12 +133,21 @@ class EclipseAddonStreamResolver private constructor(
         track: TrackEntity,
         startedNs: Long,
         speculative: Boolean,
-    ): StreamUrl? =
-        if (cloudFastestSource()) {
-            fastestCloudResolve(addon, track, startedNs, speculative)
-        } else {
-            tidalFirstCloudResolve(addon, track, startedNs, speculative)
+    ): StreamUrl? = coroutineScope {
+        // Start the ISRC lookup immediately, but only Apple waits on it.
+        val isrcLookup = async {
+            track.isrc?.trim()?.takeIf { it.isNotEmpty() }
+                ?: withTimeoutOrNull(ISRC_LOOKUP_TIMEOUT_MS) { isrcEnricher?.isrcFor(track) }
         }
+        val isrcProvider: suspend () -> String? = {
+            try { isrcLookup.await() } catch (e: CancellationException) { throw e } catch (e: Exception) { null }
+        }
+        if (cloudFastestSource()) {
+            fastestCloudResolve(addon, track, startedNs, speculative, isrcProvider)
+        } else {
+            tidalFirstCloudResolve(addon, track, startedNs, speculative, isrcProvider)
+        }
+    }
 
     /** Tidal-first (the switch off): today's behaviour, Apple only after a Tidal miss. */
     private suspend fun tidalFirstCloudResolve(
@@ -128,12 +155,18 @@ class EclipseAddonStreamResolver private constructor(
         track: TrackEntity,
         startedNs: Long,
         speculative: Boolean,
+        isrcProvider: suspend () -> String?,
     ): StreamUrl? = coroutineScope {
         val tidalKey = resolveCacheKey(addon, track)
         val appleKey = appleCacheKey(addon, track)
 
         val appleSearch = async { appleHits(addon, track, appleKey, speculative) }
-        val tidalLookup = async { cachedResolveId(addon, track, tidalKey, CLOUD_TIDAL_MISS_TTL_MS) }
+        val tidalLookup = async {
+            cachedResolveId(
+                addon, track, tidalKey, CLOUD_TIDAL_MISS_TTL_MS,
+                bypassNegative = !speculative,
+            )
+        }
 
         val tidalId = try {
             tidalLookup.await()
@@ -160,7 +193,7 @@ class EclipseAddonStreamResolver private constructor(
         } catch (e: Exception) {
             null
         }
-        appleStreamFromHits(addon, track, hits, startedNs)
+        appleStreamFromHits(addon, track, hits, startedNs, isrcProvider)
     }
 
     /**
@@ -175,12 +208,13 @@ class EclipseAddonStreamResolver private constructor(
         track: TrackEntity,
         startedNs: Long,
         speculative: Boolean,
+        isrcProvider: suspend () -> String?,
     ): StreamUrl? = coroutineScope {
         val tidalKey = resolveCacheKey(addon, track)
         val appleKey = appleCacheKey(addon, track)
 
-        val tidal = async { tidalRace(addon, track, tidalKey, startedNs) }
-        val apple = async { appleRace(addon, track, appleKey, startedNs, speculative) }
+        val tidal = async { tidalRace(addon, track, tidalKey, startedNs, speculative) }
+        val apple = async { appleRace(addon, track, appleKey, startedNs, speculative, isrcProvider) }
 
         val first = kotlinx.coroutines.selects.select<Pair<kotlinx.coroutines.Deferred<CloudRace?>, CloudRace?>> {
             tidal.onAwait { tidal to it }
@@ -220,10 +254,16 @@ class EclipseAddonStreamResolver private constructor(
         track: TrackEntity,
         tidalKey: String,
         startedNs: Long,
+        speculative: Boolean,
     ): CloudRace? =
         try {
-            val cached = resolveCache.get(tidalKey)?.itemId
-            val itemId = cached ?: resolveId(addon, track)
+            val entry = resolveCache.get(tidalKey)
+            val itemId = when {
+                entry?.itemId != null -> entry.itemId
+                // A speculative lookup may use a cached miss; a user play re-checks it.
+                entry != null && speculative -> null
+                else -> resolveId(addon, track)
+            }
             if (itemId == null) {
                 resolveCache.putMiss(tidalKey, CLOUD_TIDAL_MISS_TTL_MS)
                 null
@@ -253,6 +293,7 @@ class EclipseAddonStreamResolver private constructor(
         appleKey: String,
         startedNs: Long,
         speculative: Boolean,
+        isrcProvider: suspend () -> String?,
     ): CloudRace? =
         try {
             val hits = appleHits(addon, track, appleKey, speculative) ?: return null
@@ -261,7 +302,7 @@ class EclipseAddonStreamResolver private constructor(
             if (strongId == null) {
                 Log.d(TAG, "apple fast-path rejected ${hits.size} hit(s); falling back to best() -> $appleId")
             }
-            val url = mapStream(streamAppleWithRetry(addon, appleId, track.isrc))
+            val url = mapStream(streamAppleWithRetry(addon, appleId, isrcProvider))
                 ?.let { served(addon, track, it, startedNs) }
                 ?: return null
             CloudRace(url) { rememberAppleId(addon, track, appleId) }
@@ -322,9 +363,15 @@ class EclipseAddonStreamResolver private constructor(
         track: TrackEntity,
         key: String,
         missTtlMs: Long? = null,
+        bypassNegative: Boolean = false,
     ): String? {
         val cached = resolveCache.get(key)
-        if (cached != null) return cached.itemId
+        if (cached != null) {
+            val id = cached.itemId
+            if (id != null || !bypassNegative) return id
+            // A user play re-checks a cached Tidal miss; only a new miss is recorded.
+            resolveCache.invalidate(key)
+        }
         val id = resolveId(addon, track)
         if (id == null && missTtlMs != null) {
             resolveCache.putMiss(key, missTtlMs)
@@ -337,7 +384,7 @@ class EclipseAddonStreamResolver private constructor(
     /** A stream answer saying "that id is no longer usable": re-resolve once. */
     private fun invalidatesResolve(e: Exception): Boolean =
         e is EclipseAddonException.Preparing ||
-            (e is EclipseAddonException.HttpFailure && (e.code == 403 || e.code == 404))
+            (e is EclipseAddonException.HttpFailure && e.code in setOf(403, 404, 410))
 
     /**
      * Cloud's Apple Music fallback: Tidal had no item (or its id died), so search
@@ -431,6 +478,7 @@ class EclipseAddonStreamResolver private constructor(
         track: TrackEntity,
         hits: List<EclipseAppleTrack>?,
         startedNs: Long,
+        isrcProvider: suspend () -> String?,
     ): StreamUrl? {
         if (hits == null) return null
         val appleId = matchAppleId(track, hits)
@@ -439,7 +487,7 @@ class EclipseAddonStreamResolver private constructor(
             return null
         }
         return try {
-            mapStream(streamAppleWithRetry(addon, appleId, track.isrc))
+            mapStream(streamAppleWithRetry(addon, appleId, isrcProvider))
                 ?.let { served(addon, track, it, startedNs) }
                 ?.also { rememberAppleId(addon, track, appleId) }
         } catch (e: CancellationException) {
@@ -453,9 +501,10 @@ class EclipseAddonStreamResolver private constructor(
 
     /** Normalised title + artist + ~15 s duration, through the same matcher as search hits. */
     private fun matchAppleId(track: TrackEntity, hits: List<EclipseAppleTrack>): String? {
-        if (hits.isEmpty()) return null
-        val byId = hits.associateBy { it.trackId.toString() }
-        val candidates = hits.map { hit ->
+        val alive = hits.filterNot { it.trackId.toString() in deadAppleIds }
+        if (alive.isEmpty()) return null
+        val byId = alive.associateBy { it.trackId.toString() }
+        val candidates = alive.map { hit ->
             EclipseAddonTrack(
                 id = hit.trackId.toString(),
                 title = hit.trackName,
@@ -487,7 +536,8 @@ class EclipseAddonStreamResolver private constructor(
      * strong artist, and both durations known within 10 s.
      */
     internal fun strongAppleId(track: TrackEntity, hits: List<EclipseAppleTrack>): String? {
-        val strong = hits.filter { isStrongAppleHit(track, it) }
+        val strong = hits.filterNot { it.trackId.toString() in deadAppleIds }
+            .filter { isStrongAppleHit(track, it) }
         if (strong.size != 1) return null
         val id = strong[0].trackId.toString()
         return id.takeIf { it == matchAppleId(track, hits) }
@@ -530,14 +580,67 @@ class EclipseAddonStreamResolver private constructor(
     private suspend fun streamAppleWithRetry(
         addon: EclipseAddon,
         appleTrackId: String,
-        isrc: String?,
-    ): EclipseAddonStream =
-        try {
-            repository.streamApple(addon, appleTrackId, isrc)
-        } catch (e: EclipseAddonException.Preparing) {
-            waitPreparing(addon, e)
-            repository.streamApple(addon, appleTrackId, isrc)
+        isrcProvider: suspend () -> String?,
+    ): EclipseAddonStream {
+        var isrc = try { isrcProvider() } catch (e: CancellationException) { throw e } catch (e: Exception) { null }
+        val tiers = listOf(addon.appleQuality, "HI_RES", "LOSSLESS", "HI_RES_LOSSLESS").distinct()
+        var last: Exception? = null
+        for (tier in tiers) {
+            try {
+                return if (tier == addon.appleQuality) {
+                    repository.streamApple(addon, appleTrackId, isrc)
+                } else {
+                    repository.streamAppleAtTier(addon, appleTrackId, isrc, tier)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: EclipseAddonException.Preparing) {
+                try {
+                    waitPreparing(addon, e)
+                    return if (tier == addon.appleQuality) {
+                    repository.streamApple(addon, appleTrackId, isrc)
+                } else {
+                    repository.streamAppleAtTier(addon, appleTrackId, isrc, tier)
+                }
+                } catch (retry: CancellationException) {
+                    throw retry
+                } catch (retry: Exception) {
+                    last = retry
+                }
+            } catch (e: EclipseAddonException.HttpFailure) {
+                if (e.code !in setOf(403, 404)) throw e
+                Log.d(
+                    TAG,
+                    "apple stream $appleTrackId tier=$tier HTTP ${e.code} isrc=${if (isrc == null) "none" else "yes"}",
+                )
+                last = e
+            }
         }
+        if (isrc == null) {
+            // The 404 may be "ISRC required": enrich once and retry the tiers.
+            val enriched = try { isrcProvider() } catch (e: CancellationException) { throw e } catch (e: Exception) { null }
+            if (!enriched.isNullOrBlank()) {
+                Log.d(TAG, "apple stream $appleTrackId retrying with an ISRC")
+                isrc = enriched
+                for (tier in tiers) {
+                    try {
+                        return if (tier == addon.appleQuality) {
+                            repository.streamApple(addon, appleTrackId, isrc)
+                        } else {
+                            repository.streamAppleAtTier(addon, appleTrackId, isrc, tier)
+                        }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        if (e !is EclipseAddonException.HttpFailure || e.code !in setOf(403, 404)) throw e
+                        last = e
+                    }
+                }
+            }
+        }
+        deadAppleIds += appleTrackId
+        throw last ?: EclipseAddonException.HttpFailure(404)
+    }
 
     /**
      * Per-addon, per-track identity: ISRC when the track has one, else the
@@ -711,6 +814,8 @@ class EclipseAddonStreamResolver private constructor(
                         if (repository.addonGeneration.value != generation) return@withPermit
                         try {
                             if (cachedAppleId(addon, track, appleCacheKey(addon, track)) != null) continue
+                            // Warm the ISRC alongside the Apple id: the next play must not look it up.
+                            runCatching { isrcEnricher?.isrcFor(track) }
                             val hits = repository.searchApple(addon, track.title, track.artist)
                             rememberAppleId(addon, track, matchAppleId(track, hits))
                         } catch (e: CancellationException) {
@@ -759,8 +864,11 @@ class EclipseAddonStreamResolver private constructor(
             appleLookup: EclipseAppleLookupStore? = null,
             urlCache: StreamUrlCache? = null,
             streamUrlStore: EclipseStreamUrlStore? = null,
+            isrcEnricher: EclipseIsrcEnricher? = null,
         ): EclipseAddonStreamResolver =
-            EclipseAddonStreamResolver(repository, cache, cloudFastestSource, appleLookup, urlCache, streamUrlStore)
+            EclipseAddonStreamResolver(
+                repository, cache, cloudFastestSource, appleLookup, urlCache, streamUrlStore, isrcEnricher,
+            )
 
         private const val TAG = "EclipseAddonStreamResolver"
         private const val SEARCH_LIMIT = 25
@@ -774,6 +882,9 @@ class EclipseAddonStreamResolver private constructor(
 
         /** Fast mode's stricter duration tolerance: 10 s, not the matcher's 15 s. */
         private const val STRONG_DURATION_TOLERANCE_MS = 10_000L
+
+        /** A per-play ISRC lookup never holds the Apple stream for more than a second. */
+        private const val ISRC_LOOKUP_TIMEOUT_MS = 1_000L
 
         /** Credit connectors ignored when comparing artist names. */
         private val ARTIST_CONNECTORS = setOf("and", "feat", "ft", "with", "the")

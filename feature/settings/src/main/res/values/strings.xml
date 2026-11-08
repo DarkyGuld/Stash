@@ -484,6 +484,11 @@
     <string name="settings_addons_empty">No addons yet. Paste an addon manifest URL above.</string>
     <string name="settings_addons_first_title">Play Eclipse addons first</string>
     <string name="settings_addons_first_desc">Tries your Eclipse addons before Qobuz/Tidal, so Cloud starts without the extra misses. Falls back to the normal chain if an addon can\'t serve the track.</string>
+    <string name="settings_stream_cache_title">Stream cache</string>
+    <string name="settings_stream_cache_size">Cached: %1$s</string>
+    <string name="settings_stream_cache_clear">Clear cache</string>
+    <string name="settings_prefetch_whole_files_title">Prefetch whole files</string>
+    <string name="settings_prefetch_whole_files_desc">On Wi-Fi, download the next track\'s whole file into the cache instead of the first 2 MB. Off by default: it uses storage and can compete with playback.</string>
     <string name="settings_cloud_fastest_title">Cloud: fastest source</string>
     <string name="settings_cloud_fastest_desc">Start the Apple stream as soon as iTunes returns an exact match, in parallel with Tidal. Off: Tidal is always tried first.</string>
     <string name="settings_addon_url_label">Addon URL</string>

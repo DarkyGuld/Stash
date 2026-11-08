@@ -209,10 +209,19 @@ class EclipseAddonRepository @Inject constructor(
         appleTrackId: String,
         isrc: String?,
     ): EclipseAddonStream =
+        streamAppleAtTier(addon, appleTrackId, isrc, addon.appleQuality)
+
+    /** One request at an explicit Apple tier (the resolver's 404 fallback walks them). */
+    suspend fun streamAppleAtTier(
+        addon: EclipseAddon,
+        appleTrackId: String,
+        isrc: String?,
+        quality: String,
+    ): EclipseAddonStream =
         client.streamApple(
             manifestUrl = addon.manifestUrl,
             appleTrackId = appleTrackId,
-            appleQuality = addon.appleQuality,
+            appleQuality = quality,
             isrc = isrc,
             addonId = addon.id,
         )

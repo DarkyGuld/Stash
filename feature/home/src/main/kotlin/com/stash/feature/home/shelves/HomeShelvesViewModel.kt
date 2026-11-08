@@ -62,6 +62,9 @@ class HomeShelvesViewModel @Inject constructor(
     streamingPreference: StreamingPreference,
     homeSectionsPreference: HomeSectionsPreference,
     private val connectivity: ConnectivityMonitor,
+    /** List warmup; null in hand-built tests. */
+    private val rowsWarmer: com.stash.core.media.streaming.VisibleRowsWarmer? = null,
+    private val trackDao: com.stash.core.data.db.dao.TrackDao? = null,
 ) : ViewModel() {
 
     private val newFromArtists = Shelf(HomeSection.NEW_FROM_ARTISTS, newFromArtistsRepository::cached, newFromArtistsRepository::shelf)
@@ -90,6 +93,29 @@ class HomeShelvesViewModel @Inject constructor(
             },
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), HomeShelvesState())
+
+    /**
+     * "Because you like" rows are the only Home shelf with concrete songs: warm
+     * the top three that already have DB rows (debounced), through the shared
+     * list warmer. Cancel/replace comes from the warmer itself.
+     */
+    private val rowsWarmJob = viewModelScope.launch {
+        state.collect { shelves ->
+            val dao = trackDao ?: return@collect
+            val videoIds = shelves.becauseYouLike.asSequence()
+                .flatMap { it.songs.asSequence() }
+                .map { it.videoId }
+                .distinct()
+                .take(3)
+                .toList()
+            val ids = mutableListOf<Long>()
+            for (videoId in videoIds) {
+                runCatching { dao.findByYoutubeId(videoId)?.id }.getOrNull()
+                    ?.takeIf { it > 0 }?.let { ids += it }
+            }
+            rowsWarmer?.onVisibleRowsChanged(viewModelScope, ids)
+        }
+    }
 
     init {
         viewModelScope.launch {

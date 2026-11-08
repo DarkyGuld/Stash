@@ -643,7 +643,8 @@ class EclipseAddonStreamResolverTest {
         val cloudResolver = slowResolver(cloudRepo, cloudCache)
         cloudResolver.resolve(mario)
         now += 60 * 60_000L
-        cloudResolver.resolve(mario)
+        // A speculative lookup may use the cached miss; a foreground play re-checks it.
+        cloudResolver.resolve(mario, speculative = true)
         // Variant retries are part of the first play; the cached negative skips the full query.
         coVerify(exactly = 1) {
             cloudRepo.resolve(cloud, "Mario", "David Guetta & Jast", any(), any())
@@ -659,7 +660,7 @@ class EclipseAddonStreamResolverTest {
         val normalResolver = slowResolver(normalRepo, normalCache)
         normalResolver.resolve(mario)
         normalNow += 10 * 60_000L
-        normalResolver.resolve(mario)
+        normalResolver.resolve(mario, speculative = true)
         coVerify(exactly = 2) {
             normalRepo.resolve(nebula, "Mario", "David Guetta & Jast", any(), any())
         }
@@ -718,6 +719,8 @@ class EclipseAddonStreamResolverTest {
         coEvery { repository.enabledNow() } returns listOf(cloud)
         coEvery { repository.resolve(any(), any(), any(), any(), any()) } returns null
         coEvery { repository.streamApple(any(), any(), any()) } throws EclipseAddonException.HttpFailure(404)
+        coEvery { repository.streamAppleAtTier(any(), any(), any(), any()) } throws
+            EclipseAddonException.HttpFailure(404)
         coEvery { repository.searchApple(any(), any(), any()) } returns emptyList()
 
         var disk: com.stash.core.data.addons.AppleLookup? =
@@ -1029,6 +1032,84 @@ class EclipseAddonStreamResolverTest {
 
         assertThat(resolver.isStrongAppleHit(dancin, hit)).isTrue()
         assertThat(resolver.strongAppleId(dancin, listOf(hit))).isEqualTo("1890207695")
+    }
+
+    @Test
+    fun `an Apple 404 at the top tier falls back to a lower tier`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        coEvery { repository.resolve(any(), any(), any(), any(), any()) } returns null
+        coEvery { repository.searchApple(any(), any(), any()) } returns listOf(appleHit)
+        coEvery { repository.streamApple(any(), "6812560833", any()) } throws
+            EclipseAddonException.HttpFailure(404)
+        coEvery { repository.streamAppleAtTier(any(), "6812560833", any(), "HI_RES") } returns stream(format = "hls")
+
+        val result = cachedResolver(repository).resolve(track())
+
+        assertThat(result).isNotNull()
+        coVerify(exactly = 1) { repository.streamAppleAtTier(any(), "6812560833", any(), "HI_RES") }
+    }
+
+    @Test
+    fun `an Apple id that 404s at every tier is never requested again this session`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        coEvery { repository.resolve(any(), any(), any(), any(), any()) } returns null
+        coEvery { repository.searchApple(any(), any(), any()) } returns listOf(appleHit)
+        coEvery { repository.streamApple(any(), "6812560833", any()) } throws
+            EclipseAddonException.HttpFailure(404)
+        coEvery { repository.streamAppleAtTier(any(), any(), any(), any()) } throws
+            EclipseAddonException.HttpFailure(404)
+        val resolver = cachedResolver(repository)
+
+        assertThat(resolver.resolve(track())).isNull()
+        assertThat(resolver.resolve(track())).isNull()
+
+        // Four tiers on the first play (one primary + three fallbacks); the dead id is filtered on the second.
+        coVerify(exactly = 1) { repository.streamApple(any(), "6812560833", any()) }
+        coVerify(exactly = 3) { repository.streamAppleAtTier(any(), "6812560833", any(), any()) }
+    }
+
+    @Test
+    fun `a foreground Cloud play bypasses a cached Tidal miss, speculative does not`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        coEvery { repository.resolve(any(), any(), any(), any(), any()) } returns null
+        val resolver = cachedResolver(repository)
+
+        resolver.resolve(mario) // records the miss
+        resolver.resolve(mario, speculative = true) // uses it
+        coVerify(exactly = 2) { repository.resolve(any(), any(), any(), any(), any()) }
+        // Full query + one cleaned variant on the first play only.
+    }
+
+    @Test
+    fun `an Apple 404 without an ISRC retries once with the enriched ISRC`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        coEvery { repository.resolve(any(), any(), any(), any(), any()) } returns null
+        coEvery { repository.searchApple(any(), any(), any()) } returns listOf(appleHit)
+        coEvery { repository.streamApple(any(), "6812560833", isNull()) } throws
+            EclipseAddonException.HttpFailure(404)
+        coEvery { repository.streamApple(any(), "6812560833", "FAKEISRC") } returns stream(format = "hls")
+        coEvery { repository.streamAppleAtTier(any(), any(), any(), any()) } throws
+            EclipseAddonException.HttpFailure(404)
+        val enricher: com.stash.core.data.addons.EclipseIsrcEnricher = mockk {
+            coEvery { isrcFor(any()) } returns "FAKEISRC"
+        }
+        val resolver = EclipseAddonStreamResolver.forTest(
+            repository,
+            EclipseAddonResolveCache(),
+            cloudFastestSource = { false },
+            isrcEnricher = enricher,
+        )
+
+        assertThat(resolver.resolve(track())).isNotNull()
+        coVerify(exactly = 1) { repository.streamApple(any(), "6812560833", "FAKEISRC") }
     }
 
     private fun track() = TrackEntity(title = "Blinding Lights", artist = "The Weeknd", durationMs = 200_000)

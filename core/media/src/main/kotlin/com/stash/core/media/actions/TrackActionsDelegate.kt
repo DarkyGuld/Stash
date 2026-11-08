@@ -231,7 +231,7 @@ class TrackActionsDelegate @Inject constructor(
                         is com.stash.core.media.StreamRoutingResult.Item -> Unit
                         com.stash.core.media.StreamRoutingResult.Deduped -> Unit
                         com.stash.core.media.StreamRoutingResult.NotAvailable ->
-                            _userMessages.emit("Couldn't find this track.")
+                            _userMessages.emit("Not available in your lossless sources.")
                         com.stash.core.media.StreamRoutingResult.CellularRefused ->
                             _userMessages.emit("Streaming on cellular is off in Settings.")
                         com.stash.core.media.StreamRoutingResult.NoConnectivity ->

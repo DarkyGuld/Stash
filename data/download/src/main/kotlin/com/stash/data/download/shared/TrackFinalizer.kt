@@ -58,7 +58,15 @@ class TrackFinalizer @Inject constructor(
         format: AudioFormat,
         embedMetadata: Boolean = true,
     ): FinalizeResult = try {
-        if (embedMetadata) {
+        // ffmpeg cannot tag the fragmented-MP4/FLAC that HLS serves as `.m4a`
+        // (exit 234). The file is valid and plays; keep DB metadata/art and skip
+        // the tag pass instead of logging a failure on every HLS download.
+        val fmp4Flac = format.codec.equals("flac", ignoreCase = true) &&
+            format.fileExtension.lowercase() in setOf("m4a", "mp4")
+        if (embedMetadata && fmp4Flac) {
+            Log.d(TAG, "skipping ffmpeg tag embed for fMP4/FLAC (.${format.fileExtension}); DB metadata/art kept")
+        }
+        if (embedMetadata && !fmp4Flac) {
             val art = runCatching { albumArtCache.resolveArt(track) }
                 .onFailure { e ->
                     if (e is CancellationException) throw e

@@ -35,6 +35,7 @@ import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.add
 import com.stash.core.model.SyncResult
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -94,6 +95,9 @@ class SpotifyApiClient @Inject constructor(
          * listener plays (one of the response's `availableSortOrders`, captured 2026-11-02).
          */
         const val SAVED_ALBUMS_ORDER = "Recently Added"
+
+        /** Spotify's own cap for `/v1/tracks?ids=`. */
+        const val MAX_ISRC_BATCH = 50
 
         /** Songs per `getAlbum` page: the web player's own size. */
         private const val ALBUM_TRACK_PAGE = 50
@@ -377,6 +381,42 @@ class SpotifyApiClient @Inject constructor(
      *
      * @return A [UserInfo] with the user's ID, or null if resolution fails.
      */
+    /** One batched ISRC answer (Spotify's `/v1/tracks?ids=` supports 50). */
+    sealed interface IsrcBatch {
+        data class Success(val isrcById: Map<String, String>) : IsrcBatch
+        data class RateLimited(val retryAfterSeconds: Long) : IsrcBatch
+        data object Failed : IsrcBatch
+    }
+
+    /**
+     * `external_ids.isrc` for up to 50 track ids in ONE request. 429 reports
+     * `Retry-After` (default 60 min) so callers stop rather than hammer.
+     */
+    suspend fun getTracksIsrc(trackIds: List<String>): IsrcBatch = withContext(Dispatchers.IO) {
+        val ids = trackIds.map { it.trim() }.filter { it.isNotEmpty() }.take(MAX_ISRC_BATCH)
+        if (ids.isEmpty()) return@withContext IsrcBatch.Success(emptyMap())
+        val token = tokenManager.getSpotifyAccessToken() ?: return@withContext IsrcBatch.Failed
+        val url = "https://api.spotify.com/v1/tracks".toHttpUrlOrNull()!!.newBuilder()
+            .addQueryParameter("ids", ids.joinToString(","))
+            .build()
+        val request = Request.Builder().url(url).header("Authorization", "Bearer $token").get().build()
+        runCatching {
+            okHttpClient.newCall(request).execute().use { response ->
+                if (response.code == 429) {
+                    val retry = response.header("Retry-After")?.toLongOrNull()
+                    return@use IsrcBatch.RateLimited(retry?.coerceAtLeast(60) ?: 3_600L)
+                }
+                if (!response.isSuccessful) return@use IsrcBatch.Failed
+                IsrcBatch.Success(parseIsrcBatch(response.body?.string().orEmpty()))
+            }
+        }.getOrElse { IsrcBatch.Failed }
+    }
+
+    /** One-id convenience on the batch route. Null without token/429/failure. */
+    suspend fun getTrackIsrc(trackId: String): String? =
+        (getTracksIsrc(listOf(trackId)) as? IsrcBatch.Success)?.isrcById?.get(trackId.trim())
+
+
     suspend fun getCurrentUserProfile(): UserInfo? = withContext(Dispatchers.IO) {
         val username = tokenManager.getSpotifyUsername()
         if (username != null) {
@@ -1955,4 +1995,22 @@ class SpotifyApiClient @Inject constructor(
         val unreadableCount: Int = 0,
     )
 
+}
+
+/** `/v1/tracks?ids=` body → id → external_ids.isrc (missing/null entries skipped). */
+internal fun parseIsrcBatch(body: String): Map<String, String> {
+    val root = runCatching {
+        Json { ignoreUnknownKeys = true }.parseToJsonElement(body) as? JsonObject
+    }.getOrNull() ?: return emptyMap()
+    val tracks = root["tracks"] as? JsonArray ?: return emptyMap()
+    return buildMap {
+        for (element in tracks) {
+            val obj = element as? JsonObject ?: continue
+            val id = (obj["id"] as? JsonPrimitive)?.contentOrNull ?: continue
+            val isrc = (obj["external_ids"] as? JsonObject)
+                ?.get("isrc")?.jsonPrimitive?.contentOrNull
+                ?.takeIf { it.isNotBlank() } ?: continue
+            put(id, isrc)
+        }
+    }
 }

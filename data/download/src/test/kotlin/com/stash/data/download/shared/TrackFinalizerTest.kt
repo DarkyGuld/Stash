@@ -67,6 +67,51 @@ class TrackFinalizerTest {
         art.delete()
     }
 
+    @Test fun `an fMP4 FLAC m4a skips the ffmpeg embed and still commits`() = runTest {
+        var embedderCalled = false
+        coEvery { metadataEmbedder.embedMetadata(any(), any(), any()) } answers {
+            embedderCalled = true
+            firstArg()
+        }
+        coEvery {
+            fileOrganizer.commitDownload(any(), any(), any(), any(), any(), any())
+        } returns FileOrganizer.CommittedTrack("/library/Artist/Song.m4a", 100)
+        coEvery { audioExtractor.extract(any()) } returns null
+
+        val result = subject.finalizeFile(
+            sourceFile = File.createTempFile("src", ".m4a"),
+            track = stubTrack(),
+            format = AudioFormat(
+                codec = "flac", bitrateKbps = 0, bitsPerSample = 24, sampleRateHz = 44_100,
+                fileExtension = "m4a",
+            ),
+        )
+
+        assertEquals(false, embedderCalled)
+        assertTrue(result is TrackFinalizer.FinalizeResult.Success)
+    }
+
+    @Test fun `a direct flac still embeds`() = runTest {
+        var embedderCalled = false
+        coEvery { albumArtCache.resolveArt(any()) } returns null
+        coEvery { metadataEmbedder.embedMetadata(any(), any(), any()) } answers {
+            embedderCalled = true
+            firstArg()
+        }
+        coEvery {
+            fileOrganizer.commitDownload(any(), any(), any(), any(), any(), any())
+        } returns FileOrganizer.CommittedTrack("/library/Artist/Song.flac", 100)
+        coEvery { audioExtractor.extract(any()) } returns null
+
+        subject.finalizeFile(
+            File.createTempFile("src", ".flac"),
+            stubTrack(),
+            AudioFormat("flac", 0, 44_100, 24, fileExtension = "flac"),
+        )
+
+        assertTrue(embedderCalled)
+    }
+
     @Test fun `finalizeFile proceeds when art resolve returns null`() = runTest {
         var passedArt: File? = SENTINEL
         var embedderCalled = false

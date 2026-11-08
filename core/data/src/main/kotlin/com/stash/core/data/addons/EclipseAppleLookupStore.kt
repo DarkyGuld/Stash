@@ -98,6 +98,11 @@ class EclipseAppleLookupStore internal constructor(
         }
     }
 
+    /** Drops every cached Apple lookup (sign-out, account change, Settings' clear). */
+    suspend fun clear() {
+        store.edit { prefs -> prefs.remove(key) }
+    }
+
     /**
      * One-time cleanup: a stored long-lived negative used to suppress the iTunes
      * search for a track the catalog had since gained. Positives are kept; every

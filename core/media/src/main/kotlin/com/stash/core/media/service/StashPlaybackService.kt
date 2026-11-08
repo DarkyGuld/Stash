@@ -94,6 +94,9 @@ class StashPlaybackService : MediaLibraryService() {
     /** The media-source pick needs to know, synchronously, whether an addon may answer HLS. */
     @Inject lateinit var eclipseAddonRepository: com.stash.core.data.addons.EclipseAddonRepository
 
+    /** Spotify ISRC backfill yields while audio plays (foreground priority). */
+    @Inject lateinit var spotifyIsrcGate: com.stash.core.data.addons.SpotifyIsrcGate
+
     /** Logcat-only tap → first-audio measurement (see [StashLatency]). */
     private val stashLatency = com.stash.core.media.service.StashLatency()
 
@@ -671,6 +674,7 @@ class StashPlaybackService : MediaLibraryService() {
         }
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
+            spotifyIsrcGate.playbackActive = isPlaying && !isCasting
             // During a transition the engine owns both players' play/pause state
             // (pauseAtEndOfMediaItems, the spare) — ignore the churn it makes.
             if (crossfadeEngine?.isTransitioning() == true) return
