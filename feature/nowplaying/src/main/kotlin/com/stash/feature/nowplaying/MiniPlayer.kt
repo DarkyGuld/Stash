@@ -396,7 +396,9 @@ fun MiniPlayer(
                     // which left no in-app way to stop a stream that was about to start).
                     val playPress = remember { MutableInteractionSource() }
                     val wantsToPlay = uiState.playWhenReady || uiState.isPlaying
-                    val loading = uiState.isBuffering && wantsToPlay
+                    val loading = com.stash.core.ui.components.rememberDelayedLoading(
+                        uiState.isBuffering && wantsToPlay,
+                    )
                     val playAction = if (wantsToPlay) "Pause" else "Play"
                     val playState = when {
                         loading -> "Loading"

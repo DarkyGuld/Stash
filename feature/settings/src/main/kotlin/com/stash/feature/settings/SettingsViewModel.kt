@@ -396,6 +396,21 @@ class SettingsViewModel @Inject constructor(
         viewModelScope.launch { streamingPreference.setPrefetchWholeFile(value) }
     }
 
+    /** Streaming cache cap in MB (250 / 500 / 1000 / 2000). */
+    val streamCacheSizeMb: StateFlow<Int> = streamingPreference.streamCacheSizeMb.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5_000),
+        initialValue = 500,
+    )
+
+    fun onStreamCacheSizeChanged(mb: Int) {
+        viewModelScope.launch {
+            streamingPreference.setStreamCacheSizeMb(mb)
+            streamCacheMaintenance.setMaxBytes(mb * com.stash.core.media.streaming.StreamCachePolicy.MB)
+            _streamCacheBytes.value = streamCacheMaintenance.sizeBytes()
+        }
+    }
+
     // ── Per-source switches in the streaming chain ─────────────────────────
     //
     // All on by default. The UI lane renders them as a row of switches; turning

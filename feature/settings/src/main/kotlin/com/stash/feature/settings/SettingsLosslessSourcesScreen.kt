@@ -115,6 +115,7 @@ fun SettingsLosslessSourcesScreen(
     val cloudFastestSource by viewModel.cloudFastestSource.collectAsStateWithLifecycle()
     val streamCacheBytes by viewModel.streamCacheBytes.collectAsStateWithLifecycle()
     val prefetchWholeFile by viewModel.prefetchWholeFile.collectAsStateWithLifecycle()
+    val streamCacheSizeMb by viewModel.streamCacheSizeMb.collectAsStateWithLifecycle()
     androidx.compose.runtime.LaunchedEffect(Unit) { viewModel.refreshStreamCacheSize() }
     val qobuzEnabled by viewModel.qobuzEnabled.collectAsStateWithLifecycle()
     val tidalEnabled by viewModel.tidalEnabled.collectAsStateWithLifecycle()
@@ -289,6 +290,7 @@ fun SettingsLosslessSourcesScreen(
                 addonsFirst = addonsFirst,
                 cloudFastestSource = cloudFastestSource,
                 streamCacheBytes = streamCacheBytes,
+                streamCacheSizeMb = streamCacheSizeMb,
                 prefetchWholeFile = prefetchWholeFile,
                 tokenPresent = eclipseTokenPresent,
                 tokenError = eclipseTokenError,
@@ -303,6 +305,7 @@ fun SettingsLosslessSourcesScreen(
                 onAddonsFirstChanged = viewModel::onAddonsFirstChanged,
                 onCloudFastestSourceChanged = viewModel::onCloudFastestSourceChanged,
                 onClearCache = viewModel::onClearStreamCache,
+                onCacheSizeChanged = viewModel::onStreamCacheSizeChanged,
                 onPrefetchWholeFileChanged = viewModel::onPrefetchWholeFileChanged,
                 onTokenCommitted = viewModel::onEclipseTokenCommitted,
                 onPasswordLogin = viewModel::onEclipsePasswordLogin,
@@ -686,6 +689,7 @@ private fun EclipseAddonsSection(
     addonsFirst: Boolean,
     cloudFastestSource: Boolean,
     streamCacheBytes: Long,
+    streamCacheSizeMb: Int,
     prefetchWholeFile: Boolean,
     tokenPresent: Boolean,
     tokenError: String?,
@@ -700,6 +704,7 @@ private fun EclipseAddonsSection(
     onAddonsFirstChanged: (Boolean) -> Unit,
     onCloudFastestSourceChanged: (Boolean) -> Unit,
     onClearCache: () -> Unit,
+    onCacheSizeChanged: (Int) -> Unit,
     onPrefetchWholeFileChanged: (Boolean) -> Unit,
     onTokenCommitted: (String) -> Unit,
     onPasswordLogin: (String, String) -> Unit,
@@ -804,6 +809,32 @@ private fun EclipseAddonsSection(
                 color = MaterialTheme.colorScheme.primary,
                 modifier = Modifier.clickable { onClearCache() }.padding(8.dp),
             )
+        }
+
+        // Cap selector: raising keeps entries, lowering trims the oldest files now.
+        Spacer(modifier = Modifier.height(6.dp))
+        Text(
+            text = stringResource(R.string.settings_stream_cache_size_label),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            listOf(250, 500, 1000, 2000).forEach { mb ->
+                val label = if (mb >= 1000) "${mb / 1000} GB" else "$mb MB"
+                Text(
+                    text = label,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = if (streamCacheSizeMb == mb) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier
+                        .clickable { onCacheSizeChanged(mb) }
+                        .padding(vertical = 6.dp, horizontal = 2.dp),
+                )
+            }
         }
 
         Spacer(modifier = Modifier.height(10.dp))

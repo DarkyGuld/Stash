@@ -1091,7 +1091,9 @@ fun NowPlayingScreen(
                         // The player's intent, not isPlaying (false while buffering): the button shows
                         // Pause, and pauses, while a stream stalls. A paused buffer shows Play, not a spinner.
                         isPlaying = uiState.playWhenReady || uiState.isPlaying,
-                        isBuffering = uiState.isBuffering && (uiState.playWhenReady || uiState.isPlaying),
+                        isBuffering = com.stash.core.ui.components.rememberDelayedLoading(
+                            uiState.isBuffering && (uiState.playWhenReady || uiState.isPlaying),
+                        ),
                         shuffleEnabled = uiState.shuffleEnabled,
                         repeatMode = uiState.repeatMode,
                         onPlayPauseClick = viewModel::onPlayPauseClick,

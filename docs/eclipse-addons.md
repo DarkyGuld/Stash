@@ -23,8 +23,10 @@ Stash can install Eclipse's account-bound `Cloud` addon and third-party addons
 
 - **Lossless sources**: addon URL, Eclipse login (Google/Discord/email or token
   paste), Cloud fastest source, play addons first.
-- **Stream cache**: current size, **Clear cache**, **Prefetch whole files**
-  (off by default; Wi-Fi only, 60 MB cap, can compete with playback).
+- **Stream cache**: current size, **Cache size** (250 MB / 500 MB / 1 GB /
+  2 GB, default 500 MB), **Clear cache**, **Prefetch whole files** (off by
+  default; Wi-Fi only, 60 MB cap, can compete with playback). The play-button
+  spinner is delayed by one second, so instant starts do not flash it.
 - Per-addon quality and other settings via the addon's gear.
 
 ## Caches and invalidation
@@ -34,8 +36,10 @@ Stash can install Eclipse's account-bound `Cloud` addon and third-party addons
   foreground play.
 - Resolved URL: kept until the signed URL's `exp`/`etsp`; a disabled or removed
   addon is never served from cache.
-- Stream cache: 500 MB LRU under `cacheDir/stream_cache`, holding progressive
-  bytes and HLS manifests/segments. 401/403/410 evicts the track's entries.
+- Stream cache: configurable 250 MB–2 GB LRU under `cacheDir/stream_cache`,
+  holding progressive bytes and HLS manifests/segments. 401/403/410 evicts the
+  track's entries. The queue next-track chunk is pinned so large writes cannot
+  evict it; hit/miss/eviction counters are logged.
 - Cleared on addon add/remove/toggle/settings change, sign-out, or **Clear
   cache**. Signed URLs and tokens are redacted from logs.
 

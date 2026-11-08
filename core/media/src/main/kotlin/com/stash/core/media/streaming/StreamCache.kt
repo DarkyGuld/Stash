@@ -2,7 +2,6 @@ package com.stash.core.media.streaming
 
 import android.content.Context
 import androidx.media3.database.StandaloneDatabaseProvider
-import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
 import androidx.media3.datasource.cache.SimpleCache
 import dagger.Module
 import dagger.Provides
@@ -41,19 +40,22 @@ annotation class StreamCache
 @Module
 @InstallIn(SingletonComponent::class)
 object StreamCacheModule {
-    private const val MAX_BYTES = 500L * 1024 * 1024  // 500 MB
     private const val CACHE_DIR = "stream_cache"
 
     @Provides
     @Singleton
     @StreamCache
-    fun provideStreamCache(@ApplicationContext context: Context): SimpleCache {
+    fun provideStreamCache(
+        @ApplicationContext context: Context,
+        policy: StreamCachePolicy,
+    ): SimpleCache {
         val dir = File(context.cacheDir, CACHE_DIR).also { it.mkdirs() }
         // Separate database provider per cache instance (Media3 requirement;
         // sharing across SimpleCache instances corrupts internal state).
+        // The policy is the evictor: an adjustable LRU cap without recreating the cache.
         return SimpleCache(
             dir,
-            LeastRecentlyUsedCacheEvictor(MAX_BYTES),
+            policy,
             StandaloneDatabaseProvider(context),
         )
     }

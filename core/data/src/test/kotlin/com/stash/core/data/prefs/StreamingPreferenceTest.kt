@@ -187,6 +187,17 @@ class StreamingPreferenceTest {
         assertTrue(prefs.isYoutubeEnabled())
     }
 
+    @Test fun streamCacheSize_defaultsTo500AndRoundTripsAllowedOptions() = runTest {
+        assertEquals(500, prefs.streamCacheSizeMb.first())
+        assertEquals(500, prefs.streamCacheSizeMbNow())
+        for (mb in listOf(250, 500, 1000, 2000)) {
+            prefs.setStreamCacheSizeMb(mb)
+            assertEquals(mb, prefs.streamCacheSizeMb.first())
+        }
+        prefs.setStreamCacheSizeMb(123)
+        assertEquals(500, prefs.streamCacheSizeMb.first())
+    }
+
     @Test fun cloudFastestSource_defaultsToTrueAndRoundTrips() = runTest {
         assertTrue(prefs.cloudFastestSource.first())
         assertTrue(prefs.isCloudFastestSource())

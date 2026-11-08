@@ -5,6 +5,7 @@ import androidx.datastore.core.DataStore
 import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.stringPreferencesKey
@@ -59,6 +60,7 @@ class StreamingPreference @Inject constructor(
     private val cloudFastestSourceKey = booleanPreferencesKey("eclipse_cloud_fastest_source")
     private val prefetchSearchResultsKey = booleanPreferencesKey("prefetch_search_results")
     private val prefetchWholeFileKey = booleanPreferencesKey("prefetch_whole_file")
+    private val streamCacheSizeMbKey = intPreferencesKey("stream_cache_size_mb")
     private val qobuzEnabledKey = booleanPreferencesKey("stream_source_qobuz")
     private val tidalEnabledKey = booleanPreferencesKey("stream_source_tidal")
     private val addonsEnabledKey = booleanPreferencesKey("stream_source_eclipse_addons")
@@ -154,6 +156,11 @@ class StreamingPreference @Inject constructor(
         prefs[prefetchWholeFileKey] ?: false
     }
 
+    /** Streaming cache cap in MB (250 / 500 / 1000 / 2000; unknown values read as 500). */
+    val streamCacheSizeMb: Flow<Int> = context.streamingDataStore.data.map { prefs ->
+        (prefs[streamCacheSizeMbKey] ?: 500).takeIf { it in listOf(250, 500, 1000, 2000) } ?: 500
+    }
+
     // Per-source switches in the streaming chain. All on by default: the chain
     // behaves exactly as before until the user turns one off (the UI's way to
     // force a source, e.g. only Cloud). No dev gate: these are user settings.
@@ -231,6 +238,8 @@ class StreamingPreference @Inject constructor(
 
     suspend fun isPrefetchWholeFile(): Boolean = prefetchWholeFile.first()
 
+    suspend fun streamCacheSizeMbNow(): Int = streamCacheSizeMb.first()
+
     suspend fun isQobuzEnabled(): Boolean = qobuzEnabled.first()
 
     suspend fun isTidalEnabled(): Boolean = tidalEnabled.first()
@@ -275,6 +284,10 @@ class StreamingPreference @Inject constructor(
 
     suspend fun setPrefetchWholeFile(value: Boolean) {
         context.streamingDataStore.edit { it[prefetchWholeFileKey] = value }
+    }
+
+    suspend fun setStreamCacheSizeMb(value: Int) {
+        context.streamingDataStore.edit { it[streamCacheSizeMbKey] = value }
     }
 
     suspend fun setQobuzEnabled(value: Boolean) {

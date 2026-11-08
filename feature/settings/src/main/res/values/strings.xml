@@ -487,6 +487,7 @@
     <string name="settings_stream_cache_title">Stream cache</string>
     <string name="settings_stream_cache_size">Cached: %1$s</string>
     <string name="settings_stream_cache_clear">Clear cache</string>
+    <string name="settings_stream_cache_size_label">Cache size (applies as the cache is used)</string>
     <string name="settings_prefetch_whole_files_title">Prefetch whole files</string>
     <string name="settings_prefetch_whole_files_desc">On Wi-Fi, download the next track\'s whole file into the cache instead of the first 2 MB. Off by default: it uses storage and can compete with playback.</string>
     <string name="settings_cloud_fastest_title">Cloud: fastest source</string>

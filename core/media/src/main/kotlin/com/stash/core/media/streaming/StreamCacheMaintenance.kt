@@ -1,5 +1,6 @@
 package com.stash.core.media.streaming
 
+import android.util.Log
 import androidx.annotation.OptIn
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.cache.SimpleCache
@@ -20,6 +21,7 @@ class StreamCacheMaintenance @Inject constructor(
     private val urlCache: StreamUrlCache,
     private val urlStore: EclipseStreamUrlStore,
     private val appleLookup: EclipseAppleLookupStore,
+    private val policy: StreamCachePolicy,
 ) {
     fun sizeBytes(): Long = streamCache.cacheSpace.coerceAtLeast(0)
 
@@ -27,6 +29,15 @@ class StreamCacheMaintenance @Inject constructor(
     fun clearStreamCache() {
         runCatching { streamCache.keys.toList().forEach(streamCache::removeResource) }
         urlCache.clear()
+    }
+
+    /** Adjusts the live cap: raising keeps entries, lowering trims the oldest unpinned files. */
+    fun setMaxBytes(bytes: Long) {
+        policy.setMaxBytes(bytes, streamCache)
+        Log.i(
+            "StreamCacheMaintenance",
+            "cache ${policy.counters()} after resize to ${bytes / StreamCachePolicy.MB} MB",
+        )
     }
 
     /** The full clear: stream cache + persistent addon URL/Apple lookups (sign-out, account change, button). */

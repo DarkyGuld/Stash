@@ -187,6 +187,14 @@ class SettingsViewModelTest {
         coVerify(exactly = 1) { streamCacheMaintenance.clearAll() }
     }
 
+    @Test fun `changing the cache size persists it and retunes the live evictor`() = runTest {
+        val vm = newVm()
+        vm.onStreamCacheSizeChanged(1000)
+        advanceUntilIdle()
+
+        coVerify { streamCacheMaintenance.setMaxBytes(1000L * 1024 * 1024) }
+    }
+
     @Test fun `signing out of Eclipse clears account-bound caches`() = runTest {
         val vm = newVm()
         vm.onEclipseSignOut()

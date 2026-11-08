@@ -75,6 +75,8 @@ class StreamingMediaSourceFactory @Inject constructor(
      * DNS/TCP/TLS connection instead of opening a fresh one each.
      */
     okHttpClient: okhttp3.OkHttpClient,
+    /** Cache hit/miss counters, shared with the evictor; null in hand-built tests. */
+    private val cachePolicy: StreamCachePolicy? = null,
 ) {
     /**
      * False in Download mode, read when each source opens ([DownloadModeGate]): the playback service sets it once. Every
@@ -155,6 +157,7 @@ class StreamingMediaSourceFactory @Inject constructor(
     ): MediaSource {
         val cacheKey = addonCacheKey(trackId, stream, stream.url)
         val hit = streamCache.isCached(cacheKey, 0, 1)
+        if (hit) cachePolicy?.recordHit() else cachePolicy?.recordMiss()
         Log.d(
             TAG,
             "addon progressive track=${trackId ?: 0} ${if (hit) "cache hit" else "cache miss"} key=$cacheKey",
@@ -183,9 +186,11 @@ class StreamingMediaSourceFactory @Inject constructor(
         val current = java.util.concurrent.atomic.AtomicReference(stream.url)
         val trackId = mediaItem.mediaId.toLongOrNull()
         val cacheKey = addonCacheKey(trackId, stream, stream.url)
+        val hlsHit = streamCache.isCached(cacheKey, 0, 1)
+        if (hlsHit) cachePolicy?.recordHit() else cachePolicy?.recordMiss()
         Log.d(
             TAG,
-            "addon hls track=${trackId ?: 0} ${if (streamCache.isCached(cacheKey, 0, 1)) "cache hit" else "cache miss"} key=$cacheKey",
+            "addon hls track=${trackId ?: 0} ${if (hlsHit) "cache hit" else "cache miss"} key=$cacheKey",
         )
         // Manifest and segments share the cache, keyed by their own paths (signed query ignored).
         val cachedHttp = CacheDataSource.Factory()

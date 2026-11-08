@@ -173,6 +173,10 @@ class StashApplication : Application(), Configuration.Provider {
     @Inject
     lateinit var eclipseAppleLookupStore: com.stash.core.data.addons.EclipseAppleLookupStore
 
+    /** Applies the persisted stream-cache cap to the live evictor at start. */
+    @Inject
+    lateinit var streamCacheMaintenance: com.stash.core.media.streaming.StreamCacheMaintenance
+
     @Inject
     lateinit var streamingQualityPreferences: com.stash.data.download.prefs.StreamingQualityPreferences
 
@@ -489,6 +493,13 @@ class StashApplication : Application(), Configuration.Provider {
         applicationScope.launch {
             runCatching { eclipseAddonPreferences.migrateCloudAppleQualityOnce() }
                 .onFailure { Log.w("StashStartup", "cloud apple-quality migration failed", it) }
+        }
+        // The live cache starts at the persisted cap (raising keeps entries; lowering trims now).
+        applicationScope.launch {
+            runCatching {
+                val mb = streamingPreference.streamCacheSizeMbNow()
+                streamCacheMaintenance.setMaxBytes(mb * com.stash.core.media.streaming.StreamCachePolicy.MB)
+            }.onFailure { Log.w("StashStartup", "stream cache size apply failed", it) }
         }
         // Spotify-backed rows from older imports may lack their ISRC; fill it in the
         // background (unmetered, rate-limited) so Cloud's Apple route has it at play time.

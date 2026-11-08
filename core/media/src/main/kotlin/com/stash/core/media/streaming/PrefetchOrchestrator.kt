@@ -65,6 +65,8 @@ class PrefetchOrchestrator @Inject constructor(
     private val eclipseStreamResolver: EclipseAddonStreamResolver? = null,
     /** Read for the whole-file preference; null in hand-built tests (off, as default). */
     private val streamingPreference: com.stash.core.data.prefs.StreamingPreference? = null,
+    /** Pins the next-track chunk so the LRU cannot evict it (null in hand-built tests). */
+    private val cachePolicy: StreamCachePolicy? = null,
 ) {
     /**
      * Track ids for which a prefetch resolve has been attempted in the
@@ -110,6 +112,8 @@ class PrefetchOrchestrator @Inject constructor(
                 // same cache the player reads — whole file (60 MB cap) on unmetered,
                 // first ~2 MB on mobile data. HLS/DASH skip this.
                 if (resolved.origin?.startsWith("${EclipseAddonStreamResolver.ORIGIN}") == true) {
+                    // Pin the upcoming chunk until it starts (queue change unpins it).
+                    runCatching { cachePolicy?.pin(addonCacheKey(id, resolved, resolved.url)) }
                     // The next track always gets its first chunk. The whole file only
                     // with the explicit preference on (and unmetered).
                     val unmetered = qualityPolicy?.isMeteredNetwork() == false
@@ -266,6 +270,8 @@ class PrefetchOrchestrator @Inject constructor(
     fun resetSession() {
         attempted.clear()
         urlPrefetchJob?.cancel()
+        // The pinned chunk was for the queue position we are leaving.
+        runCatching { cachePolicy?.unpinAll() }
     }
 
     private companion object {
