@@ -3,15 +3,27 @@
 ## This release
 
 - Package: `com.stash.app`
-- Version: `0.9.130` (versionCode 160)
+- Version: `0.9.131` (versionCode 161)
 - Signing key: `stash-release` (not the debug key)
 - In-app updater: `https://github.com/DarkyGuld/Stash/releases/latest`
 - APK: `app/build/outputs/apk/release/app-release.apk`
-- Release page: `https://github.com/DarkyGuld/Stash/releases/tag/v0.9.130`
+- Release page: `https://github.com/DarkyGuld/Stash/releases/tag/v0.9.131`
 
 The official Stash APK and the old `com.stash.app.debug` build use different
 signing keys. Uninstall them before installing this release; app data is not
 migrated. After installing, sign in to Spotify and add the Eclipse addon again.
+The `0.9.130` release can be updated in place to `0.9.131`; the signing key and
+app data are unchanged.
+
+## SoundCloud sign-in
+
+SoundCloud's Google/Apple/Facebook sign-in opens a popup and hands the result
+back to the opener with `window.opener`. The login WebView therefore enables
+`setSupportMultipleWindows(true)` and implements
+`WebChromeClient.onCreateWindow()`; without a real popup WebView the provider
+consent page stays on "check your phone" and never finishes. The login WebView
+also handles `onRenderProcessGone()` (close and retry instead of a white
+screen). As a fallback the SoundCloud dialog accepts a pasted OAuth token.
 
 ## Signing (keep this safe)
 
