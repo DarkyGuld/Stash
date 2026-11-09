@@ -45,13 +45,46 @@ class StreamingMediaSourceFactoryTest {
         assertThat(source.mediaItem.localConfiguration!!.mimeType).isEqualTo(androidx.media3.common.MimeTypes.APPLICATION_M3U8)
     }
 
-    private fun newFactory(): StreamingMediaSourceFactory = StreamingMediaSourceFactory(
+    private fun newFactory(
+        policy: StreamCachePolicy? = null,
+    ): StreamingMediaSourceFactory = StreamingMediaSourceFactory(
         streamCache = streamCache,
         resolver = resolver,
         urlCache = urlCache,
         trackDao = trackDao,
         okHttpClient = okhttp3.OkHttpClient(),
+        cachePolicy = policy,
     )
+
+    @Test
+    fun `creating an HLS source pins the track prefix before playback starts`() {
+        val policy = StreamCachePolicy()
+        val item = androidx.media3.common.MediaItem.Builder().setMediaId("42")
+            .setUri("stash-resolve://track/42?sc=1").build()
+        val stream = StreamUrl("https://cf-media.sndcdn.com/playlist", Long.MAX_VALUE,
+            origin = "soundcloud", isHls = true)
+
+        newFactory(policy).createHlsMediaSource(item, stream)
+
+        assertThat(policy.isProtected("eclipse|42|soundcloud||https://cf-media.sndcdn.com/segment-1.ts")).isTrue()
+    }
+
+    @Test
+    fun `creating a progressive addon source pins the track prefix`() {
+        val policy = StreamCachePolicy()
+        val item = androidx.media3.common.MediaItem.Builder().setMediaId("7")
+            .setUri("https://cdn.test/file.flac").build()
+        val stream = StreamUrl(
+            url = "https://cdn.test/file.flac",
+            expiresAtMs = Long.MAX_VALUE,
+            codec = "flac",
+            origin = "addon:Cloud",
+        )
+
+        newFactory(policy).createAddonProgressive(item, stream, trackId = 7L)
+
+        assertThat(policy.isProtected("eclipse|7|addon:Cloud|flac|/file.flac")).isTrue()
+    }
 
     @Test
     fun create_returnsNonNullMediaSourceFactory() {

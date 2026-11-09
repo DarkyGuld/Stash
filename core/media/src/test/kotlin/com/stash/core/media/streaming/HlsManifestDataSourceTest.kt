@@ -29,9 +29,12 @@ class HlsManifestDataSourceTest {
             if (opens.size == 1) throw forbidden(spec)
             10L
         }
-        val source = HlsManifestDataSource(inner, original, AtomicReference(original), { true }, { fresh }, {})
+        var invalidatedManifest: Boolean? = null
+        val source = HlsManifestDataSource(inner, original, AtomicReference(original), { true }, { fresh },
+            { _, manifest -> invalidatedManifest = manifest })
         assertEquals(10L, source.open(DataSpec(Uri.parse(original))))
         assertEquals(listOf(original, fresh), opens)
+        assertEquals(true, invalidatedManifest)
     }
 
     @Test fun `the refreshed manifest URI can itself be refreshed`() {
@@ -43,29 +46,33 @@ class HlsManifestDataSourceTest {
             10L
         }
         every { inner.uri } returns null
-        val source = HlsManifestDataSource(inner, original, AtomicReference(fresh), { true }, { "$fresh-2" }, {})
+        val source = HlsManifestDataSource(inner, original, AtomicReference(fresh), { true }, { "$fresh-2" }, { _, _ -> })
         assertEquals(10L, source.open(DataSpec(Uri.parse(fresh))))
         assertEquals(2, opens)
     }
 
-    @Test fun `segment errors invalidate cache without opening a playlist as audio`() {
+    @Test fun `segment error invalidates only that segment and never refreshes the manifest`() {
         val inner = mockk<DataSource>(relaxed = true)
         every { inner.open(any()) } answers { throw forbidden(firstArg()) }
         var refreshed = false
-        var invalidated = false
+        var invalidated: DataSpec? = null
+        var invalidatedManifest: Boolean? = null
         val source = HlsManifestDataSource(inner, original, AtomicReference(original), { true },
-            { refreshed = true; fresh }, { invalidated = true })
+            { refreshed = true; fresh },
+            { spec, manifest -> invalidated = spec; invalidatedManifest = manifest })
         assertThrows(HttpDataSource.InvalidResponseCodeException::class.java) {
             source.open(DataSpec(Uri.parse("https://cf-media.sndcdn.com/segment-1")))
         }
-        assertTrue(invalidated)
+        // Only the failing segment is handed to the invalidator, not the track.
+        assertEquals("https://cf-media.sndcdn.com/segment-1", invalidated?.uri?.toString())
+        assertEquals(false, invalidatedManifest)
         assertFalse(refreshed)
     }
 
     @Test fun `Download mode prevents network opens and refreshes`() {
         val inner = mockk<DataSource>()
         val source = HlsManifestDataSource(inner, original, AtomicReference(original), { false },
-            { fail("network refresh in Download mode"); null }, {})
+            { fail("network refresh in Download mode"); null }, { _, _ -> })
         assertThrows(IOException::class.java) { source.open(DataSpec(Uri.parse(original))) }
     }
 
@@ -74,7 +81,7 @@ class HlsManifestDataSourceTest {
         val inner = mockk<DataSource>(relaxed = true)
         every { inner.open(any()) } answers { allowed = false; throw forbidden(firstArg()) }
         val source = HlsManifestDataSource(inner, original, AtomicReference(original), { allowed },
-            { fail("network refresh after mode change"); null }, {})
+            { fail("network refresh after mode change"); null }, { _, _ -> })
         assertThrows(IOException::class.java) { source.open(DataSpec(Uri.parse(original))) }
     }
 

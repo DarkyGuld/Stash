@@ -158,6 +158,25 @@ class StashPlaybackService : MediaLibraryService() {
     }
 
     /**
+     * The current queue item plus the next [count] tracks. These stay protected
+     * from cache eviction across a transition, crossfade swap or seek: a seek
+     * must never drop the song that is actually playing.
+     */
+    private fun queueTrackIdsFromCurrent(player: Player?, count: Int): List<Long> {
+        val p = player ?: return emptyList()
+        val index = p.currentMediaItemIndex
+        if (index < 0) return emptyList()
+        return (0..count)
+            .mapNotNull { (index + it).takeIf { i -> i < p.mediaItemCount }?.let(p::getMediaItemAt) }
+            .mapNotNull(::latencyTrackId)
+    }
+
+    private fun retainPlaybackTracks(player: Player?) {
+        val ids = queueTrackIdsFromCurrent(player, RETAIN_AHEAD)
+        if (ids.isNotEmpty()) prefetchOrchestrator.retainTracks(ids)
+    }
+
+    /**
      * Warms the resolved stream URL for the next couple of tracks as soon as the
      * queue knows them, so auto-advance and a manual skip both hit the cache.
      */
@@ -211,6 +230,7 @@ class StashPlaybackService : MediaLibraryService() {
     @Inject lateinit var prefetchOrchestrator: PrefetchOrchestrator
     @Inject lateinit var sleepTimerController: SleepTimerController
     @Inject lateinit var streamingMediaSourceFactory: StreamingMediaSourceFactory
+    @Inject lateinit var cachePolicy: com.stash.core.media.streaming.StreamCachePolicy
     @Inject lateinit var playbackResumer: PlaybackResumer
     @Inject lateinit var crossfadePreference: CrossfadePreference
     @Inject lateinit var playbackSessionBus: com.stash.core.media.PlaybackSessionBus
@@ -270,6 +290,9 @@ class StashPlaybackService : MediaLibraryService() {
 
         /** How many upcoming tracks get their resolved stream URL warmed (one Cloud call each). */
         private const val URL_PREFETCH_AHEAD = 2
+
+        /** Current + this many lookahead tracks stay cache-protected across transitions. */
+        private const val RETAIN_AHEAD = 2
 
         /**
          * The intent that opens the app on the full player: what a tap on the media notification
@@ -665,7 +688,10 @@ class StashPlaybackService : MediaLibraryService() {
             }
             updateCustomLayout()
             onTrackTransitionForLoudness(mediaItem)
+            // Keep the current item + lookahead pinned instead of unpinning all:
+            // a seek transitions too and must not make the audible track evictable.
             prefetchOrchestrator.resetSession()
+            retainPlaybackTracks(crossfadeEngine?.masterPlayer)
             // Tap → first audio: a real track change starts the measurement; a seek doesn't.
             if (reason != Player.MEDIA_ITEM_TRANSITION_REASON_SEEK) {
                 markLatencyStart(mediaItem)
@@ -692,6 +718,9 @@ class StashPlaybackService : MediaLibraryService() {
             updateDiscordPresence(master?.currentMediaItem, isPlaying)
             if (isPlaying && master != null) {
                 stashLatency.firstAudio(latencyTrackId(master.currentMediaItem))
+                // Re-assert the window if an idle stop had released it but a
+                // still-bound client resumed on the same source.
+                retainPlaybackTracks(master)
                 startPrefetchPoll(master)
                 startCrossfadePoll(master)
             } else {
@@ -2000,6 +2029,7 @@ class StashPlaybackService : MediaLibraryService() {
         updateDiscordPresence(newMaster.currentMediaItem, newMaster.isPlaying)
         updateCustomLayout()
         prefetchOrchestrator.resetSession()
+        retainPlaybackTracks(newMaster)
         // Re-read idleness from the NEW master directly: the fade's
         // pauseAtEndOfMediaItems flipped the OLD master's playWhenReady while
         // the listener was still attached to it, and no event fires on the
@@ -2060,6 +2090,9 @@ class StashPlaybackService : MediaLibraryService() {
         // stop before the app's controller hears of it, and the app then never asks again. It goes
         // when the app's controller disconnects ([onControllerDisconnected]).
         playbackSessionBus.onServiceStopping()
+        // Nothing is audible any more: release the track pins so the cache can
+        // trim down to the user's cap while the service is stopped.
+        if (::cachePolicy.isInitialized) cachePolicy.unpinAll()
         // The widget keeps the song, paused; its buttons now start the service again.
         widgetFeed?.stopped()
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
@@ -2444,6 +2477,8 @@ class StashPlaybackService : MediaLibraryService() {
         crossfadePollJob?.cancel()
         sleepTimerNotificationJob?.cancel()
         cancelSleepTimerNotification()
+        // Every death path: a destroyed service has no audible track to protect.
+        if (::cachePolicy.isInitialized) cachePolicy.unpinAll()
         if (::hiResOutputController.isInitialized) {
             // The controller outlives this service: never leave a session's bit-perfect hold behind
             // (shutdown() above normally clears it through exitSession).

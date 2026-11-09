@@ -411,6 +411,61 @@ class PrefetchOrchestratorTest {
     }
 
     @Test
+    fun resetSession_retains_the_new_window_instead_of_unpinning_everything() = runTest {
+        val policy = StreamCachePolicy()
+        val orchestrator = PrefetchOrchestrator(
+            streamResolver = streamResolver,
+            streamUrlCache = streamUrlCache,
+            trackDao = trackDao,
+            cachePolicy = policy,
+        )
+        policy.pinTrack(99L)
+
+        orchestrator.resetSession(listOf(10L, 11L, 12L))
+
+        assertThat(policy.isProtected("eclipse|10|addon:Cloud|flac|/a.flac")).isTrue()
+        assertThat(policy.isProtected("eclipse|12|addon:Cloud|flac|/c.flac")).isTrue()
+        // The old queue position is no longer part of the retained window.
+        assertThat(policy.isProtected("eclipse|99|addon:Cloud|flac|/old.flac")).isFalse()
+    }
+
+    @Test
+    fun prefetch_pins_the_track_prefix_for_an_hls_next_track() = runTest {
+        val policy = StreamCachePolicy()
+        val track = TrackEntity(
+            id = 5L,
+            title = "Next Up",
+            artist = "Artist",
+            durationMs = 200_000L,
+            isStreamable = true,
+        )
+        val hls = StreamUrl(
+            url = "https://cdn.test/playlist.m3u8",
+            expiresAtMs = Long.MAX_VALUE,
+            codec = "flac",
+            origin = "addon:Cloud",
+            isHls = true,
+        )
+        coEvery { trackDao.getById(5L) } returns track
+        coEvery {
+            streamResolver.resolve(track, allowYouTube = true, allowYtDlp = true, speculative = true)
+        } returns hls
+        val orchestrator = PrefetchOrchestrator(
+            streamResolver = streamResolver,
+            streamUrlCache = StreamUrlCache(),
+            trackDao = trackDao,
+            cachePolicy = policy,
+        )
+
+        orchestrator.prefetchUrlsAhead(this, listOf(5L))
+        advanceUntilIdle()
+
+        assertThat(policy.isProtected(addonCacheKey(5L, hls, hls.url))).isTrue()
+        // HLS segments use their own keys: the whole prefix must be protected.
+        assertThat(policy.isProtected("eclipse|5|addon:Cloud|flac|/segment-1.ts")).isTrue()
+    }
+
+    @Test
     fun prefetch_skips_track_confirmed_unstreamable() = runTest {
         coEvery { streamingPreference.current() } returns true
         every { streamUrlCache.get(7L) } returns null

@@ -155,6 +155,9 @@ class StreamingMediaSourceFactory @Inject constructor(
         stream: StreamUrl,
         trackId: Long?,
     ): MediaSource {
+        // The audible track (or a crossfade spare before the transition listener
+        // moves) must survive eviction while its source is being read.
+        trackId?.let { cachePolicy?.pinTrack(it) }
         val cacheKey = addonCacheKey(trackId, stream, stream.url)
         val hit = streamCache.isCached(cacheKey, 0, 1)
         if (hit) cachePolicy?.recordHit() else cachePolicy?.recordMiss()
@@ -174,17 +177,12 @@ class StreamingMediaSourceFactory @Inject constructor(
             .createMediaSource(item)
     }
 
-    /** Drops every cached manifest/segment of [trackId] (401/403/410 invalidation). */
-    private fun evictAddonCache(trackId: Long) {
-        val prefix = "eclipse|$trackId|"
-        runCatching {
-            streamCache.keys.filter { it.startsWith(prefix) }.forEach(streamCache::removeResource)
-        }.onFailure { Log.d(TAG, "cache eviction failed for track $trackId: ${it::class.java.simpleName}") }
-    }
-
     fun createHlsMediaSource(mediaItem: MediaItem, stream: StreamUrl): MediaSource {
         val current = java.util.concurrent.atomic.AtomicReference(stream.url)
         val trackId = mediaItem.mediaId.toLongOrNull()
+        // Protect the manifest and every segment of this track; HLS fetches many
+        // keys per track, and one expired segment must not drop the others.
+        trackId?.let { cachePolicy?.pinTrack(it) }
         val cacheKey = addonCacheKey(trackId, stream, stream.url)
         val hlsHit = streamCache.isCached(cacheKey, 0, 1)
         if (hlsHit) cachePolicy?.recordHit() else cachePolicy?.recordMiss()
@@ -216,10 +214,14 @@ class StreamingMediaSourceFactory @Inject constructor(
                         }
                     }
                 },
-                invalidate = {
-                    trackId?.let(urlCache::invalidate)
-                    // Stale manifest/segments must not be served again.
-                    trackId?.let(::evictAddonCache)
+                invalidate = { spec, manifest ->
+                    // Remove only the key that actually failed. A segment 401/403/410
+                    // must not evict the rest of the track's still-valid segments;
+                    // the manifest itself always drops its own entry before refresh.
+                    val key = addonCacheKey(trackId, stream, spec.uri.toString())
+                    runCatching { streamCache.removeResource(key) }
+                        .onFailure { Log.d(TAG, "cache eviction failed for track ${trackId ?: 0}: ${it::class.java.simpleName}") }
+                    if (manifest) trackId?.let(urlCache::invalidate)
                 },
             )
         }

@@ -17,7 +17,8 @@ class HlsManifestDataSource(
     private val currentManifest: AtomicReference<String>,
     private val streamAllowed: () -> Boolean,
     private val refresh: () -> String?,
-    private val invalidate: () -> Unit,
+    /** Receives the exact failing request and whether it was the manifest. */
+    private val invalidate: (DataSpec, Boolean) -> Unit,
 ) : DataSource by inner {
     override fun open(dataSpec: DataSpec): Long {
         if (!streamAllowed()) throw IOException("Download mode: streaming disabled")
@@ -27,7 +28,10 @@ class HlsManifestDataSource(
             return inner.open(spec).also { if (manifest) inner.uri?.let { currentManifest.set(it.toString()) } }
         } catch (e: HttpDataSource.InvalidResponseCodeException) {
             if (e.responseCode !in setOf(401, 403, 410)) throw e
-            invalidate()
+            // Only the failing key is invalidated; a segment never drops the track.
+            // [spec] is the URI the cache actually read (the refreshed manifest URI
+            // for a manifest request), so its key is the one to drop.
+            invalidate(spec, manifest)
             // A segment failure needs a fresh media source; never substitute manifest bytes.
             if (!manifest || dataSpec.position != 0L) throw e
             inner.close()

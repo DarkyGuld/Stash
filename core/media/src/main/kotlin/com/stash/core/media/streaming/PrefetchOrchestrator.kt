@@ -112,8 +112,11 @@ class PrefetchOrchestrator @Inject constructor(
                 // same cache the player reads — whole file (60 MB cap) on unmetered,
                 // first ~2 MB on mobile data. HLS/DASH skip this.
                 if (resolved.origin?.startsWith("${EclipseAddonStreamResolver.ORIGIN}") == true) {
-                    // Pin the upcoming chunk until it starts (queue change unpins it).
+                    // Pin the upcoming chunk until it starts. For HLS the exact key
+                    // is only the manifest, so also pin the whole track prefix:
+                    // its segments arrive under separate keys.
                     runCatching { cachePolicy?.pin(addonCacheKey(id, resolved, resolved.url)) }
+                    if (resolved.isHls) runCatching { cachePolicy?.pinTrack(id) }
                     // The next track always gets its first chunk. The whole file only
                     // with the explicit preference on (and unmetered).
                     val unmetered = qualityPolicy?.isMeteredNetwork() == false
@@ -266,12 +269,21 @@ class PrefetchOrchestrator @Inject constructor(
      * Clears the per-session "already attempted" guard. Hosts should
      * call this on every track transition so a fresh prefetch attempt
      * is allowed for the new "next" track.
+     *
+     * The old queue position's pin is NOT dropped wholesale: the host passes
+     * the new window (current + next 2) and only those tracks stay protected.
+     * Hosts must include the current item on a seek, so it never loses its pin.
      */
-    fun resetSession() {
+    fun resetSession(retainTrackIds: List<Long> = emptyList()) {
         attempted.clear()
         urlPrefetchJob?.cancel()
-        // The pinned chunk was for the queue position we are leaving.
-        runCatching { cachePolicy?.unpinAll() }
+        if (retainTrackIds.isNotEmpty()) retainTracks(retainTrackIds)
+    }
+
+    /** Keeps [trackIds] protected; the first id is the active track. */
+    fun retainTracks(trackIds: List<Long>) {
+        if (trackIds.isEmpty()) return
+        runCatching { cachePolicy?.retainTracks(trackIds) }
     }
 
     private companion object {

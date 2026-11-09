@@ -17,21 +17,23 @@ import org.junit.Test
 class StreamCachePolicyTest {
     private val file = File("/tmp/fake")
 
-    /** Cache with [spans] keyed by name; removing a key frees its bytes. */
-    private fun cache(vararg spans: CacheSpan): Cache {
-        val live = spans.associateBy { it.key }.toMutableMap()
+    /** Cache with [spans] grouped by key; removing a key frees all its spans. */
+    private fun cache(vararg spans: CacheSpan): Cache = cache(spans.toList())
+
+    private fun cache(spans: List<CacheSpan>): Cache {
+        val live = spans.groupBy { it.key }.mapValues { it.value.toMutableList() }.toMutableMap()
         val cache = mockk<Cache>()
-        every { cache.cacheSpace } answers { live.values.sumOf { it.length } }
+        every { cache.cacheSpace } answers { live.values.flatten().sumOf { it.length } }
         every { cache.keys } answers { live.keys.toSet() }
         every { cache.getCachedSpans(any()) } answers {
-            java.util.TreeSet<CacheSpan>().apply { live[firstArg<String>()]?.let { add(it) } }
+            java.util.TreeSet<CacheSpan>().apply { live[firstArg<String>()]?.let { addAll(it) } }
         }
-        every { cache.removeResource(any()) } answers { live.remove(firstArg<String>()) }
+        every { cache.removeResource(any()) } answers { live.remove(firstArg<String>()) != null }
         return cache
     }
 
-    private fun span(key: String, touched: Long) =
-        CacheSpan(key, 0, StreamCachePolicy.MB * 100, touched, file)
+    private fun span(key: String, touched: Long, position: Long = 0) =
+        CacheSpan(key, position, StreamCachePolicy.MB * 100, touched, file)
 
     @Test
     fun `lowering the cap evicts the oldest unpinned file`() {
@@ -68,6 +70,141 @@ class StreamCachePolicyTest {
 
         verify(exactly = 1) { cache.removeResource("p1") }
         assertEquals(1, policy.counters().pinnedEvictions)
+    }
+
+    @Test
+    fun `prefix-protected tracks survive while an unprotected file goes`() {
+        val active = "eclipse|1|addon:Cloud|flac|/a.flac"
+        val lookahead = "eclipse|2|addon:Cloud|flac|/b.flac"
+        val other = "eclipse|9|addon:Cloud|flac|/old.flac"
+        val cache = cache(span(active, 1), span(lookahead, 2), span(other, 3))
+        val policy = StreamCachePolicy()
+
+        policy.retainTracks(listOf(1L, 2L, 3L))
+        policy.setMaxBytes(200 * StreamCachePolicy.MB, cache)
+
+        // Only the unprotected track goes, even though it is not the oldest.
+        verify(exactly = 0) { cache.removeResource(active) }
+        verify(exactly = 0) { cache.removeResource(lookahead) }
+        verify(exactly = 1) { cache.removeResource(other) }
+        assertTrue(policy.isProtected(active))
+        assertTrue(policy.isProtected(lookahead))
+        assertFalse(policy.isProtected("eclipse|4|addon:Cloud|flac|/d.flac"))
+    }
+
+    @Test
+    fun `lookahead is evicted before the active track`() {
+        val active = "eclipse|1|addon:Cloud|flac|/a.flac"
+        val lookahead = "eclipse|2|addon:Cloud|flac|/b.flac"
+        val cache = cache(span(active, 1), span(lookahead, 2))
+        val policy = StreamCachePolicy()
+
+        policy.retainTracks(listOf(1L, 2L))
+        policy.setMaxBytes(100 * StreamCachePolicy.MB, cache)
+
+        verify(exactly = 0) { cache.removeResource(active) }
+        verify(exactly = 1) { cache.removeResource(lookahead) }
+        assertEquals(1, policy.counters().pinnedEvictions)
+    }
+
+    @Test
+    fun `a recently touched key survives even when it is the oldest`() {
+        val cache = cache(span("old", 1), span("new", 2))
+        val policy = StreamCachePolicy()
+        policy.elapsedRealtimeMs = { 0L }
+        policy.onSpanTouched(cache, span("old", 1), span("old", 1))
+        policy.elapsedRealtimeMs = { 1_000L }
+
+        policy.setMaxBytes(100 * StreamCachePolicy.MB, cache)
+
+        verify(exactly = 0) { cache.removeResource("old") }
+        verify(exactly = 1) { cache.removeResource("new") }
+    }
+
+    @Test
+    fun `the touch window expires after ninety seconds`() {
+        val cache = cache(span("old", 1), span("new", 2))
+        val policy = StreamCachePolicy()
+        policy.elapsedRealtimeMs = { 0L }
+        policy.onSpanTouched(cache, span("old", 1), span("old", 1))
+        policy.elapsedRealtimeMs = { 100_000L }
+
+        policy.setMaxBytes(100 * StreamCachePolicy.MB, cache)
+
+        verify(exactly = 1) { cache.removeResource("old") }
+        verify(exactly = 0) { cache.removeResource("new") }
+    }
+
+    @Test
+    fun `onStartFile clamps a 60 MB length to five megabytes`() {
+        val empty = cache()
+        val cache = cache(span("a", 1), span("b", 2), span("c", 3), span("d", 4))
+        val policy = StreamCachePolicy()
+        // Configure the cap without trimming the test cache itself.
+        policy.setMaxBytes(300 * StreamCachePolicy.MB, empty)
+
+        // 400 MB cached + 5 MB clamped (not 60 MB) needs two evictions,
+        // stopping at 200 MB; an unclamped 600 MB would evict all four.
+        policy.onStartFile(cache, "a", 0, 60 * StreamCachePolicy.MB)
+
+        verify(exactly = 2) { cache.removeResource(any()) }
+        assertEquals(2, policy.counters().evictions)
+    }
+
+    @Test
+    fun `a key with several spans is removed exactly once`() {
+        val cache = cache(
+            span("dup", 1, position = 0),
+            span("dup", 2, position = StreamCachePolicy.MB * 100),
+            span("other", 3),
+        )
+        val policy = StreamCachePolicy()
+
+        policy.setMaxBytes(100 * StreamCachePolicy.MB, cache)
+
+        verify(exactly = 1) { cache.removeResource("dup") }
+        verify(exactly = 0) { cache.removeResource("other") }
+        // One eviction per key, not per span.
+        assertEquals(1, policy.counters().evictions)
+    }
+
+    @Test
+    fun `when every prefix track is protected the oldest protected one goes`() {
+        val first = "eclipse|1|addon:Cloud|flac|/a.flac"
+        val second = "eclipse|2|addon:Cloud|flac|/b.flac"
+        val cache = cache(span(first, 1), span(second, 2))
+        val policy = StreamCachePolicy()
+        policy.pinTrack(1L); policy.pinTrack(2L)
+
+        policy.setMaxBytes(100 * StreamCachePolicy.MB, cache)
+
+        verify(exactly = 1) { cache.removeResource(first) }
+        verify(exactly = 0) { cache.removeResource(second) }
+        assertEquals(1, policy.counters().pinnedEvictions)
+    }
+
+    @Test
+    fun `retainTracks replaces the previous window`() {
+        val policy = StreamCachePolicy()
+        policy.pinTrack(9L)
+
+        policy.retainTracks(listOf(1L, 2L, 3L))
+
+        assertTrue(policy.isProtected("eclipse|1|x"))
+        assertTrue(policy.isProtected("eclipse|2|x"))
+        assertFalse(policy.isProtected("eclipse|9|x"))
+    }
+
+    @Test
+    fun `retainTracks releases exact pins for tracks that left the window`() {
+        val policy = StreamCachePolicy()
+        policy.pin("eclipse|9|addon:Cloud|flac|/old.flac")
+        policy.pin("keep-me")
+
+        policy.retainTracks(listOf(1L, 2L))
+
+        assertFalse(policy.isPinned("eclipse|9|addon:Cloud|flac|/old.flac"))
+        assertTrue(policy.isPinned("keep-me"))
     }
 
     /**
