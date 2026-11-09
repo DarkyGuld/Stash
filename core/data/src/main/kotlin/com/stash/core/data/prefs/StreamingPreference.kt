@@ -61,6 +61,7 @@ class StreamingPreference @Inject constructor(
     private val prefetchSearchResultsKey = booleanPreferencesKey("prefetch_search_results")
     private val prefetchWholeFileKey = booleanPreferencesKey("prefetch_whole_file")
     private val streamCacheSizeMbKey = intPreferencesKey("stream_cache_size_mb")
+    private val restoreQueueAfterRadioKey = booleanPreferencesKey("restore_queue_after_radio")
     private val qobuzEnabledKey = booleanPreferencesKey("stream_source_qobuz")
     private val tidalEnabledKey = booleanPreferencesKey("stream_source_tidal")
     private val addonsEnabledKey = booleanPreferencesKey("stream_source_eclipse_addons")
@@ -161,6 +162,15 @@ class StreamingPreference @Inject constructor(
         (prefs[streamCacheSizeMbKey] ?: 500).takeIf { it in listOf(250, 500, 1000, 2000) } ?: 500
     }
 
+    /**
+     * "Restore queue after radio" (Settings › Playback), on by default: leaving
+     * a station puts back the queue that was playing before it. Off means the
+     * station's tracks stay and only the radio state is cleared.
+     */
+    val restoreQueueAfterRadio: Flow<Boolean> = context.streamingDataStore.data.map { prefs ->
+        prefs[restoreQueueAfterRadioKey] ?: true
+    }
+
     // Per-source switches in the streaming chain. All on by default: the chain
     // behaves exactly as before until the user turns one off (the UI's way to
     // force a source, e.g. only Cloud). No dev gate: these are user settings.
@@ -240,6 +250,9 @@ class StreamingPreference @Inject constructor(
 
     suspend fun streamCacheSizeMbNow(): Int = streamCacheSizeMb.first()
 
+    /** Whether leaving a radio station restores the queue that played before it. */
+    suspend fun isRestoreQueueAfterRadio(): Boolean = restoreQueueAfterRadio.first()
+
     suspend fun isQobuzEnabled(): Boolean = qobuzEnabled.first()
 
     suspend fun isTidalEnabled(): Boolean = tidalEnabled.first()
@@ -288,6 +301,10 @@ class StreamingPreference @Inject constructor(
 
     suspend fun setStreamCacheSizeMb(value: Int) {
         context.streamingDataStore.edit { it[streamCacheSizeMbKey] = value }
+    }
+
+    suspend fun setRestoreQueueAfterRadio(value: Boolean) {
+        context.streamingDataStore.edit { it[restoreQueueAfterRadioKey] = value }
     }
 
     suspend fun setQobuzEnabled(value: Boolean) {

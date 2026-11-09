@@ -65,6 +65,7 @@ fun SettingsPlaybackScreen(
         context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
     }
     val autoplayRadioEnabled by viewModel.autoplayRadioEnabled.collectAsStateWithLifecycle()
+    val restoreQueueAfterRadio by viewModel.restoreQueueAfterRadio.collectAsStateWithLifecycle()
     val crossfadeEnabled by viewModel.crossfadeEnabled.collectAsStateWithLifecycle()
     val crossfadeDurationMs by viewModel.crossfadeDurationMs.collectAsStateWithLifecycle()
     val headphoneResumeOnReconnect by viewModel.headphoneResumeOnReconnect.collectAsStateWithLifecycle()
@@ -162,6 +163,14 @@ fun SettingsPlaybackScreen(
                         subtitle = stringResource(R.string.settings_autoplay_radio_desc),
                         checked = autoplayRadioEnabled,
                         onCheckedChange = viewModel::onAutoplayRadioToggle,
+                    )
+                }
+                add {
+                    SettingsToggleRow(
+                        title = stringResource(R.string.settings_restore_queue_after_radio_title),
+                        subtitle = stringResource(R.string.settings_restore_queue_after_radio_desc),
+                        checked = restoreQueueAfterRadio,
+                        onCheckedChange = viewModel::onRestoreQueueAfterRadioToggle,
                     )
                 }
                 add {

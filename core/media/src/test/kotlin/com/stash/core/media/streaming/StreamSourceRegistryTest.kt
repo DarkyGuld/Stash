@@ -746,6 +746,83 @@ class StreamSourceRegistryTest {
         coVerify { youtube.resolve(track, allowYtDlp = true) }
     }
 
+    // ── Radio: addon rung bypasses the lossless/data-saver/foreground gates ──
+
+    @Test
+    fun `radio asks the addon rung with Lossless off`() = runTest {
+        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
+        coEvery { losslessPrefs.enabledNow() } returns false
+        coEvery { qbdlx.resolve(any()) } returns null
+        coEvery { youtube.resolve(any(), any()) } returns null
+        val addon: EclipseAddonStreamResolver = mockk {
+            coEvery { resolve(any(), any()) } returns stubStreamUrl("addon")
+        }
+
+        val result = registryWithAddon(addon).resolve(stubTrack(), radio = true)
+
+        assertThat(result!!.origin).isEqualTo("addon")
+        coVerify(exactly = 1) { addon.resolve(any(), any()) }
+    }
+
+    @Test
+    fun `radio asks the addon rung with allowYtDlp off`() = runTest {
+        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
+        coEvery { losslessPrefs.enabledNow() } returns true
+        val addon: EclipseAddonStreamResolver = mockk {
+            coEvery { resolve(any(), any()) } returns stubStreamUrl("addon")
+        }
+
+        val result = registryWithAddon(addon).resolve(
+            stubTrack(),
+            allowYouTube = true,
+            allowYtDlp = false,
+            radio = true,
+        )
+
+        assertThat(result!!.origin).isEqualTo("addon")
+        coVerify(exactly = 1) { addon.resolve(any(), any()) }
+    }
+
+    @Test
+    fun `radio asks the addon rung where Data saver applies`() = runTest {
+        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
+        coEvery { losslessPrefs.enabledNow() } returns true
+        val addon: EclipseAddonStreamResolver = mockk {
+            coEvery { resolve(any(), any()) } returns stubStreamUrl("addon")
+        }
+        val policy: StreamQualityPolicy = mockk {
+            coEvery { dataSaverApplies() } returns true
+            coEvery { preferTidalAac() } returns false
+            coEvery { preferCloudCopies() } returns false
+        }
+        val registry = StreamSourceRegistry(
+            kennyy, qobuz, qbdlx, jiosaavn, youtube, streamingPreference,
+            LosslessSourceHealth(), losslessPrefs, Dispatchers.IO, log,
+            qualityPolicy = policy,
+            addons = addon,
+        )
+
+        val result = registry.resolve(stubTrack(), radio = true)
+
+        assertThat(result!!.origin).isEqualTo("addon")
+    }
+
+    @Test
+    fun `library playback still gates the addon rung with Lossless off`() = runTest {
+        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
+        coEvery { losslessPrefs.enabledNow() } returns false
+        coEvery { qbdlx.resolve(any()) } returns null
+        coEvery { youtube.resolve(any(), any()) } returns null
+        val addon: EclipseAddonStreamResolver = mockk {
+            coEvery { resolve(any(), any()) } returns stubStreamUrl("addon")
+        }
+
+        val result = registryWithAddon(addon).resolve(stubTrack())
+
+        assertThat(result).isNull()
+        coVerify(exactly = 0) { addon.resolve(any(), any()) }
+    }
+
     private fun stubTrack(): TrackEntity = TrackEntity(
         id = 1L,
         title = "Title",

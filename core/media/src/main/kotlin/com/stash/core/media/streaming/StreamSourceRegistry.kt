@@ -181,6 +181,14 @@ class StreamSourceRegistry internal constructor(
          * it is asked like any first rung.
          */
         speculative: Boolean = false,
+        /**
+         * A radio station's play-time resolve. Radio must be able to use the installed
+         * Eclipse addons even when Lossless is off, Data saver applies, or the caller is
+         * not the foreground (radio auto-grow/prefetch): addons are often the only
+         * source an addon-only station has. This bypasses those gates for the addon
+         * rung ONLY; library and every other playback path keep the normal chain.
+         */
+        radio: Boolean = false,
     ): StreamUrl? {
         // Definitive miss recently: don't re-walk the whole chain on every player retry.
         unavailableUntilMs[track.id]?.let { until ->
@@ -209,7 +217,7 @@ class StreamSourceRegistry internal constructor(
         // Keyed on the FLAGS as well as the id: background fill calls with
         // allowYouTube/allowYtDlp = false deliberately accept a narrower source
         // set, and must never be handed a foreground result (or vice versa).
-        val key = resolveKey(track.id, allowYouTube, allowYtDlp, speculative)
+        val key = resolveKey(track.id, allowYouTube, allowYtDlp, speculative, radio)
         inFlightResolves[key]?.let { return it.await() }
 
         val fresh = resolveScope.async(start = CoroutineStart.LAZY) {
@@ -231,7 +239,7 @@ class StreamSourceRegistry internal constructor(
             // find this track", and RefreshingDataSource's open() threw a
             // non-IOException Media3 never retries. doResolve still records it.
             withTimeoutOrNull(LazyResolvingDataSource.RESOLVE_DEADLINE_MS) {
-                doResolve(track, allowYouTube, allowYtDlp, speculative)
+                doResolve(track, allowYouTube, allowYtDlp, speculative, radio)
             }
         }
         val existing = inFlightResolves.putIfAbsent(key, fresh)
@@ -265,6 +273,18 @@ class StreamSourceRegistry internal constructor(
             unavailableUntilMs.remove(track.id)
         }
         return resolved
+    }
+
+    /**
+     * True while the last real play's all-source miss still suppresses [trackId].
+     * Read by radio's station build/filter so it can drop candidates already known
+     * dead WITHOUT resolving anything over the network.
+     */
+    internal fun hasFreshNegative(trackId: Long): Boolean {
+        val until = unavailableUntilMs[trackId] ?: return false
+        if (System.currentTimeMillis() < until) return true
+        unavailableUntilMs.remove(trackId, until)
+        return false
     }
 
     /**
@@ -302,8 +322,8 @@ class StreamSourceRegistry internal constructor(
      */
     private val unavailableUntilMs = ConcurrentHashMap<Long, Long>()
 
-    private fun resolveKey(trackId: Long, allowYouTube: Boolean, allowYtDlp: Boolean, speculative: Boolean) =
-        "$trackId:$allowYouTube:$allowYtDlp:$speculative"
+    private fun resolveKey(trackId: Long, allowYouTube: Boolean, allowYtDlp: Boolean, speculative: Boolean, radio: Boolean) =
+        "$trackId:$allowYouTube:$allowYtDlp:$speculative:$radio"
 
     /** The resolver-chain walk itself; reached only via [resolve]'s single-flight. */
     private suspend fun doResolve(
@@ -311,6 +331,7 @@ class StreamSourceRegistry internal constructor(
         allowYouTube: Boolean,
         allowYtDlp: Boolean,
         speculative: Boolean,
+        radio: Boolean,
     ): StreamUrl? {
         val startedNs = System.nanoTime()
         // The Lossless switch (Settings › Audio & Quality) governs streaming as well as
@@ -379,7 +400,11 @@ class StreamSourceRegistry internal constructor(
                 // they sit after the lossless relays and before JioSaavn. Foreground/
                 // next-up only (allowYtDlp), and only with Lossless on and Data saver
                 // not applying: an addon may serve lossy, so it is not a LOSSLESS_RUNG.
-                val addonRung = addons?.takeIf { allowYtDlp && losslessRungs && eclipseAddonsOn }
+                // Radio is the exception: a station must be able to use the addons even
+                // with Lossless off / Data saver / a non-foreground resolve, or an
+                // addon-only station has no source at all. `radio` is explicit, so no
+                // library or general playback path changes.
+                val addonRung = addons?.takeIf { eclipseAddonsOn && (radio || (allowYtDlp && losslessRungs)) }
                 if (addonsFirst && addonRung != null) add("addon" to { t: TrackEntity -> addonRung.resolve(t, speculative) })
 
                 // Prefer Tidal AAC: Tidal's 320 kbps AAC (`?aac=only&hires=0`, the AAC

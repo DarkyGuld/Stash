@@ -32,6 +32,18 @@ import java.io.IOException
  */
 const val STASH_RESOLVE_SCHEME = "stash-resolve"
 
+/** Query param marking a radio station's placeholder: its resolve may use the addon rung. */
+const val RADIO_CANDIDATE_PARAM = "radio"
+
+/**
+ * A radio candidate's stream could not be resolved at play time. Distinct from a
+ * generic IO error so [com.stash.core.media.PlayerRepositoryImpl] can mark the
+ * candidate dead and skip to the next one without tripping the global stream
+ * error cascade.
+ */
+class RadioTrackUnavailableException(trackId: Long) :
+    IOException("radio candidate $trackId is unavailable")
+
 /**
  * Builds the placeholder URI for [trackId]. The optional query params carry
  * the [StreamSourceRegistry] resolver inputs so a track that has NO Room row
@@ -49,6 +61,7 @@ fun stashResolveUri(
     album: String? = null,
     durationMs: Long = 0L,
     isrc: String? = null,
+    radio: Boolean = false,
 ): Uri = Uri.Builder()
     .scheme(STASH_RESOLVE_SCHEME)
     .authority("track")
@@ -60,8 +73,12 @@ fun stashResolveUri(
         album?.takeIf { it.isNotBlank() }?.let { appendQueryParameter("al", it) }
         if (durationMs > 0) appendQueryParameter("d", durationMs.toString())
         isrc?.let { appendQueryParameter("isrc", it) }
+        if (radio) appendQueryParameter(RADIO_CANDIDATE_PARAM, "1")
     }
     .build()
+
+/** True for a radio station's placeholder (see [RADIO_CANDIDATE_PARAM]). */
+internal fun isRadioPlaceholder(uri: Uri): Boolean = uri.getQueryParameter(RADIO_CANDIDATE_PARAM) == "1"
 
 /**
  * Query param marking a placeholder whose `yt` / `isrc` / `d` must win over the
@@ -189,7 +206,10 @@ class LazyResolvingDataSource(
             // so a FLAC link saved on Wi-Fi resolves again here on mobile data.
             val next = (if (overridesRow(uri)) null else urlCache.get(trackId))
                 ?: resolveBlocking(trackId, uri)
-                ?: throw IOException("stream resolve failed for track $trackId")
+                ?: run {
+                    if (isRadioPlaceholder(uri)) throw RadioTrackUnavailableException(trackId)
+                    throw IOException("stream resolve failed for track $trackId")
+                }
             // A DASH MPD (Tidal Hi-Res) cannot be byte-piped into the progressive
             // extractor this source feeds. ResolveFirstMediaSource routes those to a
             // DASH source up front; reaching here means it was bypassed (an override
@@ -220,7 +240,10 @@ class LazyResolvingDataSource(
             active = null
             urlCache.invalidate(trackId)
             stream = resolveBlocking(trackId, uri)?.takeIf { it.origin != CloudCopyFinder.ORIGIN }
-                ?: throw IOException("stream resolve failed for track $trackId after its cloud copy failed", e)
+                ?: run {
+                    if (isRadioPlaceholder(uri)) throw RadioTrackUnavailableException(trackId)
+                    throw IOException("stream resolve failed for track $trackId after its cloud copy failed", e)
+                }
             if (stream.isDash || stream.isHls) {
                 throw IOException("track $trackId resolved to a DASH manifest; needs a DASH media source", e)
             }
@@ -276,7 +299,12 @@ class LazyResolvingDataSource(
                 // query params — see [stashResolveUri]. An override item's
                 // params win over its row ([withRowOverride]).
                 val entity = placeholderEntity(trackDao, trackId, uri) ?: return@withTimeout null
-                resolver.resolve(entity, allowYouTube = true, allowYtDlp = true)
+                resolver.resolve(
+                    entity,
+                    allowYouTube = true,
+                    allowYtDlp = true,
+                    radio = isRadioPlaceholder(uri),
+                )
             }
         }?.also { if (!overridesRow(uri)) urlCache.put(trackId, it) }
     } catch (e: TimeoutCancellationException) {

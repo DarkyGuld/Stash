@@ -666,7 +666,7 @@ fun NowPlayingScreen(
                 // Start a station seeded from this song, or stop the running one; taps while tuning wait.
                 NowPlayingAction.RADIO -> when {
                     radioTuning -> Unit
-                    radioLabel != null -> viewModel.stopRadio()
+                    radioLabel != null -> viewModel.exitRadio()
                     else -> viewModel.startRadioFromCurrent()
                 }
                 NowPlayingAction.LYRICS -> viewModel.onToggleLyrics()

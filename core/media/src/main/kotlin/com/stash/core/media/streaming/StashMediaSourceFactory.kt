@@ -222,7 +222,14 @@ class StashMediaSourceFactory(
                             urlCache.get(trackId)?.takeIf {
                                 (row?.soundCloudId == null && row?.source != com.stash.core.model.MusicSource.SOUNDCLOUD) || it.origin == "soundcloud"
                             } ?: (if (uri.getQueryParameter("sc") == "1" && row?.soundCloudId == null) null else placeholderEntity(trackDao, trackId, uri))
-                                ?.let { resolver.resolve(it, allowYouTube = true, allowYtDlp = true) }
+                                ?.let {
+                                    resolver.resolve(
+                                        it,
+                                        allowYouTube = true,
+                                        allowYtDlp = true,
+                                        radio = isRadioPlaceholder(uri),
+                                    )
+                                }
                                 ?.also { urlCache.put(trackId, it) }
                         }
                     },

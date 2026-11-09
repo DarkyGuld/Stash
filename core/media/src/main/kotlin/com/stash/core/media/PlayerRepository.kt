@@ -240,6 +240,16 @@ interface PlayerRepository {
     /** Stop the active station (queued tracks remain; no more auto-grow). */
     fun stopRadio()
 
+    /**
+     * Leave the active station the way the Now Playing toggle does: stop radio
+     * and, unless the user turned it off or another output owns the player,
+     * restore the queue that was playing before the station started.
+     *
+     * [stopRadio] stays the auto-stop/grow path (no restore). Defaults to
+     * [stopRadio] for stand-in repositories that never start a station.
+     */
+    suspend fun exitRadio() = stopRadio()
+
     /** Live label of the active station's seed (null when no station). */
     val radioSeedLabel: StateFlow<String?>
 

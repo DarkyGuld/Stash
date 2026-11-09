@@ -551,6 +551,13 @@ class NowPlayingViewModelTrackTapTest {
         verify { playerRepository.stopRadio() }
     }
 
+    @Test fun `exitRadio delegates to the player`() = runTest(dispatcher) {
+        val vm = newViewModel(mockk(relaxed = true))
+        vm.exitRadio()
+        advanceUntilIdle()
+        coVerify { playerRepository.exitRadio() }
+    }
+
     @Test fun `onTrackInfoTapped emits nav target with focusAlbum on resolve success`() =
         runTest(dispatcher) {
             val api = mockk<YTMusicApiClient>()

@@ -423,8 +423,13 @@ class NowPlayingViewModel @Inject constructor(
     private fun radioFailureMessage(result: RadioStartResult): String? =
         com.stash.core.media.RadioStarter.failureMessage(result)?.let { appContext.getString(it) }
 
-    /** Stop the active radio station. */
+    /** Stop the active radio station (auto-stop/grow path). */
     fun stopRadio() = playerRepository.stopRadio()
+
+    /** Leave the station from the Now Playing toggle, restoring the previous queue. */
+    fun exitRadio() {
+        viewModelScope.launch { playerRepository.exitRadio() }
+    }
 
     // ── Playback speed (session-only; lives in PlayerRepository) ──
     val playbackSpeed: StateFlow<Float> = playerRepository.playbackSpeed

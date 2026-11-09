@@ -37,7 +37,7 @@ class PlayerRepositoryRadioTest {
         every { trackDeletions } returns MutableSharedFlow()
     }
     private val streamingPreference: StreamingPreference = mockk(relaxed = true) { coEvery { current() } returns true }
-    private val streamResolver: StreamSourceRegistry = mockk()
+    private val streamResolver: StreamSourceRegistry = mockk(relaxed = true)
     private val streamUrlCache: StreamUrlCache = mockk(relaxUnitFun = true)
     private val connectivity: ConnectivityMonitor = mockk(relaxed = true)
     private val trackDao: TrackDao = mockk(relaxed = true)
@@ -250,6 +250,40 @@ class PlayerRepositoryRadioTest {
 
         coVerify(exactly = 0) { radioGenerator.nextBatch(any()) }
         verify(exactly = 0) { controller.addMediaItems(any<List<MediaItem>>()) }
+    }
+
+    @Test fun `startRadio pre-filters a candidate already known unavailable`() = runTest {
+        coEvery { streamingPreference.current() } returns true
+        val session = mockk<RadioSession>(relaxed = true)
+        coEvery { radioGenerator.start(any()) } returns (session to listOf(track(1), track(2)))
+        every { streamResolver.hasFreshNegative(1L) } returns true
+        every { streamResolver.hasFreshNegative(2L) } returns false
+        val items = slot<List<MediaItem>>()
+        every { controller.setMediaItems(capture(items), any<Int>(), any<Long>()) } returns Unit
+
+        val started = repo.startRadio(RadioSeed.Artist("MBV", "id"))
+
+        assertThat(started).isEqualTo(RadioStartResult.Started)
+        assertThat(items.captured.map { it.mediaId }).containsExactly("2")
+        assertThat(repo.currentQueueTracks.map { it.id }).containsExactly(2L)
+    }
+
+    @Test fun `growRadio skips a candidate marked dead for this station`() = runTest {
+        coEvery { streamingPreference.current() } returns true
+        val session = mockk<RadioSession>(relaxed = true)
+        coEvery { radioGenerator.start(any()) } returns (session to listOf(track(1)))
+        coEvery { radioGenerator.nextBatch(session) } returns listOf(track(2), track(3))
+        repo.startRadio(RadioSeed.Artist("MBV", "id"))
+        every { controller.mediaItemCount } returns 1
+        // A play-time miss on this station's second candidate.
+        repo.radioUnavailable.markDead(2L)
+        val appended = slot<List<MediaItem>>()
+        every { controller.addMediaItems(capture(appended)) } returns Unit
+
+        repo.growRadio()
+
+        assertThat(appended.captured.map { it.mediaId }).containsExactly("3")
+        assertThat(repo.currentQueueTracks.map { it.id }).containsExactly(1L, 3L).inOrder()
     }
 
     /** A radio / artist-page / YouTube-album track: queued under a hash of its video id, no row. */

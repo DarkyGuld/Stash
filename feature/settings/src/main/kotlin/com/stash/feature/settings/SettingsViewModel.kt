@@ -770,6 +770,18 @@ class SettingsViewModel @Inject constructor(
             false,
         )
 
+    /** "Restore queue after radio" — on by default. */
+    val restoreQueueAfterRadio: kotlinx.coroutines.flow.StateFlow<Boolean> =
+        streamingPreference.restoreQueueAfterRadio.stateIn(
+            viewModelScope,
+            kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5_000),
+            true,
+        )
+
+    fun onRestoreQueueAfterRadioToggle(enabled: Boolean) {
+        viewModelScope.launch { streamingPreference.setRestoreQueueAfterRadio(enabled) }
+    }
+
     fun onHeadphoneResumeOnReconnectToggle(enabled: Boolean) {
         viewModelScope.launch { headphonePreference.setResumeOnReconnect(enabled) }
     }

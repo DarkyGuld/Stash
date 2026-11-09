@@ -233,7 +233,7 @@ class PlayerRepositoryGhostQueueTest {
             playbackStateStore = playbackStateStore,
             musicRepository = musicRepository,
             streamingPreference = mockk<com.stash.core.data.prefs.StreamingPreference>(relaxed = true) { coEvery { current() } returns true },
-            streamResolver = mockk(),
+            streamResolver = mockk(relaxed = true),
             streamUrlCache = streamUrlCache,
             connectivity = mockk(relaxed = true),
             trackDao = trackDao,

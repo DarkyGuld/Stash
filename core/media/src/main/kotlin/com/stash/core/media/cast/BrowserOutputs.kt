@@ -144,6 +144,9 @@ class BrowserOutputs internal constructor(
     /** The playback service plays through a browser right now: it says so as it starts and as it is back on the phone. */
     val served: StateFlow<Boolean> = _served.asStateFlow()
 
+    /** A speaker (Chromecast) is the output right now. */
+    val isCasting: Boolean get() = castDevices.remote.value != null
+
     /** The space has a linked browser: "Play on" shows even on a phone without Cast. */
     val hasBrowser: StateFlow<Boolean> = link.linked.map { it.isNotEmpty() }.distinctUntilChanged()
         .stateIn(scope, SharingStarted.Eagerly, false)

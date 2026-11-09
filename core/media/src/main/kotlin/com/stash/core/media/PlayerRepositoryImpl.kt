@@ -598,6 +598,19 @@ class PlayerRepositoryImpl @Inject constructor(
     @Volatile
     private var radioSession: com.stash.core.data.radio.RadioSession? = null
 
+    /**
+     * What the player held just before the station took the queue. [exitRadio]
+     * puts it back; [stopRadio] (auto-stop/grow) drops it.
+     */
+    @Volatile
+    private var radioExitSnapshot: RadioExitSnapshot? = null
+
+    /**
+     * Candidates whose play-time resolve failed for this station, with a short
+     * negative TTL. Internal as a test seam. In memory only: never persisted.
+     */
+    internal val radioUnavailable = RadioUnavailableTracker()
+
     private val _radioSeedLabel = MutableStateFlow<String?>(null)
     override val radioSeedLabel: StateFlow<String?> = _radioSeedLabel.asStateFlow()
 
@@ -952,7 +965,9 @@ class PlayerRepositoryImpl @Inject constructor(
         // Any explicit setQueue (playlist tap, single-song play, etc.) leaves
         // library-shuffle mode behind. Snapshot is cleared so a stale Track
         // list doesn't grow back into a different queue later. A radio station
-        // also ends (the user picked something else).
+        // also ends (the user picked something else), and its exit snapshot is
+        // no longer the queue to come back to.
+        radioExitSnapshot = null
         libraryShuffleActive = false
         librarySnapshot = emptyList()
         radioActive = false
@@ -1333,7 +1348,7 @@ class PlayerRepositoryImpl @Inject constructor(
             // Qobuz-proxy outage even if it falls through to the YouTube path.
             // speculative: a Tidal-only track is left to the real play (the user may skip
             // it); the shared Tidal relay pool is small.
-            streamResolver.resolve(entity, allowYouTube = true, allowYtDlp = true, speculative = true)
+            streamResolver.resolve(entity, allowYouTube = true, allowYtDlp = true, speculative = true, radio = radioActive)
         } catch (ce: CancellationException) {
             prefetchInFlight.remove(next.id)
             throw ce
@@ -1549,9 +1564,20 @@ class PlayerRepositoryImpl @Inject constructor(
         if (!streamAllowed()) return RadioStartResult.DownloadMode
         val (session, generated) = radioGenerator.start(seed)
         if (generated.isEmpty()) return RadioStartResult.NoStation
+        // A new station starts with a fresh dead set (the old one was this
+        // station's) and drops only candidates already known dead from the
+        // URL cache / registry negative. Nothing is resolved here.
+        radioUnavailable.clear()
+        val liveGenerated = generated.filterNot { isKnownRadioMiss(it) }
+        if (liveGenerated.isEmpty()) {
+            _userMessages.tryEmit("Every song in this station is unavailable right now.")
+            return RadioStartResult.NoStation
+        }
         // Library ids before queueing: the generator's ids are videoId hashes with no row, so a
         // saved radio queue resumed into nothing after the app was closed (withQueueIdentity).
-        val firstBatch = generated.map { it.withQueueIdentity() }
+        val firstBatch = liveGenerated.map { it.withQueueIdentity() }
+        // Capture the queue radio is about to replace BEFORE any of it is touched.
+        if (!radioActive) captureRadioExitSnapshot(controller)
         radioSession = session
         radioActive = true
         // Only ONE grower may run: startRadio bypasses setQueueInternal (which is
@@ -1590,14 +1616,14 @@ class PlayerRepositoryImpl @Inject constructor(
                 controller.removeMediaItems(curIdx + 1, controller.mediaItemCount)
             }
             if (curIdx > 0) controller.removeMediaItems(0, curIdx)
-            controller.addMediaItems(discoveries.map { it.toQueueMediaItem() })
+            controller.addMediaItems(discoveries.map { it.toQueueMediaItem(radio = true) })
             // No prepare/play/seek — the current item keeps playing uninterrupted.
         } else {
             // Fresh station (artist radio, song ⋮ menu on a non-playing row):
             // replace the queue and start from the top.
             currentQueueTracks = firstBatch
             resetPlayHistory()
-            controller.setMediaItems(firstBatch.map { it.toQueueMediaItem() }, 0, 0L)
+            controller.setMediaItems(firstBatch.map { it.toQueueMediaItem(radio = true) }, 0, 0L)
             controller.prepare()
             controller.play()
         }
@@ -1613,8 +1639,119 @@ class PlayerRepositoryImpl @Inject constructor(
     override fun stopRadio() {
         radioActive = false
         radioSession = null
+        radioExitSnapshot = null
+        radioUnavailable.clear()
         _radioSeedLabel.value = null
         currentSource = com.stash.core.model.PlaybackSource.Unknown
+    }
+
+    /**
+     * Leave the station from the Now Playing toggle: stop radio and, when the
+     * user wants it and no session/browser/cast owns the player, put back the
+     * queue that was playing before the station. [stopRadio] stays the
+     * auto-stop/grow path.
+     */
+    override suspend fun exitRadio() {
+        // Read before stopRadio drops them: the restore needs both the snapshot
+        // and the rest of the player state it captured.
+        val snapshot = radioExitSnapshot
+        val queueOwnedElsewhere = listenTogetherOwnsQueue ||
+            playsOnBrowser ||
+            browserOutputs?.served?.value == true ||
+            browserOutputs?.isCasting == true
+        stopRadio()
+        val restorePreference = try {
+            streamingPreference.isRestoreQueueAfterRadio()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            true
+        }
+        if (!RadioExitRestore.shouldRestore(
+                hasSnapshot = snapshot != null && snapshot.tracks.isNotEmpty(),
+                preference = restorePreference,
+                queueOwnedElsewhere = queueOwnedElsewhere,
+            )
+        ) {
+            return
+        }
+        restoreRadioExit(snapshot!!)
+    }
+
+    /** Snapshot the queue radio is about to replace. Main thread. */
+    private fun captureRadioExitSnapshot(controller: MediaController) {
+        val currentId = controller.currentMediaItem?.mediaMetadata?.extras
+            ?.getLong(EXTRA_TRACK_ID, 0L)
+            ?.takeIf { it != 0L }
+        radioExitSnapshot = RadioExitSnapshot(
+            tracks = currentQueueTracks,
+            capturedIndex = controller.currentMediaItemIndex,
+            currentTrackId = currentId,
+            positionMs = controller.currentPosition.coerceAtLeast(0L),
+            source = currentSource,
+            queueWindow = queueWindow,
+            windowPinned = windowPinned,
+            windowUnconfirmed = windowUnconfirmed,
+            shuffleModeEnabled = controller.shuffleModeEnabled,
+            repeatMode = controller.repeatMode,
+            libraryShuffleActive = libraryShuffleActive,
+            librarySnapshot = librarySnapshot,
+            wasPlaying = controller.playWhenReady,
+        )
+    }
+
+    /**
+     * Put the captured queue back through the normal queue path, then restore
+     * the window/pins, shuffle/repeat, source and library-shuffle state it had.
+     * The queue list is already in play order, so Media3's shuffle is held off
+     * during the build and turned back on after it: restoring the mode, not
+     * shuffling the restored order a second time.
+     */
+    private suspend fun restoreRadioExit(snapshot: RadioExitSnapshot) {
+        val controller = ensureController() ?: return
+        val startIndex = RadioExitRestore.startIndex(
+            tracks = snapshot.tracks,
+            currentTrackId = snapshot.currentTrackId,
+            capturedIndex = snapshot.capturedIndex,
+        )
+        controller.shuffleModeEnabled = false
+        var restored = false
+        try {
+            setQueueInternal(
+                tracks = snapshot.tracks,
+                startIndex = startIndex,
+                startPositionMs = snapshot.positionMs,
+                source = snapshot.source,
+                play = snapshot.wasPlaying,
+                restore = true,
+            )
+            // The build can bail (a snapshot whose songs can no longer play): the
+            // player then still holds the station's queue, so don't claim the
+            // captured window/logical queue for it.
+            restored = controller.mediaItemCount == snapshot.tracks.size &&
+                snapshot.tracks.indices.all {
+                    controller.getMediaItemAt(it).mediaId == snapshot.tracks[it].id.toString()
+                }
+        } finally {
+            controller.shuffleModeEnabled = snapshot.shuffleModeEnabled
+            controller.repeatMode = snapshot.repeatMode
+        }
+        if (!restored) {
+            currentSource = com.stash.core.model.PlaybackSource.Unknown
+            return
+        }
+        // setQueueInternal may rebuild a window from the visible slice. The
+        // captured window keeps the whole order for a big queue, so put it (and
+        // its pins) back exactly, then tell the service to keep the timeline.
+        currentQueueTracks = snapshot.tracks
+        queueWindow = snapshot.queueWindow
+        windowPinned = snapshot.windowPinned
+        windowUnconfirmed = snapshot.windowUnconfirmed
+        libraryShuffleActive = snapshot.libraryShuffleActive
+        librarySnapshot = snapshot.librarySnapshot
+        currentSource = snapshot.source
+        if (snapshot.queueWindow != null) setKeepTimelineOrder(controller, true)
+        _radioSeedLabel.value = null
     }
 
     /** Append the next generated batch to the station queue. Single-flight via
@@ -1633,14 +1770,22 @@ class PlayerRepositoryImpl @Inject constructor(
                 stopRadio()
                 return
             }
+            // Drop candidates already known dead before they enter the queue:
+            // no network resolve, just the station dead set / URL-cache miss.
+            val playable = batch.filterNot { isKnownRadioMiss(it) }
+            if (playable.isEmpty()) return
             // Library ids, as in startRadio, so the grown queue resumes too. Streaming tracks →
             // stash-resolve:// placeholders (see startRadio). The logical queue first, as in
             // addNext: the add is reported, and the queue published, during the call.
-            val queued = batch.map { it.withQueueIdentity() }
+            val queued = playable.map { it.withQueueIdentity() }
             currentQueueTracks = currentQueueTracks + queued
-            controller.addMediaItems(queued.map { it.toQueueMediaItem() })
+            controller.addMediaItems(queued.map { it.toQueueMediaItem(radio = true) })
         }
     }
+
+    /** A radio candidate already known to have no stream (no resolve attempted here). */
+    private fun isKnownRadioMiss(track: Track): Boolean =
+        radioUnavailable.isDead(track.id) || streamResolver.hasFreshNegative(track.id)
 
     /**
      * Append the next slice of unused library tracks to the controller's
@@ -2998,7 +3143,7 @@ class PlayerRepositoryImpl @Inject constructor(
 
     override suspend fun playTrack(track: Track): StreamRoutingResult {
         val entity = trackDao.getById(track.id) ?: track.toEntity()
-        val result = buildMediaItemForTrack(entity)
+        val result = buildMediaItemForTrack(entity, radio = radioActive)
         if (result is StreamRoutingResult.Item) {
             // Single-track play replaces the whole queue — the logical queue
             // must follow, or a stale playlist list would keep hijacking the
@@ -3115,7 +3260,7 @@ class PlayerRepositoryImpl @Inject constructor(
             musicVideoType = item.musicVideoType,
             explicit = item.explicit ?: stored?.explicit,
         )
-        val result = buildMediaItemForTrack(transient)
+        val result = buildMediaItemForTrack(transient, radio = radioActive)
         if (result is StreamRoutingResult.Item) {
             // Single-item replacement: drop the stale logical queue so the
             // queue display falls back to the (one-item) timeline.
@@ -3152,6 +3297,8 @@ class PlayerRepositoryImpl @Inject constructor(
         track: TrackEntity,
         allowYouTube: Boolean = true,
         allowYtDlp: Boolean = true,
+        /** A radio station's play-time resolve: the addon rung is available even when normally gated. */
+        radio: Boolean = false,
     ): StreamRoutingResult {
         val localPath = track.filePath
         // The disk check off the main thread (playTrack runs on the caller's, Main from a
@@ -3212,6 +3359,7 @@ class PlayerRepositoryImpl @Inject constructor(
             track,
             allowYouTube = allowYouTube,
             allowYtDlp = allowYtDlp,
+            radio = radio,
         )?.also { resolved ->
             // Don't poison the shared cache with a PROVISIONAL lossy fallback.
             // The queue-wide background fill resolves with allowYtDlp = false
@@ -3617,6 +3765,32 @@ class PlayerRepositoryImpl @Inject constructor(
                         _streamingHaltedEvents.tryEmit(StreamingHaltedEvent(failingTitle = failingTitle, consecutiveErrorCount = v.consecutiveErrors))
                     }
                 }
+                return
+            }
+
+            // A radio station candidate: a play-time resolve miss (or any stream
+            // error on the candidate) skips to the next song and marks the
+            // candidate dead for this station. It never reaches the cascade
+            // guard, so three bad candidates can't halt the user's playback.
+            val radioCandidate = current?.mediaMetadata?.extras
+                ?.getBoolean(EXTRA_RADIO_CANDIDATE, false) == true ||
+                current?.localConfiguration?.uri
+                    ?.getQueryParameter(com.stash.core.media.streaming.RADIO_CANDIDATE_PARAM) == "1"
+            if (radioCandidate) {
+                val notAvailable = error.hasCauseOfType(
+                    com.stash.core.media.streaming.RadioTrackUnavailableException::class.java,
+                )
+                if (failingId != null) radioUnavailable.markDead(failingId)
+                note("RADIO ${if (notAvailable) "not available" else "stream error"} → next candidate")
+                Log.w(
+                    TAG,
+                    "onPlayerError: radio candidate '$failingTitle' code=${error.errorCode} " +
+                        "(${error.errorCodeName}) — skipping it, playback continues",
+                    error,
+                )
+                // Non-blocking: the station keeps going on the next song.
+                _userMessages.tryEmit("Skipping an unavailable radio track.")
+                controller?.recoverOrStop()
                 return
             }
 
@@ -4327,14 +4501,14 @@ class PlayerRepositoryImpl @Inject constructor(
      * so every downstream consumer (offline silent-skip, scrobbler, likes,
      * resume, prefetch matching) keeps working unchanged.
      */
-    private fun Track.toQueueMediaItem(): MediaItem {
+    private fun Track.toQueueMediaItem(radio: Boolean = false): MediaItem {
         // An All Songs file is local-only: if it has gone, the local-error policy skips it.
         if (isScannedSong) return toMediaItem()
         val localPath = filePath
         if (isDownloaded && !localPath.isNullOrBlank() && filePathExistsOnDisk(localPath)) {
             return toMediaItem()
         }
-        return toStreamPlaceholderMediaItem()
+        return toStreamPlaceholderMediaItem(radio = radio)
     }
 
     /**
@@ -4453,7 +4627,7 @@ class PlayerRepositoryImpl @Inject constructor(
         )
     }
 
-    private fun Track.toStreamPlaceholderMediaItem(): MediaItem {
+    private fun Track.toStreamPlaceholderMediaItem(radio: Boolean = false): MediaItem {
         // A cloud song streams from the user's own cloud, never from an online match by its words.
         if (source == com.stash.core.model.MusicSource.CLOUD) {
             return toMediaItem().buildUpon().setUri(com.stash.core.media.streaming.cloudPlaybackUri(cloudUri)).build()
@@ -4468,10 +4642,21 @@ class PlayerRepositoryImpl @Inject constructor(
             album = album,
             durationMs = durationMs,
             isrc = isrc,
+            radio = radio,
         )
-        return toMediaItem().buildUpon().setUri(
+        val item = toMediaItem()
+        val withUri = item.buildUpon().setUri(
             if (soundCloudId != null) placeholder.buildUpon().appendQueryParameter("sc", "1").build() else placeholder,
         ).build()
+        if (!radio) return withUri
+        // The marker survives a prefetch's URL upgrade (extras are copied), so
+        // onPlayerError still knows a failing item belongs to a station.
+        val extras = Bundle(item.mediaMetadata.extras ?: Bundle()).apply {
+            putBoolean(EXTRA_RADIO_CANDIDATE, true)
+        }
+        return withUri.buildUpon()
+            .setMediaMetadata(item.mediaMetadata.buildUpon().setExtras(extras).build())
+            .build()
     }
 
     /**
@@ -4583,6 +4768,22 @@ class PlayerRepositoryImpl @Inject constructor(
 }
 
 /**
+ * Whether [this] throwable, or any cause in its chain, is an instance of [type].
+ * Media3 wraps a DataSource's failure in a PlaybackException, so radio's
+ * play-time [com.stash.core.media.streaming.RadioTrackUnavailableException] is
+ * found through the causes rather than at the top.
+ */
+internal fun Throwable.hasCauseOfType(type: Class<out Throwable>): Boolean {
+    var current: Throwable? = this
+    var depth = 0
+    while (current != null && depth++ < 16) {
+        if (type.isInstance(current)) return true
+        current = current.cause
+    }
+    return false
+}
+
+/**
  * Whether a position-persist DataStore write is worth issuing. True on a
  * track/index switch, on a play→pause edge (resume must land exactly where
  * the user paused), or once the position has drifted at least
@@ -4673,6 +4874,13 @@ private enum class QueueEntryKind { FILE, PLACEHOLDER }
 
 /** MediaMetadata extra: an All Songs file's format (its file extension), see [toScannedTrack]. */
 internal const val EXTRA_SCANNED_FILE_FORMAT = "stash_scanned_file_format"
+
+/**
+ * MediaMetadata extra marking a radio station's candidate item, so a play-time
+ * stream error can be handled as "skip this candidate" instead of tripping the
+ * global [StreamErrorCascadeGuard].
+ */
+internal const val EXTRA_RADIO_CANDIDATE = "stash_radio_candidate"
 
 /**
  * A song's stored [com.stash.core.model.MusicSource], on every MediaItem ([putTrackOrigin]), so the
