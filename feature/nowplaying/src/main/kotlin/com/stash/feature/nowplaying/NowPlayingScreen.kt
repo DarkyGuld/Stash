@@ -1281,9 +1281,14 @@ fun NowPlayingScreen(
                                                 front(faceModifier)
                                             }
                                         }
-                                        // Full art: a swipe across the art turns its page; the square's own
-                                        // gestures (skip, seek, turn over) wait under it.
-                                        if (fullArtOn && !reading) com.stash.feature.nowplaying.ui.FullArtSwipe(fullArt)
+                                        // Full art: a sideways swipe skips the song; the pages still
+                                        // turn by themselves. The square's seek/turn-over stay under it.
+                                        if (fullArtOn && !reading) com.stash.feature.nowplaying.ui.FullArtSwipe(
+                                            canNext = canSwipeNext,
+                                            canPrevious = canSwipePrevious,
+                                            onNext = viewModel::onSkipNext,
+                                            onPrevious = viewModel::onSwipePrevious,
+                                        )
                                         if (room != null) {
                                             // "Maya joined", "Rawn skipped": over the art, so the layout never shifts.
                                             com.stash.feature.nowplaying.listen.SessionEventChip(together.events, room.myId, Modifier.align(Alignment.TopCenter))

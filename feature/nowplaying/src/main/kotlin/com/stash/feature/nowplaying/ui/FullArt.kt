@@ -682,15 +682,26 @@ internal fun FullArtLayer(
 }
 
 /**
- * Where full art's art sits in Now Playing's art slot: a sideways swipe there turns the page (the
- * pages go on from it). Stands in for the square art's own gestures while full art is out.
+ * Where full art's art sits in Now Playing's art slot: a sideways swipe skips the song, like the
+ * square art and Spotify. The album's pages still turn by themselves (Cycle album art); this never
+ * scrolls between images.
  */
 @Composable
-internal fun FullArtSwipe(state: FullArtState, modifier: Modifier = Modifier) {
+internal fun FullArtSwipe(
+    canNext: Boolean,
+    canPrevious: Boolean,
+    onNext: () -> Unit,
+    onPrevious: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val currentCanNext by rememberUpdatedState(canNext)
+    val currentCanPrevious by rememberUpdatedState(canPrevious)
+    val currentOnNext by rememberUpdatedState(onNext)
+    val currentOnPrevious by rememberUpdatedState(onPrevious)
     Box(
         modifier = modifier
             .fillMaxSize()
-            .pointerInput(state) {
+            .pointerInput(Unit) {
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)
                     var moved = Offset.Zero
@@ -702,7 +713,8 @@ internal fun FullArtSwipe(state: FullArtState, modifier: Modifier = Modifier) {
                         if (!change.pressed) break
                     }
                     if (abs(moved.x) > viewConfiguration.touchSlop * 2 && abs(moved.x) > abs(moved.y)) {
-                        state.turn(if (moved.x < 0) 1 else -1)
+                        if (moved.x < 0 && currentCanNext) currentOnNext()
+                        else if (moved.x > 0 && currentCanPrevious) currentOnPrevious()
                     }
                 }
             },

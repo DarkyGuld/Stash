@@ -57,8 +57,8 @@ private const val FLIP_CAMERA_DISTANCE = 12f
 /**
  * The Now Playing album art with its gestures: swipe sideways for the next / previous song,
  * double-tap the left or right third to seek back / forward 10 s, and tap to turn the cover over
- * to the album's back ([back]) and again to turn it back. While the back is up the swipe is the
- * back's own (it pages through the inside), not a skip: the cover is in hand, being looked through.
+ * to the album's back ([back]) and again to turn it back. The swipe skips songs on both faces:
+ * the back's page indicator changes the album pages, so a sideways swipe is always a skip.
  *
  * The swipe is [rememberSwipeToSkip] (shared with the mini player): the art follows the finger,
  * skips on a third of its width or a flick through the same [onNext] / [onPrevious] the transport
@@ -132,10 +132,10 @@ internal fun SwipeableArt(
         backUpFor = if (backUpFor == currentFlipKey) null else currentFlipKey
     }
 
-    // No skipping while the back is up: its own swipe turns its pages.
+    // Both faces skip: the back's page indicator, not its swipe, changes the album pages.
     val swipe = rememberSwipeToSkip(
         trackKey = trackKey,
-        enabled = gesturesEnabled && !showBack,
+        enabled = gesturesEnabled,
         canNext = canNext,
         canPrevious = canPrevious,
         onNext = onNext,

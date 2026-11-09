@@ -3,16 +3,16 @@
 ## This release
 
 - Package: `com.stash.app`
-- Version: `0.9.132` (versionCode 162)
+- Version: `0.9.133` (versionCode 163)
 - Signing key: `stash-release` (not the debug key)
 - In-app updater: `https://github.com/DarkyGuld/Stash/releases/latest`
 - APK: `app/build/outputs/apk/release/app-release.apk`
-- Release page: `https://github.com/DarkyGuld/Stash/releases/tag/v0.9.132`
+- Release page: `https://github.com/DarkyGuld/Stash/releases/tag/v0.9.133`
 
 The official Stash APK and the old `com.stash.app.debug` build use different
 signing keys. Uninstall them before installing this release; app data is not
 migrated. After installing, sign in to Spotify and add the Eclipse addon again.
-The `0.9.130`/`0.9.131` releases can be updated in place to `0.9.132`; the
+The `0.9.130`–`0.9.132` releases can be updated in place to `0.9.133`; the
 signing key and app data are unchanged.
 
 ## SoundCloud sign-in
@@ -24,6 +24,14 @@ back to the opener with `window.opener`. The login WebView therefore enables
 consent page stays on "check your phone" and never finishes. The login WebView
 also handles `onRenderProcessGone()` (close and retry instead of a white
 screen). As a fallback the SoundCloud dialog accepts a pasted OAuth token.
+
+## Now Playing swipe
+
+A horizontal swipe on the album art always skips to the next/previous song:
+the front, the back cover and full art. The back cover's page indicator dots
+change the album pages (the pager has `userScrollEnabled = false`); full-art
+pages still turn with the automatic cycle. A swipe never scrolls between album
+images.
 
 ## Stream cache
 

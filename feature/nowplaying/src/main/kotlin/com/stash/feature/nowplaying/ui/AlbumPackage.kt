@@ -18,6 +18,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalUriHandler
@@ -25,16 +26,17 @@ import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.launch
 
 /** Up to this many pages the indicator is a row of dots; past it, a slim track with the page's place on it. */
 private const val MAX_DOTS = 10
 
 /**
  * The back of the album held in the hand: its cover and then the pages inside (booklet, gatefold
- * panels, inner sleeve), turned with a sideways swipe in the art's own place; two fingers lift a
- * page off the art to the whole screen ([LiftablePage], drawn by each page). A tap still turns
- * the cover back over, and double-tapping a side still seeks: those are the art's
- * ([SwipeableArt]), which takes the song swipe away while the back is up.
+ * panels, inner sleeve). The page indicator changes pages; a sideways swipe is always the song
+ * skip ([SwipeableArt]), never a page turn. Two fingers lift a page off the art to the whole
+ * screen ([LiftablePage], drawn by each page). A tap still turns the cover back over, and
+ * double-tapping a side still seeks.
  *
  * Where the reader is shows just under the art, in the gap above the title (at least 16dp:
  * `GapArtMin`), never over a scan; beside it, the credit a page from Discogs asks for.
@@ -53,6 +55,7 @@ internal fun AlbumPackage(
     page: @Composable (index: Int) -> Unit,
 ) {
     val pagerState = rememberPagerState(initialPage = initialPage.coerceIn(0, (pageCount - 1).coerceAtLeast(0))) { pageCount }
+    val scope = rememberCoroutineScope()
     // Turned over on a page the cycle was showing: the back opens on it.
     androidx.compose.runtime.LaunchedEffect(initialPage) {
         pagerState.scrollToPage(initialPage.coerceIn(0, (pageCount - 1).coerceAtLeast(0)))
@@ -61,8 +64,10 @@ internal fun AlbumPackage(
         HorizontalPager(
             state = pagerState,
             pageSpacing = 24.dp,
-            // The neighbouring pages load before they are swiped to.
+            // The neighbouring pages load before they are shown.
             beyondViewportPageCount = 1,
+            // A sideways swipe is the song skip on both faces; the page indicator pages the album.
+            userScrollEnabled = false,
             modifier = Modifier.fillMaxSize(),
         ) { index ->
             page(index)
@@ -73,6 +78,7 @@ internal fun AlbumPackage(
             PageIndicator(
                 count = pageCount,
                 current = pagerState.currentPage,
+                onPage = { page -> scope.launch { pagerState.animateScrollToPage(page) } },
                 modifier = Modifier
                     .align(if (discogs != null) Alignment.BottomStart else Alignment.BottomCenter)
                     .offset(x = if (discogs != null) 4.dp else 0.dp, y = 10.dp),
@@ -113,7 +119,12 @@ internal fun DiscogsCredit(page: String, modifier: Modifier = Modifier) {
  * number.
  */
 @Composable
-private fun PageIndicator(count: Int, current: Int, modifier: Modifier = Modifier) {
+private fun PageIndicator(
+    count: Int,
+    current: Int,
+    onPage: (Int) -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val ink = npInk()
     if (count <= MAX_DOTS) {
         Row(
@@ -124,9 +135,16 @@ private fun PageIndicator(count: Int, current: Int, modifier: Modifier = Modifie
             repeat(count) { i ->
                 Box(
                     modifier = Modifier
-                        .size(6.dp)
-                        .background(ink.copy(alpha = if (i == current) 0.9f else 0.3f), CircleShape),
-                )
+                        .size(24.dp)
+                        .clickable { onPage(i) },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(6.dp)
+                            .background(ink.copy(alpha = if (i == current) 0.9f else 0.3f), CircleShape),
+                    )
+                }
             }
         }
     } else {
@@ -136,16 +154,24 @@ private fun PageIndicator(count: Int, current: Int, modifier: Modifier = Modifie
             modifier = modifier
                 .clearAndSetSemantics { }
                 .width(track)
-                .height(4.dp)
-                .background(ink.copy(alpha = 0.25f), RoundedCornerShape(50)),
+                .height(24.dp)
+                .clickable { onPage((current + 1) % count) },
+            contentAlignment = Alignment.Center,
         ) {
             Box(
                 modifier = Modifier
-                    .offset(x = (track - thumb) * (current.toFloat() / (count - 1)))
-                    .width(thumb)
+                    .width(track)
                     .height(4.dp)
-                    .background(ink.copy(alpha = 0.9f), RoundedCornerShape(50)),
-            )
+                    .background(ink.copy(alpha = 0.25f), RoundedCornerShape(50)),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .offset(x = (track - thumb) * (current.toFloat() / (count - 1)))
+                        .width(thumb)
+                        .height(4.dp)
+                        .background(ink.copy(alpha = 0.9f), RoundedCornerShape(50)),
+                )
+            }
         }
     }
 }
