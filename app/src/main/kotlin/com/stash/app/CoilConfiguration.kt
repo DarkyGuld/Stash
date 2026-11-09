@@ -23,9 +23,11 @@ import okio.Path.Companion.toOkioPath
  *  - Crossfade off globally — the hero composables do their own crossfade.
  *  - [ArtSizeInterceptor]: a cover drawn bigger than its stored URL (Now
  *    Playing, above all) asks its host for a big enough variant, and draws the
- *    stored URL when that fails or turns out smaller; rows are untouched. No
- *    variant above 1200px on a metered network while Android's Data Saver
- *    restricts the app or Stash's own Data saver switch is on.
+ *    stored URL when that fails or turns out smaller; rows and heroes are
+ *    capped at Last.fm's 770, and Now Playing/full art alone may pick bigger
+ *    variants (and gives up on them after ~1.5s). No variant above 1200px on a
+ *    metered network while Android's Data Saver restricts the app or Stash's
+ *    own Data saver switch is on.
  */
 object CoilConfiguration {
     fun build(context: PlatformContext, okHttp: OkHttpClient): ImageLoader =

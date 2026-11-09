@@ -36,6 +36,7 @@ class ArtSizeInterceptorTest {
 
     private val qobuz600 = "https://static.qobuz.com/images/covers/25/40/0060254794025_600.jpg"
     private val qobuzMax = "https://static.qobuz.com/images/covers/25/40/0060254794025_max.jpg"
+    private val lastFm300 = "https://lastfm-img.freetls.fastly.net/i/u/300x300/c9ebed7e766b45dabedaa8ee759b5181.jpg"
     private val lastFm770 = "https://lastfm-img.freetls.fastly.net/i/u/770x0/c9ebed7e766b45dabedaa8ee759b5181.jpg"
     private val lastFmOrig = "https://lastfm-img.freetls.fastly.net/i/u/ar0/c9ebed7e766b45dabedaa8ee759b5181.jpg"
 
@@ -60,12 +61,15 @@ class ArtSizeInterceptorTest {
         }
     }
 
-    private fun request(url: String, skip: Boolean = false, memoryKey: String? = null) =
+    private fun request(url: String, skip: Boolean = false, memoryKey: String? = null, nowPlaying: Boolean = false) =
         ImageRequest.Builder(context)
             .data(url)
             .size(1024)
             .memoryCacheKey(memoryKey)
-            .apply { if (skip) extras[ArtSizeInterceptor.SkipSizing] = true }
+            .apply {
+                if (skip) extras[ArtSizeInterceptor.SkipSizing] = true
+                if (nowPlaying) extras[ArtSizeInterceptor.NowPlayingArt] = true
+            }
             .build()
 
     private fun ok(r: ImageRequest, px: Int) = SuccessResult(image = FakeImage(px, px), request = r)
@@ -76,9 +80,10 @@ class ArtSizeInterceptorTest {
         target: Int = 1024,
         skip: Boolean = false,
         cap: Int = ArtUrlSizer.NO_CAP,
+        nowPlaying: Boolean = false,
         respond: suspend (ImageRequest) -> ImageResult,
     ): Pair<ImageResult, List<Any>> {
-        val chain = FakeChain(request(url, skip), Size(target, target), respond)
+        val chain = FakeChain(request(url, skip, nowPlaying = nowPlaying), Size(target, target), respond)
         val result = ArtSizeInterceptor(maxVariantPx = { cap }).intercept(chain)
         return result to chain.tried
     }
@@ -87,7 +92,7 @@ class ArtSizeInterceptorTest {
 
     @Test
     fun `a sized-up request that fails draws the stored url (offline, 5xx, timeout)`() = runTest {
-        val (result, tried) = run(qobuz600) { r -> if (r.data == qobuzMax) fail(r) else ok(r, 600) }
+        val (result, tried) = run(qobuz600, nowPlaying = true) { r -> if (r.data == qobuzMax) fail(r) else ok(r, 600) }
         assertEquals(listOf<Any>(qobuzMax, qobuz600), tried)
         assertTrue(result is SuccessResult)
         assertEquals(qobuz600, result.request.data)
@@ -95,7 +100,7 @@ class ArtSizeInterceptorTest {
 
     @Test
     fun `when the stored url fails too, its error is what is drawn`() = runTest {
-        val (result, tried) = run(qobuz600) { r -> fail(r) }
+        val (result, tried) = run(qobuz600, nowPlaying = true) { r -> fail(r) }
         assertEquals(listOf<Any>(qobuzMax, qobuz600), tried)
         assertTrue(result is ErrorResult)
         assertEquals(qobuz600, result.request.data)
@@ -106,14 +111,16 @@ class ArtSizeInterceptorTest {
     @Test
     fun `a sized-up result smaller than the stored url draws the stored url`() = runTest {
         // Sinnerman: Last.fm's original is 350px, its stored 770x0 the CDN's cleaner upscale.
-        val (result, tried) = run(lastFm770) { r -> if (r.data == lastFmOrig) ok(r, 350) else ok(r, 770) }
+        val (result, tried) = run(lastFm770, nowPlaying = true) {
+            r -> if (r.data == lastFmOrig) ok(r, 350) else ok(r, 770)
+        }
         assertEquals(listOf<Any>(lastFmOrig, lastFm770), tried)
         assertEquals(770, result.image!!.width)
     }
 
     @Test
     fun `a sized-up result bigger than the stored url is kept, with one fetch`() = runTest {
-        val (result, tried) = run(qobuz600) { r -> ok(r, 1024) }
+        val (result, tried) = run(qobuz600, nowPlaying = true) { r -> ok(r, 1024) }
         assertEquals(listOf<Any>(qobuzMax), tried)
         assertEquals(qobuzMax, result.request.data)
         assertEquals(1024, result.image!!.width)
@@ -121,7 +128,7 @@ class ArtSizeInterceptorTest {
 
     @Test
     fun `a lastfm original at least the stored size is kept`() = runTest {
-        val (result, tried) = run(lastFm770) { r -> ok(r, 1000) }
+        val (result, tried) = run(lastFm770, nowPlaying = true) { r -> ok(r, 1000) }
         assertEquals(listOf<Any>(lastFmOrig), tried)
         assertEquals(1000, result.image!!.width)
     }
@@ -151,7 +158,7 @@ class ArtSizeInterceptorTest {
 
     @Test
     fun `the data saver cap keeps qobuz on 600`() = runTest {
-        val (_, tried) = run(qobuz600, cap = ArtUrlSizer.DATA_SAVER_MAX_PX) { r -> ok(r, 600) }
+        val (_, tried) = run(qobuz600, nowPlaying = true, cap = ArtUrlSizer.DATA_SAVER_MAX_PX) { r -> ok(r, 600) }
         assertEquals(listOf<Any>(qobuz600), tried)
     }
 
@@ -184,9 +191,34 @@ class ArtSizeInterceptorTest {
     // ── R1: a stalled bigger variant gives up after the budget; a cancelled load never retries ─
 
     @Test
-    fun `a sized-up attempt over the time budget draws the stored url`() = runTest {
+    fun `a list sized-up attempt gives up after the longer budget`() = runTest {
         // A stalled or captive link: the big variant would hang for the client's 30s timeouts.
-        val (result, tried) = run(qobuz600) { r ->
+        val (result, tried) = run(lastFm300) { r ->
+            if (r.data == lastFm770) {
+                delay(30_000)
+                ok(r, 770)
+            } else {
+                ok(r, 300)
+            }
+        }
+        assertEquals(listOf<Any>(lastFm770, lastFm300), tried)
+        assertEquals(lastFm300, result.request.data)
+        // Fell back at the list budget, not after the stall (virtual time).
+        assertEquals(ArtSizeInterceptor.SIZED_ATTEMPT_BUDGET_MS, testScheduler.currentTime)
+    }
+
+    @Test
+    fun `a Now Playing sized-up attempt within the budget is kept`() = runTest {
+        val (result, tried) = run(qobuz600, nowPlaying = true) { r -> delay(1_000); ok(r, 1024) }
+        assertEquals(listOf<Any>(qobuzMax), tried)
+        assertEquals(qobuzMax, result.request.data)
+    }
+
+    // ── Now Playing/full art opts in to the big variant and the shorter budget ────────────────
+
+    @Test
+    fun `a Now Playing request gives up on the sized-up variant at the short budget`() = runTest {
+        val (result, tried) = run(qobuz600, nowPlaying = true) { r ->
             if (r.data == qobuzMax) {
                 delay(30_000)
                 ok(r, 1024)
@@ -196,20 +228,33 @@ class ArtSizeInterceptorTest {
         }
         assertEquals(listOf<Any>(qobuzMax, qobuz600), tried)
         assertEquals(qobuz600, result.request.data)
-        // Fell back at the budget, not after the stall (virtual time).
-        assertEquals(ArtSizeInterceptor.SIZED_ATTEMPT_BUDGET_MS, testScheduler.currentTime)
+        assertEquals(ArtSizeInterceptor.NOW_PLAYING_BUDGET_MS, testScheduler.currentTime)
     }
 
     @Test
-    fun `a sized-up attempt within the budget is kept`() = runTest {
-        val (result, tried) = run(qobuz600) { r -> delay(5_000); ok(r, 1024) }
-        assertEquals(listOf<Any>(qobuzMax), tried)
-        assertEquals(qobuzMax, result.request.data)
+    fun `a Now Playing request may pick a variant above the list cap`() = runTest {
+        val url = "https://lh3.googleusercontent.com/abc=s300"
+        val big = "https://lh3.googleusercontent.com/abc=s1600"
+        val (_, tried) = run(url, target = 1600, nowPlaying = true) { r -> ok(r, 1600) }
+        assertEquals(listOf<Any>(big), tried)
+    }
+
+    @Test
+    fun `a list request stops at the list cap, and the stored url is unchanged`() = runTest {
+        // The same Google cover: a list/hero request may not reach for =s1600.
+        val url = "https://lh3.googleusercontent.com/abc=s300"
+        val capped = "https://lh3.googleusercontent.com/abc=s512"
+        val (_, tried) = run(url, target = 1600) { r -> ok(r, 512) }
+        assertEquals(listOf<Any>(capped), tried)
+
+        // A stored Qobuz _600 is at/below the cap already: no upgrade at all.
+        val (_, storedTried) = run(qobuz600, target = 1600) { r -> ok(r, 600) }
+        assertEquals(listOf<Any>(qobuz600), storedTried)
     }
 
     @Test
     fun `a cancellation thrown by the sized-up attempt propagates and nothing falls back`() = runTest {
-        val chain = FakeChain(request(qobuz600), Size(1024, 1024), { r ->
+        val chain = FakeChain(request(qobuz600, nowPlaying = true), Size(1024, 1024), { r ->
             if (r.data == qobuzMax) throw CancellationException("track skipped") else ok(r, 600)
         })
         var cancelled = false
@@ -224,7 +269,7 @@ class ArtSizeInterceptorTest {
 
     @Test
     fun `cancelling the load while the sized-up attempt waits does not fetch the stored url`() = runTest {
-        val chain = FakeChain(request(qobuz600), Size(1024, 1024), { r ->
+        val chain = FakeChain(request(qobuz600, nowPlaying = true), Size(1024, 1024), { r ->
             if (r.data == qobuzMax) delay(30_000)
             ok(r, 600)
         })

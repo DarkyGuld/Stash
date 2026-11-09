@@ -543,10 +543,14 @@ fun NowPlayingScreen(
     // The album colours come from LocalAlbumChrome (the app-wide palette the mini player wears
     // too), not from the art this screen loads; both covers share one decode (rememberNpArtRequest).
     val artModel: Any? = track?.albumArtPath ?: track?.albumArtUrl
+    // The front cover's own load state, reset on a track change. The neighbours wait for it, so
+    // their two fetches never compete with the cover the user is looking at.
+    var frontArtReady by remember(artModel) { mutableStateOf(false) }
     // Full art's pages: the front (the square art's own decode), then the back and the pages
     // inside as far as they're known.
     val frontRequest = com.stash.feature.nowplaying.ui.rememberNpArtRequest(artModel)
-    // The covers either side, fetched ahead: a skip then shows its cover at once.
+    // The covers either side, fetched ahead once the front has landed: a skip then shows its
+    // cover at once.
     run {
         val q = uiState.queue
         val i = uiState.currentIndex
@@ -556,6 +560,7 @@ fun NowPlayingScreen(
         com.stash.feature.nowplaying.ui.PrefetchNeighbourArt(
             previous = previousTrack?.let { it.albumArtPath ?: it.albumArtUrl },
             next = nextTrack?.let { it.albumArtPath ?: it.albumArtUrl },
+            frontReady = frontArtReady,
         )
     }
     val npContext = androidx.compose.ui.platform.LocalContext.current
@@ -1244,6 +1249,7 @@ fun NowPlayingScreen(
                                                     albumArtUrl = track?.albumArtUrl,
                                                     albumArtPath = track?.albumArtPath,
                                                     zoom = pageZoom,
+                                                    onFrontLoaded = { frontArtReady = true },
                                                     modifier = m,
                                                 )
                                             }
@@ -1891,6 +1897,7 @@ private fun AlbumArtSection(
     albumArtUrl: String?,
     albumArtPath: String?,
     zoom: com.stash.feature.nowplaying.ui.PageZoom,
+    onFrontLoaded: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val artModel = albumArtPath ?: albumArtUrl
@@ -1919,8 +1926,13 @@ private fun AlbumArtSection(
             model = artRequest,
             contentDescription = "Album art",
             contentScale = ContentScale.Crop,
+            // The tile until the first frame: the prefetched bitmap's key (placeholderMemoryCacheKey)
+            // may miss (local art, a differently sized row bitmap), but this never leaves a blank
+            // hole. The request's short crossfade then eases the cover in.
+            placeholder = missingArt,
             error = missingArt,
             fallback = missingArt,
+            onSuccess = { onFrontLoaded() },
             modifier = Modifier
                 .fillMaxSize()
                 .clip(RoundedCornerShape(20.dp)),

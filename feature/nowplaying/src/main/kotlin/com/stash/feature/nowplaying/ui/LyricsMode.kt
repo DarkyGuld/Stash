@@ -1,5 +1,6 @@
 package com.stash.feature.nowplaying.ui
 
+import android.content.Context
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.clickable
@@ -79,13 +80,18 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
+import coil3.SingletonImageLoader
 import coil3.compose.AsyncImage
 import coil3.request.ImageRequest
 import coil3.request.allowHardware
+import coil3.request.crossfade
 import coil3.size.Precision
+import com.stash.core.common.isActiveNetworkMetered
 import com.stash.core.ui.theme.SpaceGrotesk
+import com.stash.core.ui.util.ArtSizeInterceptor
 import com.stash.feature.nowplaying.R
 import java.util.Locale
+import kotlin.math.roundToInt
 import kotlin.math.roundToLong
 
 /*
@@ -335,26 +341,35 @@ private val HeaderArtistStyle = TextStyle(fontSize = 14.sp)
 internal val CompactCoverSize = 64.dp
 
 /**
- * Both Now Playing covers (the big art and the compact one) decode at one size: one cache
- * entry, one Bitmap, so opening or closing lyrics never decodes the cover again. (The album
- * colours no longer come from these bitmaps: Now Playing wears the app-wide palette, read once
- * per cover by PaletteCache.) INEXACT precision caps the decode at that size without upscaling smaller art; the request,
- * and so the cache key, is still identical for both.
- *
- * The size is the screen's short side: the big cover spans the width less its margins, so this
- * always covers it (Pixel 5: 1080 for a 948px cover; Pixel 6 Pro: 1440 for a ~1270px cover,
- * which a fixed 1024 decode stretched 1.24x). The short side, so rotating doesn't change the
- * request. Capped, so a tablet or an unfolded foldable doesn't hold a
- * 2000px+ bitmap: 1440x1440 ARGB is 8 MB, one shared Bitmap. The app's ArtSizeInterceptor reads
- * this size to pick the cover URL variant, so it also decides whether Qobuz `_max`, Spotify's
- * original etc. are fetched.
+ * The cap on the big cover's decode. The cover is ~1270px wide on a 1440px phone, so this no
+ * longer decodes the screen's 1440 (1440x1440 ARGB is 8 MB) for pixels it never draws.
  */
-private const val NP_ART_MAX_DECODE_PX = 1440
+private const val NP_ART_MAX_DECODE_PX = 1280
 
 /**
- * The cover request both covers use. Remembered: an inline ImageRequest.Builder is a new object
- * every recomposition, which makes Coil re-evaluate the request each time (and Now Playing
- * recomposes on every 250ms position tick).
+ * Decode sizes are rounded up to one of these. A rotation swaps the screen's width and height
+ * (the short side, and so the bucket, stays the same), and a pixel of layout drift no longer
+ * changes the Coil key.
+ */
+private val NP_ART_DECODE_BUCKETS = intArrayOf(320, 480, 640, 768, 1024, 1280)
+
+/** A neighbour's prefetch decodes at most this: warmed, not a third full-size bitmap. */
+internal const val NEIGHBOUR_ART_MAX_DECODE_PX = 640
+
+/** A short fade when a cover lands, so the missing-art tile doesn't pop. */
+private const val NP_ART_CROSSFADE_MS = 180
+
+/**
+ * The cover request both covers use. Both Now Playing covers (the big art and the compact one)
+ * decode at one size: one cache entry, one Bitmap, so opening or closing lyrics never decodes the
+ * cover again. (The album colours no longer come from these bitmaps: Now Playing wears the
+ * app-wide palette, read once per cover by PaletteCache.) INEXACT precision caps the decode at
+ * that size without upscaling smaller art; the request, and so the cache key, is identical for
+ * both. The size is the big cover's measured width, not the screen: see [rememberNpArtDecodePx].
+ *
+ * Remembered: an inline ImageRequest.Builder is a new object every recomposition, which makes
+ * Coil re-evaluate the request each time (and Now Playing recomposes on every 250ms position
+ * tick).
  *
  * Placeholder: the bigger cover variant has its own cache key, so a track's first view fetches it
  * from the network (a Qobuz `_max` can be 2 MB). Until it lands, draw the bitmap the mini player
@@ -362,7 +377,15 @@ private const val NP_ART_MAX_DECODE_PX = 1440
  * String model maps to a Uri keyed by its toString, and the mini player sets no transformations
  * or key extras), which is exactly what a String key here builds. A miss (local-file art, or a
  * cover the mini player sized up because it is under ~110px) just means no placeholder, as today.
- * The swap is instant (crossfade is off).
+ *
+ * Hardware bitmaps are allowed now that nothing reads this bitmap's pixels: the palette is
+ * decoded separately by PaletteCache (software, 128px), the zoom only draws it, and full art's
+ * small copy converts a hardware bitmap to ARGB_8888 before it reads anything. Drawing and
+ * scaling stay on the GPU.
+ *
+ * The request opts into [ArtSizeInterceptor.NowPlayingArt]: it may pick an oversized variant and
+ * gives up on it after the short Now Playing budget, not the list/hero one. The short crossfade
+ * covers the tile-to-cover swap.
  */
 @Composable
 internal fun rememberNpArtRequest(artModel: Any?): ImageRequest {
@@ -371,41 +394,124 @@ internal fun rememberNpArtRequest(artModel: Any?): ImageRequest {
     return remember(context, artModel, decodePx) { npArtRequest(context, artModel, decodePx) }
 }
 
-/** [rememberNpArtRequest]'s decode size, for building the same request outside composition. */
+/**
+ * [rememberNpArtRequest]'s decode size, for building the same request outside composition.
+ *
+ * It is the big cover's measured width, not the screen: the page's side padding is taken off the
+ * short side (the cover spans the width less its margins), then rounded up to a
+ * [NP_ART_DECODE_BUCKETS] step. On the Pixel 5 that is 1024 for a 948px cover (was 1080), on the
+ * Pixel 6 Pro 1280 for ~1270 (was 1440): no pixels the cover never draws, and the same key after a
+ * rotation. [NP_ART_MAX_DECODE_PX] caps a tablet or an unfolded foldable. The app's
+ * ArtSizeInterceptor reads this size to pick the cover URL variant, so it also decides whether
+ * Qobuz `_max`, Spotify's original etc. are fetched.
+ */
 @Composable
 internal fun rememberNpArtDecodePx(): Int {
     val configuration = LocalConfiguration.current
-    return with(LocalDensity.current) {
-        minOf(configuration.screenWidthDp, configuration.screenHeightDp).dp.roundToPx()
-    }.coerceIn(1, NP_ART_MAX_DECODE_PX)
+    val density = LocalDensity.current.density
+    val sidePadding = LocalNpSpacing.current.sidePadding
+    return remember(
+        configuration.screenWidthDp,
+        configuration.screenHeightDp,
+        density,
+        sidePadding,
+    ) {
+        npArtDecodePx(
+            screenWidthDp = configuration.screenWidthDp,
+            screenHeightDp = configuration.screenHeightDp,
+            density = density,
+            sidePaddingDp = sidePadding,
+        )
+    }
+}
+
+/**
+ * [rememberNpArtDecodePx] from a [Context], for the ViewModel's prefetch: the two must build the
+ * same request (data, size and options give Coil's memory-cache key). It uses the production side
+ * padding; a debug spacing override can only make the prefetch a separate, harmless request.
+ */
+internal fun npArtDecodePx(context: Context): Int {
+    val configuration = context.resources.configuration
+    return npArtDecodePx(
+        screenWidthDp = configuration.screenWidthDp,
+        screenHeightDp = configuration.screenHeightDp,
+        density = context.resources.displayMetrics.density,
+    )
+}
+
+/**
+ * The big cover's decode size: the short side less the page's side padding (the cover spans the
+ * width less its margins), rounded up to a bucket and capped. The short side is the same in both
+ * orientations, so the Coil key survives a rotation.
+ */
+internal fun npArtDecodePx(
+    screenWidthDp: Int,
+    screenHeightDp: Int,
+    density: Float,
+    sidePaddingDp: Float = NpSpacingDefaults.SIDE_PADDING_DP,
+): Int {
+    val shortSidePx = (minOf(screenWidthDp, screenHeightDp) * density).roundToInt()
+    val coverPx = (shortSidePx - 2f * sidePaddingDp * density).roundToInt()
+    return NP_ART_DECODE_BUCKETS.firstOrNull { it >= coverPx } ?: NP_ART_MAX_DECODE_PX
 }
 
 /** The cover request itself: the same data, size and options give the same Coil memory-cache key. */
-internal fun npArtRequest(context: android.content.Context, artModel: Any?, decodePx: Int): ImageRequest =
+internal fun npArtRequest(context: Context, artModel: Any?, decodePx: Int): ImageRequest =
     ImageRequest.Builder(context)
         .data(artModel)
         .placeholderMemoryCacheKey(artModel as? String)
         .size(decodePx)
         .precision(Precision.INEXACT)
-        // Software, as when Now Playing sampled its palette from this bitmap. Nothing reads
-        // its pixels any more, so a hardware bitmap would do: a separate, measured change.
-        .allowHardware(false)
+        .apply { extras[ArtSizeInterceptor.NowPlayingArt] = true }
+        .allowHardware(true)
+        .crossfade(NP_ART_CROSSFADE_MS)
         .build()
 
 /**
- * Fetches the covers of the songs either side of the playing one, with [npArtRequest]'s exact
- * request, so Next or Previous finds its cover in memory: the square art and full art's front
- * show at once instead of after a download.
+ * Fetches the covers of the songs either side of the playing one, next first.
+ *
+ * It waits until the front cover has loaded ([frontReady]) and only runs on an unmetered
+ * network: the front's own bytes and decode come first. The decode is capped at
+ * [NEIGHBOUR_ART_MAX_DECODE_PX], so two neighbours never hold the memory of two more big covers.
+ * The saved cover still shows at once from the stored-URL placeholder while its own variant
+ * lands; where a host serves one large variant (Qobuz `_max`) the prefetch is also the disk hit.
  */
 @Composable
-internal fun PrefetchNeighbourArt(previous: Any?, next: Any?) {
+internal fun PrefetchNeighbourArt(
+    previous: Any?,
+    next: Any?,
+    frontReady: Boolean,
+) {
     val context = LocalContext.current
     val decodePx = rememberNpArtDecodePx()
-    LaunchedEffect(previous, next, decodePx) {
-        val loader = coil3.SingletonImageLoader.get(context)
-        listOfNotNull(next, previous).forEach { loader.enqueue(npArtRequest(context, it, decodePx)) }
+    val neighbourPx = remember(decodePx) { neighbourArtDecodePx(decodePx) }
+    LaunchedEffect(previous, next, frontReady, neighbourPx) {
+        val models = neighbourPrefetchModels(
+            frontReady = frontReady,
+            metered = isActiveNetworkMetered(context),
+            next = next,
+            previous = previous,
+        )
+        if (models.isEmpty()) return@LaunchedEffect
+        val loader = SingletonImageLoader.get(context)
+        models.forEach { loader.enqueue(npArtRequest(context, it, neighbourPx)) }
     }
 }
+
+/**
+ * Which neighbours to prefetch, next first: none until the front cover has landed, nor on a
+ * metered network, where the front's bytes and the user's data plan come first.
+ */
+internal fun neighbourPrefetchModels(
+    frontReady: Boolean,
+    metered: Boolean,
+    next: Any?,
+    previous: Any?,
+): List<Any> = if (!frontReady || metered) emptyList() else listOfNotNull(next, previous)
+
+/** The neighbours' decode size: the big cover's, capped so it never matches its full memory. */
+internal fun neighbourArtDecodePx(frontDecodePx: Int): Int =
+    minOf(frontDecodePx, NEIGHBOUR_ART_MAX_DECODE_PX)
 
 /** The compact cover in the lyrics header (the same decode as the big art); a tap goes back to it. */
 @Composable

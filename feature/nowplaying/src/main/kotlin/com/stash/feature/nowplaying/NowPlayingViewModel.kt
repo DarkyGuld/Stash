@@ -23,6 +23,7 @@ import com.stash.core.model.isScannedSong
 import com.stash.core.ui.components.PlaylistInfo
 import com.stash.core.model.Track
 import coil3.SingletonImageLoader
+import coil3.request.CachePolicy
 import com.stash.core.data.backcover.AlbumBackCovers
 import com.stash.core.data.backcover.AlbumCoverArt
 import com.stash.core.data.backcover.BackCoverAlbum
@@ -39,6 +40,8 @@ import com.stash.feature.nowplaying.ui.lyricsPositionMs
 import com.stash.feature.nowplaying.ui.lyricsSeekTargetMs
 import com.stash.feature.nowplaying.ui.lyricsViewStateFor
 import com.stash.feature.nowplaying.ui.lyricsViewStateForResult
+import com.stash.feature.nowplaying.ui.npArtDecodePx
+import com.stash.feature.nowplaying.ui.npArtRequest
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
@@ -683,6 +686,51 @@ class NowPlayingViewModel @Inject constructor(
         }
     }
 
+    // ── Front cover: the big art's own request, warmed before the screen opens ──
+
+    /**
+     * The playing song's front cover as the screen's big art asks for it: its downloaded art file,
+     * else its URL, one emission per cover. The player's own track carries the same model the Room
+     * row does (its artwork URI is the path when there is one), so a late row doesn't repeat it.
+     */
+    private val frontCoverModels: Flow<Any?> = uiState
+        .map { s -> s.currentTrack?.albumArtPath ?: s.currentTrack?.albumArtUrl }
+        .distinctUntilChanged()
+
+    /**
+     * Fetches the playing song's front cover while the app is in the foreground, after the lyrics
+     * prefetch's [PREFETCH_DWELL_MS]: the bitmap the big art and full art draw is then in Coil's
+     * memory (or disk) cache before they open, instead of starting its download on the tick the
+     * screen appears. A skip cancels the wait and, because [execute] is used rather than enqueue,
+     * the fetch itself. Nothing runs with the screen off, nor on mobile data under Data saver (the
+     * stored cover and the mini player's bitmap still show).
+     */
+    private fun prefetchFrontCoverWhileForeground() {
+        viewModelScope.launch {
+            combine(frontCoverModels, appForeground.foreground) { model, foreground -> model to foreground }
+                .distinctUntilChanged { old, new -> old.first == new.first && old.second == new.second }
+                .collectLatest { (model, foreground) ->
+                    if (!foreground || model == null) return@collectLatest
+                    delay(PREFETCH_DWELL_MS)
+                    if (dataSaver.appliesNow()) return@collectLatest
+                    // A downloaded cover is a local decode (instant when drawn): only a remote URL
+                    // has a download worth warming.
+                    val url = model as? String
+                    if (url == null || !url.startsWith("http")) return@collectLatest
+                    // Same request as rememberNpArtRequest: the data and size give Coil's key.
+                    // Memory caching is off for this one: if the sized variant misses the short
+                    // budget, the stored-URL fallback would otherwise be cached under the key the
+                    // screen's request reads, and the screen would never try the big variant. Its
+                    // bytes still reach Coil's disk cache, so the screen's own attempt is a disk hit.
+                    val request = npArtRequest(appContext, url, npArtDecodePx(appContext))
+                        .newBuilder()
+                        .memoryCachePolicy(CachePolicy.DISABLED)
+                        .build()
+                    SingletonImageLoader.get(appContext).execute(request)
+                }
+        }
+    }
+
     // ── Back cover: a tap on the art turns it over to the album's back, and its pill opens the inside ──
 
     /**
@@ -888,6 +936,7 @@ class NowPlayingViewModel @Inject constructor(
     // this flow they reached the user only while Now Playing or the queue sheet collected it.
     init {
         observePlayerStateLive()
+        prefetchFrontCoverWhileForeground()
         prefetchLyricsWhileForeground()
         prefetchBackCoverWhileForeground()
         observeUserPlaylists()

@@ -16,6 +16,7 @@ import coil3.request.ErrorResult
 import coil3.request.ImageRequest
 import coil3.request.SuccessResult
 import coil3.size.Precision
+import com.stash.core.ui.util.ArtSizeInterceptor
 
 /**
  * Tries at an image before it is given up on. archive.org, where the archive's images live, now and
@@ -31,8 +32,9 @@ private const val BACK_COVER_MAX_DECODE_PX = 1200
 
 /**
  * The back cover's image request, one for the ViewModel's prefetch and the flip's draw, so the
- * draw finds the prefetched bitmap in memory. Decoded at the screen's short side, as the front is
- * ([rememberNpArtRequest]), read from the display so the ViewModel builds the same request.
+ * draw finds the prefetched bitmap in memory. Decoded at the screen's short side, capped at the
+ * archive's 1200px thumbnail (the front is sized to the cover's measured width instead:
+ * [rememberNpArtRequest]), read from the display so the ViewModel builds the same request.
  * Discogs' images are kept in memory only: its terms allow no copy older than six hours, and the
  * disk cache would keep one for as long as its headers say.
  */
@@ -43,7 +45,12 @@ internal fun backCoverRequest(context: Context, url: String): ImageRequest {
         .data(url)
         .size(px)
         .precision(Precision.INEXACT)
-        .apply { if (isDiscogsImage(url)) diskCachePolicy(CachePolicy.DISABLED) }
+        .apply {
+            // The flip and full art draw these big: they may pick a bigger variant, with the
+            // short Now Playing budget. archive.org and Discogs URLs pass through unchanged.
+            extras[ArtSizeInterceptor.NowPlayingArt] = true
+            if (isDiscogsImage(url)) diskCachePolicy(CachePolicy.DISABLED)
+        }
         .build()
 }
 
