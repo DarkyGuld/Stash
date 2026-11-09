@@ -4,20 +4,26 @@ import android.util.Log
 import com.stash.core.data.db.dao.TrackDao
 import com.stash.core.data.db.entity.TrackEntity
 import com.stash.data.spotify.SpotifyApiClient
+import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
 
 /**
  * Best-effort ISRC for Eclipse's Cloud Apple route: some tracks only stream when
@@ -118,17 +124,12 @@ class EclipseIsrcEnricher @Inject constructor(
         null
     }
 
-    private fun deezerSearch(query: String, track: TrackEntity): String? {
+    private suspend fun deezerSearch(query: String, track: TrackEntity): String? {
         val url = "https://api.deezer.com/search".toHttpUrlOrNull()!!.newBuilder()
             .addQueryParameter("q", query)
             .addQueryParameter("limit", "10")
             .build()
-        val body = runCatching {
-            http.newCall(Request.Builder().url(url).get().build()).execute().use { response ->
-                if (!response.isSuccessful) return@use null
-                response.body?.string()
-            }
-        }.getOrNull() ?: return null
+        val body = deezerGet(url) ?: return null
         val root = runCatching { json.parseToJsonElement(body) as? JsonObject }.getOrNull() ?: return null
         val rows = root["data"] as? JsonArray ?: return null
         val wantTitle = normalize(track.title)
@@ -155,10 +156,38 @@ class EclipseIsrcEnricher @Inject constructor(
         return null
     }
 
+    /**
+     * One Deezer GET on OkHttp's own threads: cancelling the coroutine drops the request,
+     * and the per-call timeout stops a stalled answer instead of holding the Cloud resolve.
+     */
+    private suspend fun deezerGet(url: okhttp3.HttpUrl): String? =
+        suspendCancellableCoroutine { cont ->
+            val call = http.newCall(Request.Builder().url(url).get().build())
+            call.timeout().timeout(DEEZER_CALL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            cont.invokeOnCancellation { call.cancel() }
+            call.enqueue(
+                object : Callback {
+                    override fun onFailure(call: Call, e: IOException) {
+                        if (cont.isActive) cont.resumeWith(Result.success<String?>(null))
+                    }
+
+                    override fun onResponse(call: Call, response: Response) {
+                        val body = runCatching {
+                            response.use { if (it.isSuccessful) it.body?.string() else null }
+                        }.getOrNull()
+                        if (cont.isActive) cont.resumeWith(Result.success<String?>(body))
+                    }
+                },
+            )
+        }
+
     private fun normalize(raw: String): String =
         raw.lowercase().replace(Regex("[^a-z0-9]+"), " ").trim()
 
     private companion object {
         const val TAG = "EclipseIsrcEnricher"
+
+        /** A stalled Deezer query is dropped instead of holding the Apple route. */
+        const val DEEZER_CALL_TIMEOUT_MS = 1_000L
     }
 }

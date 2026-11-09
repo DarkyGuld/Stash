@@ -242,4 +242,104 @@ class EclipseAddonMatcherTest {
 
         assertThat(best?.id).isEqualTo("plain")
     }
+
+    @Test
+    fun `YouTube presentation tags name the same take in both directions`() {
+        val taggedTitles = listOf(
+            "Blinding Lights (Official Video)",
+            "Blinding Lights [Official Music Video]",
+            "Blinding Lights (Lyric Video)",
+            "Blinding Lights (Audio)",
+            "Blinding Lights (Visualizer)",
+            "Blinding Lights (HD)",
+            "Blinding Lights - Official Video",
+            "Blinding Lights - Official Music Video HD",
+        )
+        for (tagged in taggedTitles) {
+            assertThat(EclipseAddonMatcher.best(track.copy(title = tagged), listOf(candidate(title = "Blinding Lights"))))
+                .isNotNull()
+            assertThat(EclipseAddonMatcher.best(track, listOf(candidate(title = tagged))))
+                .isNotNull()
+        }
+    }
+
+    @Test
+    fun `acoustic, re-recorded and live takes are still rejected`() {
+        for (other in listOf(
+            "Blinding Lights (Acoustic)",
+            "Blinding Lights - Acoustic",
+            "Blinding Lights (Re-Recorded)",
+            "Blinding Lights (Live)",
+            "Blinding Lights (Instrumental)",
+        )) {
+            assertThat(EclipseAddonMatcher.best(track, listOf(candidate(title = other)))).isNull()
+        }
+    }
+
+    @Test
+    fun `artist credits compare as normalized sorted sets, and a subset still matches`() {
+        val dancin = TrackEntity(
+            title = "Dancin",
+            artist = "Aaron Smith, Luvli, southstar",
+            durationMs = 173_333,
+        )
+        fun hit(artist: String) = EclipseAddonTrack(id = "c", title = "Dancin", artist = artist, duration = 173)
+
+        assertThat(EclipseAddonMatcher.best(dancin, listOf(hit("southstar & Aaron Smith")))).isNotNull()
+        assertThat(EclipseAddonMatcher.best(dancin, listOf(hit("Aaron Smith, Luvli")))).isNotNull()
+        assertThat(EclipseAddonMatcher.best(dancin, listOf(hit("Drake, Future")))).isNull()
+    }
+
+    @Test
+    fun `a namesake band never matches on a shared prefix`() {
+        assertThat(EclipseAddonMatcher.best(track, listOf(candidate(artist = "The Weeknd Tribute Band")))).isNull()
+        assertThat(EclipseAddonMatcher.best(track, listOf(candidate(artist = "Weeknd")))).isNotNull()
+    }
+
+    @Test
+    fun `a video-like row's duration is loose`() {
+        val tagged = track.copy(title = "Blinding Lights (Official Video)", durationMs = 200_000)
+        assertThat(EclipseAddonMatcher.best(tagged, listOf(candidate(duration = 260)))).isNotNull()
+
+        val omv = track.copy(musicVideoType = "OMV")
+        assertThat(EclipseAddonMatcher.best(omv, listOf(candidate(duration = 260)))).isNotNull()
+
+        val prefixed = track.copy(musicVideoType = "MUSIC_VIDEO_TYPE_UGC")
+        assertThat(EclipseAddonMatcher.best(prefixed, listOf(candidate(duration = 260)))).isNotNull()
+
+        // ATV is the studio master, so its duration is still the audio length.
+        val atv = track.copy(musicVideoType = "ATV")
+        assertThat(EclipseAddonMatcher.best(atv, listOf(candidate(duration = 260)))).isNull()
+    }
+
+    @Test
+    fun `a loose video duration still rejects a live or long edit`() {
+        val video = track.copy(title = "Blinding Lights (Official Video)", durationMs = 200_000)
+        for (other in listOf("Blinding Lights (Live)", "Blinding Lights (Extended Mix)", "Blinding Lights (Remix)")) {
+            assertThat(EclipseAddonMatcher.best(video, listOf(candidate(title = other, duration = 260)))).isNull()
+        }
+
+        // A Radio Edit keeps its 2 s rule even when the imported row is a video.
+        val edit = TrackEntity(
+            title = "Intoxicated - Radio Edit",
+            artist = "Martin Solveig",
+            durationMs = 159_560,
+            musicVideoType = "OMV",
+        )
+        assertThat(
+            EclipseAddonMatcher.best(
+                edit,
+                listOf(candidate(title = "Intoxicated", artist = "Martin Solveig", duration = 255)),
+            ),
+        ).isNull()
+
+        // A presentation tag on the edit does not hide its length from the 2 s rule.
+        val taggedEdit = edit.copy(title = "Intoxicated - Radio Edit (Official Video)")
+        assertThat(
+            EclipseAddonMatcher.best(
+                taggedEdit,
+                listOf(candidate(title = "Intoxicated", artist = "Martin Solveig", duration = 255)),
+            ),
+        ).isNull()
+    }
 }

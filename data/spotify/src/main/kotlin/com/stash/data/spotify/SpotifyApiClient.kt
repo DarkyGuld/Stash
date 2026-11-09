@@ -42,6 +42,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.net.URLEncoder
+import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -99,6 +100,9 @@ class SpotifyApiClient @Inject constructor(
 
         /** Spotify's own cap for `/v1/tracks?ids=`. */
         const val MAX_ISRC_BATCH = 50
+
+        /** A stalled ISRC lookup is dropped after this long; the caller may cancel sooner. */
+        private const val ISRC_CALL_TIMEOUT_MS = 2_000L
 
         /** Songs per `getAlbum` page: the web player's own size. */
         private const val ALBUM_TRACK_PAGE = 50
@@ -437,16 +441,23 @@ class SpotifyApiClient @Inject constructor(
             .addQueryParameter("ids", ids.joinToString(","))
             .build()
         val request = Request.Builder().url(url).header("Authorization", "Bearer $token").get().build()
-        runCatching {
-            okHttpClient.newCall(request).execute().use { response ->
-                if (response.code == 429) {
-                    val retry = response.header("Retry-After")?.toLongOrNull()
-                    return@use IsrcBatch.RateLimited(retry?.coerceAtLeast(60) ?: 3_600L)
+        try {
+            // Enqueued, not execute(): cancelling the caller cancels the HTTP call, and
+            // the per-call timeout bounds a stalled answer even without one.
+            val response = sendWithHeaders(request, ISRC_CALL_TIMEOUT_MS)
+            when {
+                response.code == 429 -> {
+                    val retry = response.retryAfter?.toLongOrNull()
+                    IsrcBatch.RateLimited(retry?.coerceAtLeast(60) ?: 3_600L)
                 }
-                if (!response.isSuccessful) return@use IsrcBatch.Failed
-                IsrcBatch.Success(parseIsrcBatch(response.body?.string().orEmpty()))
+                response.code !in 200..299 -> IsrcBatch.Failed
+                else -> IsrcBatch.Success(parseIsrcBatch(response.body.orEmpty()))
             }
-        }.getOrElse { IsrcBatch.Failed }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            IsrcBatch.Failed
+        }
     }
 
     /** One-id convenience on the batch route. Null without token/429/failure. */
@@ -1864,6 +1875,38 @@ class SpotifyApiClient @Inject constructor(
         } catch (e: Exception) {
             Log.e(TAG, "retryGraphQL: parse failed for $operationName", e)
             null
+        }
+    }
+
+    /** One enqueued answer: the status, body and the `Retry-After` header. */
+    private class HttpResponse(val code: Int, val body: String?, val retryAfter: String?)
+
+    /**
+     * [request]'s answer on OkHttp's own threads, cancelled with the caller's coroutine,
+     * body read included. [callTimeoutMs] bounds the whole call even when the caller has
+     * no timeout of its own.
+     */
+    private suspend fun sendWithHeaders(request: Request, callTimeoutMs: Long): HttpResponse {
+        val call = okHttpClient.newCall(request)
+        call.timeout().timeout(callTimeoutMs, TimeUnit.MILLISECONDS)
+        return suspendCancellableCoroutine { cont ->
+            cont.invokeOnCancellation { call.cancel() }
+            call.enqueue(
+                object : okhttp3.Callback {
+                    override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
+                        if (cont.isActive) cont.resumeWith(Result.failure(e))
+                    }
+
+                    override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                        val read = runCatching {
+                            response.use {
+                                HttpResponse(it.code, it.body?.string(), it.header("Retry-After"))
+                            }
+                        }
+                        if (cont.isActive) cont.resumeWith(read)
+                    }
+                },
+            )
         }
     }
 

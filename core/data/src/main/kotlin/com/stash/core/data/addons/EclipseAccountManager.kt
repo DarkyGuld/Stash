@@ -4,6 +4,9 @@ import com.stash.core.auth.store.EncryptedTokenStore
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 
@@ -31,6 +34,18 @@ class EclipseAccountManager @Inject constructor(
     /** The signed-in profile (email/name/id) for display; null when signed out. */
     val user: Flow<EclipseUser?> = accountPreferences.user
 
+    private val _accountGeneration = MutableStateFlow(0L)
+
+    /**
+     * Bumped when the signed-in account changes (sign in, token change, sign out).
+     * Session-only caches keyed by account observe this and start clean.
+     */
+    val accountGeneration: StateFlow<Long> = _accountGeneration.asStateFlow()
+
+    private fun accountChanged() {
+        _accountGeneration.value += 1
+    }
+
     /**
      * Signs in with email/password and stores the returned token plus profile.
      * Never throws; a failure is a typed [EclipseAuthException].
@@ -39,6 +54,7 @@ class EclipseAccountManager @Inject constructor(
         authClient.loginWithPassword(email.trim(), password).mapCatching { login ->
             tokenStore.saveEclipseToken(login.token)
             accountPreferences.saveUser(login.user)
+            accountChanged()
             login.user
         }
 
@@ -54,6 +70,7 @@ class EclipseAccountManager @Inject constructor(
             return false
         }
         tokenStore.saveEclipseToken(token)
+        accountChanged()
         refreshUser(token)
         return true
     }
@@ -78,6 +95,7 @@ class EclipseAccountManager @Inject constructor(
     suspend fun signOut() {
         tokenStore.clearEclipseToken()
         accountPreferences.clear()
+        accountChanged()
     }
 
     /**

@@ -1,6 +1,9 @@
 package com.stash.core.media.streaming
 
 import android.util.Log
+import com.stash.core.common.TrackCanonical
+import com.stash.core.common.VersionWords
+import com.stash.core.data.addons.EclipseAccountManager
 import com.stash.core.data.addons.EclipseAddon
 import com.stash.core.data.addons.EclipseAddonException
 import com.stash.core.data.addons.EclipseAddonQuery
@@ -48,9 +51,15 @@ class EclipseAddonStreamResolver private constructor(
     private val streamUrlStore: EclipseStreamUrlStore?,
     /** ISRC enrichment for Cloud's Apple route; null in hand-built tests. */
     private val isrcEnricher: EclipseIsrcEnricher?,
+    /** Account changes invalidate session-only Apple dead ids; null in hand-built tests. */
+    private val account: EclipseAccountManager?,
 ) {
     /** Apple ids that 404'd at every tier this session: never request them again. */
     private val deadAppleIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /** The addon/account epoch [deadAppleIds] belongs to. */
+    @Volatile
+    private var deadAppleEpoch: Pair<Long, Long>? = null
 
     @Inject
     constructor(
@@ -60,6 +69,7 @@ class EclipseAddonStreamResolver private constructor(
         urlCache: StreamUrlCache,
         streamUrlStore: EclipseStreamUrlStore,
         isrcEnricher: EclipseIsrcEnricher,
+        account: EclipseAccountManager,
     ) : this(
         repository,
         EclipseAddonResolveCache(),
@@ -68,15 +78,17 @@ class EclipseAddonStreamResolver private constructor(
         urlCache,
         streamUrlStore,
         isrcEnricher,
+        account,
     )
 
     /** Hand-built tests: Tidal-first, as the default switch does. */
     internal constructor(repository: EclipseAddonRepository) :
-        this(repository, EclipseAddonResolveCache(), { false }, null, null, null, null)
+        this(repository, EclipseAddonResolveCache(), { false }, null, null, null, null, null)
 
     suspend fun resolve(track: TrackEntity, speculative: Boolean = false): StreamUrl? {
         val query = "${track.artist} ${track.title}".trim()
         if (query.isEmpty()) return null
+        forgetDeadAppleIdsOnChange()
         val startedNs = System.nanoTime()
 
         val addons = enabledAddons()
@@ -99,19 +111,25 @@ class EclipseAddonStreamResolver private constructor(
 
                 // Only when the manifest advertised it: a resolve-only addon has no search.
                 if (addon.supportsSearch) {
-                    val candidates = repository.search(addon, query, SEARCH_LIMIT)
-                    val match = EclipseAddonMatcher.best(track, candidates)
-                    if (match == null && candidates.isNotEmpty()) {
-                        Log.d(
-                            TAG,
-                            "addon '${addon.name}' rejected ${candidates.size} search hit(s) for " +
-                                "'${track.title}' / '${track.artist}' / ${track.durationMs} ms",
-                        )
-                        continue
+                    // A search-only addon may need the cleaned credit variants; one that
+                    // already paid for /resolve variants keeps the single full query.
+                    val searches = if (addon.supportsResolve) listOf(query) else searchQueries(track)
+                    for (searchQuery in searches) {
+                        val candidates = repository.search(addon, searchQuery, SEARCH_LIMIT)
+                        val match = EclipseAddonMatcher.best(track, candidates)
+                        if (match == null) {
+                            if (candidates.isNotEmpty()) {
+                                Log.d(
+                                    TAG,
+                                    "addon '${addon.name}' rejected ${candidates.size} search hit(s) for " +
+                                        "'${track.title}' / '${track.artist}' / ${track.durationMs} ms",
+                                )
+                            }
+                            continue
+                        }
+                        val url = mapStream(streamWithRetry(addon, match.id)) ?: continue
+                        return served(addon, track, url, startedNs)
                     }
-                    if (match == null) continue
-                    val url = mapStream(streamWithRetry(addon, match.id)) ?: continue
-                    return served(addon, track, url, startedNs)
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -558,24 +576,8 @@ class EclipseAddonStreamResolver private constructor(
             kotlin.math.abs(track.durationMs - duration) <= STRONG_DURATION_TOLERANCE_MS
     }
 
-    /** Exact normalised artist, or every token of the shorter name present in the longer one. */
-    private fun strongArtist(a: String, b: String): Boolean {
-        val left = EclipseAddonMatcher.normalize(a)
-        val right = EclipseAddonMatcher.normalize(b)
-        if (left.isEmpty() || right.isEmpty()) return false
-        if (left == right) return true
-        // Connector words don't identify an artist: "Aaron Smith & southstar" and
-        // "Aaron Smith, Luvli, southstar" must compare on the names only.
-        val leftTokens = left.split(' ').filterNot { it in ARTIST_CONNECTORS }.toSet()
-        val rightTokens = right.split(' ').filterNot { it in ARTIST_CONNECTORS }.toSet()
-        if (leftTokens.isEmpty() || rightTokens.isEmpty()) return false
-        val (shorter, longer) = if (leftTokens.size <= rightTokens.size) {
-            leftTokens to rightTokens
-        } else {
-            rightTokens to leftTokens
-        }
-        return shorter.all { it in longer }
-    }
+    /** Normalised, sorted artist sets: the same credit list, or a subset of it. */
+    private fun strongArtist(a: String, b: String): Boolean = EclipseAddonMatcher.artistMatches(a, b)
 
     private suspend fun streamAppleWithRetry(
         addon: EclipseAddon,
@@ -641,8 +643,13 @@ class EclipseAddonStreamResolver private constructor(
                 }
             }
         }
-        deadAppleIds += appleTrackId
-        throw last ?: EclipseAddonException.HttpFailure(404)
+        val failure = last ?: EclipseAddonException.HttpFailure(404)
+        // Only a 404 means "not in this catalog". A 403 is a rights/token refusal
+        // that may clear on the next account or addon change.
+        if (failure is EclipseAddonException.HttpFailure && failure.code == 404) {
+            deadAppleIds += appleTrackId
+        }
+        throw failure
     }
 
     /**
@@ -723,6 +730,38 @@ class EclipseAddonStreamResolver private constructor(
             }
         }
         return null
+    }
+
+    /** The bounded, deduplicated catalog searches for one track: full credit first, then the cleaned variants. */
+    private fun searchQueries(track: TrackEntity): List<String> =
+        EclipseAddonQuery.variants(track.title, track.artist)
+            .asSequence()
+            .map { (title, artist) -> "$artist $title".trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .take(SEARCH_VARIANT_LIMIT)
+            .toList()
+
+    /**
+     * Drops session-only Apple negatives when the addon or account changed. A 404
+     * stays dead for the session, but a new addon/quality setting or signed-in
+     * account may reach a catalog that now answers.
+     */
+    private fun forgetDeadAppleIdsOnChange() {
+        val addonGeneration = try {
+            repository.addonGeneration.value
+        } catch (e: Exception) {
+            // Hand-built tests may not expose the flow; 0 keeps the epoch stable.
+            0L
+        }
+        val accountGeneration = try {
+            account?.accountGeneration?.value ?: 0L
+        } catch (e: Exception) {
+            0L
+        }
+        val epoch = addonGeneration to accountGeneration
+        if (deadAppleEpoch != null && deadAppleEpoch != epoch) deadAppleIds.clear()
+        deadAppleEpoch = epoch
     }
 
     /**
@@ -868,13 +907,17 @@ class EclipseAddonStreamResolver private constructor(
             urlCache: StreamUrlCache? = null,
             streamUrlStore: EclipseStreamUrlStore? = null,
             isrcEnricher: EclipseIsrcEnricher? = null,
+            account: EclipseAccountManager? = null,
         ): EclipseAddonStreamResolver =
             EclipseAddonStreamResolver(
-                repository, cache, cloudFastestSource, appleLookup, urlCache, streamUrlStore, isrcEnricher,
+                repository, cache, cloudFastestSource, appleLookup, urlCache, streamUrlStore, isrcEnricher, account,
             )
 
         private const val TAG = "EclipseAddonStreamResolver"
         private const val SEARCH_LIMIT = 25
+
+        /** Three credit variants at most: full, cleaned title/primary artist, full title/primary artist. */
+        private const val SEARCH_VARIANT_LIMIT = 3
 
         /** One retry for a 503 "preparing", as long as the addon asks (up to 8 s). */
         private const val DEFAULT_PREPARING_WAIT_SECONDS = 2
@@ -888,9 +931,6 @@ class EclipseAddonStreamResolver private constructor(
 
         /** A per-play ISRC lookup never holds the Apple stream for more than a second. */
         private const val ISRC_LOOKUP_TIMEOUT_MS = 1_000L
-
-        /** Credit connectors ignored when comparing artist names. */
-        private val ARTIST_CONNECTORS = setOf("and", "feat", "ft", "with", "the")
     }
 }
 
@@ -960,9 +1000,16 @@ private const val HLS_TTL_MS = 6 * 60 * 60_000L
  *
  * Hard rules, in order:
  *  - an ISRC match (case-insensitive) wins immediately, duration or not;
- *  - otherwise the normalised title must be identical, the artist equal or one
- *    containing the other, and the durations within 15 s;
- *  - a live/remix/instrumental marker on one side only is a different recording.
+ *  - otherwise [TrackCanonical.sameTake] says the titles name the same take. It
+ *    folds presentation tags ("(Official Video)", "(Audio)", "(HD)", the dash
+ *    forms), credits, remasters and reissues, while a performance word on one side
+ *    only (Live/Remix/Instrumental/Acoustic/re-recorded...) is a different take;
+ *  - a trailing named-version suffix may be dropped by a catalog ("Stay - Ely Oaks
+ *    Version" -> "Stay"), but never when the dropped suffix hides a performance word;
+ *  - an edit ("Radio Edit" vs "Edit") is the same file only within 2 s;
+ *  - the artist credit lists are the same set, or one is a subset of the other;
+ *  - durations are within 15 s, unless the imported row is a video upload (then its
+ *    length is not the audio length), while a live/long edit is still rejected above.
  *
  * Among the survivors the best score wins: lossless first, then bit depth and
  * sample rate, then the closest duration.
@@ -980,6 +1027,19 @@ internal object EclipseAddonMatcher {
     private const val LOSSLESS_BONUS = 100.0
     private val MARKERS = listOf("live", "remix", "instrumental")
 
+    /** Credit connectors ignored when comparing one artist name pair. */
+    private val ARTIST_CONNECTORS = setOf("and", "feat", "ft", "with", "the")
+
+    /** YouTube's presentation tags: an upload label, never another recording. */
+    private val PRESENTATION_BRACKET = Regex("""[\(\[]([^)\]]*)[\)\]]""")
+    private val PRESENTATION_DASH = Regex("""\s[-\u2013\u2014]\s.*""")
+    private val PRESENTATION_WORD = Regex(
+        """(?i)\b(?:official\s+(?:music\s+)?video|lyric\s+video|lyrics?|audio|visuali[sz]er|hd|hq|mv)\b""",
+    )
+
+    /** Music-video classifications whose length is not the studio master's length. */
+    private val VIDEO_TYPES = setOf("OMV", "UGC", "OFFICIAL_SOURCE_MUSIC")
+
     /**
      * A trailing edit marker in either spelling a catalog uses:
      * `- Radio Edit`, `(Radio Edit)`, `(Edit)`, `- Edit`. Only the label differs;
@@ -987,7 +1047,20 @@ internal object EclipseAddonMatcher {
      */
     private val EDIT_SUFFIX = Regex("(?i)\\s*[-–—]?\\s*\\(?\\s*(?:radio\\s+)?edit\\s*\\)?\\s*$")
 
-    private fun editless(raw: String): String = normalize(EDIT_SUFFIX.replace(raw, ""))
+    private fun editless(raw: String): String = normalize(EDIT_SUFFIX.replace(withoutPresentation(raw), ""))
+
+    /** Removes only the upload's presentation tags, keeping performance/version labels. */
+    private fun withoutPresentation(title: String): String {
+        val noBrackets = PRESENTATION_BRACKET.replace(title) { match ->
+            if (PRESENTATION_WORD.containsMatchIn(match.groupValues[1])) "" else match.value
+        }
+        val dash = PRESENTATION_DASH.find(noBrackets) ?: return noBrackets
+        return if (PRESENTATION_WORD.containsMatchIn(dash.value)) {
+            noBrackets.substring(0, dash.range.first)
+        } else {
+            noBrackets
+        }
+    }
 
     fun best(track: TrackEntity, candidates: List<EclipseAddonTrack>): EclipseAddonTrack? {
         val isrc = track.isrc?.trim()?.takeIf { it.isNotEmpty() }
@@ -997,36 +1070,77 @@ internal object EclipseAddonMatcher {
 
         val title = normalize(track.title)
         if (title.isEmpty()) return null
-        // A version suffix ("Stay - Ely Oaks Version") may be stripped by the
-        // catalog; the plain title is accepted as an alias. The marker check below
-        // still rejects Remix/Live/Instrumental, which are different recordings.
-        val cleanedTitle = normalize(EclipseAddonQuery.cleanedTitle(track.title))
-        val trackEditless = editless(track.title)
-        val trackMarkers = markers(track.title)
+        val looseDuration = isVideoLike(track)
 
         return candidates
             .asSequence()
             .filter { candidate -> candidate.id.isNotBlank() }
             .filter { candidate ->
-                val candidateTitle = normalize(candidate.title)
-                if (candidateTitle == title || (cleanedTitle != title && candidateTitle == cleanedTitle)) {
-                    return@filter true
-                }
+                if (!titleMatches(track.title, candidate.title)) return@filter false
+                if (!editMismatch(track.title, candidate.title)) return@filter true
                 // "Radio Edit" vs "Edit": only the same file when the length agrees.
-                trackEditless.isNotEmpty() &&
-                    editless(candidate.title) == trackEditless &&
-                    track.durationMs > 0 &&
+                track.durationMs > 0 &&
                     candidate.durationMs > 0 &&
                     kotlin.math.abs(track.durationMs - candidate.durationMs) <= EDIT_DURATION_TOLERANCE_MS
             }
-            .filter { candidate -> markers(candidate.title) == trackMarkers }
             .filter { candidate -> artistMatches(track.artist, candidate.artist) }
             .filter { candidate ->
                 val other = candidate.durationMs
-                track.durationMs <= 0 || other <= 0 || kotlin.math.abs(track.durationMs - other) <= DURATION_TOLERANCE_MS
+                track.durationMs <= 0 || other <= 0 || looseDuration ||
+                    kotlin.math.abs(track.durationMs - other) <= DURATION_TOLERANCE_MS
             }
             .maxByOrNull { score(track, it) }
     }
+
+    /**
+     * Same take by [TrackCanonical.sameTake], or the catalog's plain title when the
+     * imported row carries a named-version suffix it drops ("Stay - Ely Oaks
+     * Version"). A performance word in that suffix ("Song - Remix Version") is not
+     * an alias: the version is the recording the user imported.
+     */
+    private fun titleMatches(trackTitle: String, candidateTitle: String): Boolean {
+        if (TrackCanonical.sameTake(trackTitle, candidateTitle)) return true
+
+        // Punctuation, accents and a dash that is part of the title itself fold away;
+        // the take still has to name the same performance words on both sides.
+        val folded = normalize(trackTitle)
+        if (folded.isNotEmpty() && folded == normalize(candidateTitle) &&
+            versionWords(trackTitle) == versionWords(candidateTitle)
+        ) {
+            return true
+        }
+
+        val cleaned = EclipseAddonQuery.cleanedTitle(trackTitle)
+        if (cleaned == trackTitle) return false
+        // Only a *named* version suffix is an alias; a performance word hidden in
+        // one ("Song - Remix Version") keeps the version the user imported.
+        if (TrackCanonical.version(trackTitle, VersionWords::of).words.isNotEmpty()) return false
+        return TrackCanonical.sameTake(cleaned, candidateTitle)
+    }
+
+    private fun versionWords(title: String): Set<String> =
+        TrackCanonical.version(title, VersionWords::forCatalogMatch).words
+
+    /** One side carries an edit label the other does not: the same file only when the lengths agree. */
+    private fun editMismatch(trackTitle: String, candidateTitle: String): Boolean {
+        val trackBase = withoutPresentation(trackTitle)
+        val candidateBase = withoutPresentation(candidateTitle)
+        if (normalize(trackBase) == normalize(candidateBase)) return false
+        val wanted = editless(trackBase)
+        return wanted.isNotEmpty() && editless(candidateBase) == wanted
+    }
+
+    /** A video upload's length is the video's, not the studio recording's. */
+    private fun isVideoLike(track: TrackEntity): Boolean {
+        if (hasPresentationMarker(track.title)) return true
+        val type = track.musicVideoType?.trim()?.uppercase()
+            ?.removePrefix("MUSIC_VIDEO_TYPE_")
+            ?.takeIf { it.isNotEmpty() }
+            ?: return false
+        return type in VIDEO_TYPES
+    }
+
+    private fun hasPresentationMarker(title: String): Boolean = withoutPresentation(title) != title
 
     /** Lowercase, de-accented, punctuation-free, single-spaced; `&` reads as "and". */
     fun normalize(raw: String): String {
@@ -1040,15 +1154,32 @@ internal object EclipseAddonMatcher {
             .replace(Regex("\\s+"), " ")
     }
 
-    private fun artistMatches(a: String, b: String): Boolean {
-        val left = normalize(a)
-        val right = normalize(b)
+    /**
+     * [TrackCanonical.artist]'s normalized, sorted credit list: the same artists, or
+     * one list a subset of the other ("Aaron Smith & southstar" vs "Aaron Smith,
+     * Luvli, southstar"). Single names only fold connector words, so a namesake
+     * ("The Weeknd Tribute Band") never matches on a shared prefix.
+     */
+    internal fun artistMatches(a: String, b: String): Boolean {
+        val left = artistNames(a)
+        val right = artistNames(b)
         if (left.isEmpty() || right.isEmpty()) return false
-        if (left == right || left.contains(right) || right.contains(left)) return true
-        val leftTokens = left.split(' ').toSet()
-        val rightTokens = right.split(' ').toSet()
-        val shared = leftTokens.intersect(rightTokens)
-        return shared.isNotEmpty() && shared.size * 2 >= minOf(leftTokens.size, rightTokens.size)
+        val (shorter, longer) = if (left.size <= right.size) left to right else right to left
+        return shorter.all { name -> longer.any { sameArtistName(name, it) } }
+    }
+
+    private fun artistNames(raw: String): Set<String> =
+        TrackCanonical.artist(raw)
+            .split(", ")
+            .map(::normalize)
+            .filter { it.isNotEmpty() }
+            .toSet()
+
+    private fun sameArtistName(a: String, b: String): Boolean {
+        if (a == b) return true
+        val left = a.split(' ').filterNot { it in ARTIST_CONNECTORS }.toSet()
+        val right = b.split(' ').filterNot { it in ARTIST_CONNECTORS }.toSet()
+        return left.isNotEmpty() && left == right
     }
 
     fun markers(title: String): Set<String> {

@@ -8,11 +8,17 @@ import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.HttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.SocketPolicy
 import org.junit.After
 import org.junit.Before
 import org.junit.Test
@@ -128,5 +134,36 @@ class EclipseIsrcEnricherTest {
         val enricher = enricher()
 
         assertThat(enricher.isrcFor(track().copy(spotifyUri = null))).isNull()
+    }
+
+    @Test
+    fun `a stalled Deezer lookup stops at its per-call timeout`() = runBlocking {
+        coEvery { spotify.getTracksIsrc(any()) } returns SpotifyApiClient.IsrcBatch.Failed
+        server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
+        val started = System.nanoTime()
+
+        val result = withTimeoutOrNull(4_000) {
+            enricher().isrcFor(track().copy(spotifyUri = null, artist = "Dimitri Vegas"))
+        }
+        val tookMs = (System.nanoTime() - started) / 1_000_000
+
+        assertThat(result).isNull()
+        assertThat(tookMs).isLessThan(4_000)
+    }
+
+    @Test
+    fun `cancelling the lookup drops the in-flight Deezer request`() = runBlocking {
+        coEvery { spotify.getTracksIsrc(any()) } returns SpotifyApiClient.IsrcBatch.Failed
+        server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
+        val started = System.nanoTime()
+
+        val job = launch {
+            enricher().isrcFor(track().copy(spotifyUri = null, artist = "Dimitri Vegas"))
+        }
+        delay(200)
+        job.cancelAndJoin()
+        val tookMs = (System.nanoTime() - started) / 1_000_000
+
+        assertThat(tookMs).isLessThan(2_000)
     }
 }

@@ -874,6 +874,37 @@ class EclipseAddonStreamResolverTest {
     }
 
     @Test
+    fun `a search-only addon tries the query variants in order within the 25-hit limit`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val searchOnly = addon("search-only", resources = listOf("stream", "search"))
+        coEvery { repository.enabledNow() } returns listOf(searchOnly)
+        coEvery { repository.search(searchOnly, any(), 25) } answers {
+            if (secondArg<String>() == "Ely Oaks Stay") {
+                listOf(EclipseAddonTrack(id = "s1", title = "Stay", artist = "Ely Oaks", duration = 159))
+            } else {
+                emptyList()
+            }
+        }
+        coEvery { repository.stream(searchOnly, "s1") } returns stream()
+
+        val result = EclipseAddonStreamResolver(repository).resolve(
+            TrackEntity(
+                title = "Stay - Ely Oaks Version",
+                artist = "Ely Oaks, Misdemeanor",
+                durationMs = 159_246,
+            ),
+        )
+
+        assertThat(result).isNotNull()
+        coVerify(exactly = 1) {
+            repository.search(searchOnly, "Ely Oaks, Misdemeanor Stay - Ely Oaks Version", 25)
+        }
+        coVerify(exactly = 1) { repository.search(searchOnly, "Ely Oaks Stay", 25) }
+        // The third variant is not paid for once the second found the song.
+        coVerify(exactly = 0) { repository.search(searchOnly, "Ely Oaks Stay - Ely Oaks Version", 25) }
+    }
+
+    @Test
     fun `a version suffix and multi-artist credit fall back to the cleaned Tidal query, then cache`() = runTest {
         val repository: EclipseAddonRepository = mockk()
         val cloud = resolveOnly("eclipse-music-cloud")
@@ -1043,12 +1074,12 @@ class EclipseAddonStreamResolverTest {
         coEvery { repository.searchApple(any(), any(), any()) } returns listOf(appleHit)
         coEvery { repository.streamApple(any(), "6812560833", any()) } throws
             EclipseAddonException.HttpFailure(404)
-        coEvery { repository.streamAppleAtTier(any(), "6812560833", any(), "HI_RES") } returns stream(format = "hls")
+        coEvery { repository.streamAppleAtTier(any(), "6812560833", any(), "LOSSLESS") } returns stream(format = "hls")
 
         val result = cachedResolver(repository).resolve(track())
 
         assertThat(result).isNotNull()
-        coVerify(exactly = 1) { repository.streamAppleAtTier(any(), "6812560833", any(), "HI_RES") }
+        coVerify(exactly = 1) { repository.streamAppleAtTier(any(), "6812560833", any(), "LOSSLESS") }
     }
 
     @Test
@@ -1067,9 +1098,83 @@ class EclipseAddonStreamResolverTest {
         assertThat(resolver.resolve(track())).isNull()
         assertThat(resolver.resolve(track())).isNull()
 
-        // Four tiers on the first play (one primary + three fallbacks); the dead id is filtered on the second.
+        // Two tiers on the first play (one primary + LOSSLESS); the dead id is filtered on the second.
         coVerify(exactly = 1) { repository.streamApple(any(), "6812560833", any()) }
-        coVerify(exactly = 3) { repository.streamAppleAtTier(any(), "6812560833", any(), any()) }
+        coVerify(exactly = 1) { repository.streamAppleAtTier(any(), "6812560833", any(), any()) }
+    }
+
+    @Test
+    fun `an Apple id that 403s is retried on the next play`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        coEvery { repository.resolve(cloud, any(), any(), any(), any()) } returns null
+        coEvery { repository.searchApple(cloud, any(), any()) } returns listOf(appleHit)
+        coEvery { repository.streamApple(cloud, "6812560833", any()) } throws
+            EclipseAddonException.HttpFailure(403)
+        coEvery { repository.streamAppleAtTier(cloud, any(), any(), any()) } throws
+            EclipseAddonException.HttpFailure(403)
+        val resolver = cachedResolver(repository)
+
+        assertThat(resolver.resolve(track())).isNull()
+        assertThat(resolver.resolve(track())).isNull()
+
+        // A rights refusal is not a permanent 404: the next play asks again.
+        coVerify(exactly = 2) { repository.streamApple(cloud, "6812560833", any()) }
+    }
+
+    @Test
+    fun `a dead Apple id from a 404 is retried after an addon change`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        val generation = kotlinx.coroutines.flow.MutableStateFlow(0L)
+        every { repository.addonGeneration } returns generation
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        coEvery { repository.resolve(cloud, any(), any(), any(), any()) } returns null
+        coEvery { repository.searchApple(cloud, any(), any()) } returns listOf(appleHit)
+        coEvery { repository.streamApple(cloud, "6812560833", any()) } throws
+            EclipseAddonException.HttpFailure(404)
+        coEvery { repository.streamAppleAtTier(cloud, any(), any(), any()) } throws
+            EclipseAddonException.HttpFailure(404)
+        val resolver = cachedResolver(repository)
+
+        assertThat(resolver.resolve(track())).isNull()
+        assertThat(resolver.resolve(track())).isNull() // the dead id is filtered
+        generation.value = 1L // an addon/quality setting changed
+        assertThat(resolver.resolve(track())).isNull()
+
+        // Once per play that was allowed to request the id; the filtered play was not.
+        coVerify(exactly = 2) { repository.streamApple(cloud, "6812560833", any()) }
+    }
+
+    @Test
+    fun `a dead Apple id from a 404 is retried after the account changes`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        val addonGeneration = kotlinx.coroutines.flow.MutableStateFlow(0L)
+        val accountFlow = kotlinx.coroutines.flow.MutableStateFlow(0L)
+        val account: com.stash.core.data.addons.EclipseAccountManager = mockk()
+        every { account.accountGeneration } returns accountFlow
+        every { repository.addonGeneration } returns addonGeneration
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        coEvery { repository.resolve(cloud, any(), any(), any(), any()) } returns null
+        coEvery { repository.searchApple(cloud, any(), any()) } returns listOf(appleHit)
+        coEvery { repository.streamApple(cloud, "6812560833", any()) } throws
+            EclipseAddonException.HttpFailure(404)
+        coEvery { repository.streamAppleAtTier(cloud, any(), any(), any()) } throws
+            EclipseAddonException.HttpFailure(404)
+        val resolver = EclipseAddonStreamResolver.forTest(
+            repository,
+            EclipseAddonResolveCache(),
+            account = account,
+        )
+
+        assertThat(resolver.resolve(track())).isNull()
+        assertThat(resolver.resolve(track())).isNull()
+        accountFlow.value = 1L
+        assertThat(resolver.resolve(track())).isNull()
+
+        coVerify(exactly = 2) { repository.streamApple(cloud, "6812560833", any()) }
     }
 
     @Test
