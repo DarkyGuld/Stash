@@ -6,14 +6,13 @@ import com.stash.core.data.lossless.LosslessUpgrader
 import com.stash.core.data.repository.MusicRepository
 import com.stash.core.data.social.LikeCoordinator
 import com.stash.core.media.PlayerRepository
-import com.stash.core.model.PlaybackSource
 import com.stash.core.model.PlayerState
 import com.stash.core.model.Track
 import com.stash.data.lyrics.LyricsRepository
+import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
-import io.mockk.slot
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -31,9 +30,10 @@ import org.junit.Before
 import org.junit.Test
 
 /**
- * Spotify song radio: a finite "Inspired by" queue, separate from the radio station. The source is
- * faked here, so no test touches the network; the ViewModel's job is only to prepend the current
- * song, call `setQueue` once, and explain an empty/no-match answer without touching the queue.
+ * Spotify song radio: a finite "Inspired by" mix saved as a real playlist, separate from the
+ * radio station. The source is faked here, so no test touches the network; the ViewModel's job is
+ * only to prepend the current song, create the playlist once, open it, and explain an empty/no-match
+ * answer without touching the queue.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class NowPlayingViewModelSpotifyRadioTest {
@@ -55,6 +55,7 @@ class NowPlayingViewModelSpotifyRadioTest {
         every { observeTrackById(any()) } returns flowOf(null)
         every { observeTrackByYoutubeId(any()) } returns flowOf(null)
         every { getUserCreatedPlaylists() } returns flowOf(emptyList())
+        coEvery { createPlaylistWithTracks(any(), any()) } returns 555L
     }
     private val likeCoordinator: LikeCoordinator = mockk(relaxed = true) {
         every { mirrorFailures } returns MutableSharedFlow()
@@ -85,20 +86,22 @@ class NowPlayingViewModelSpotifyRadioTest {
         )
     }
 
-    @Test fun `a ready mix queues the current song first, then the finite mix, with the Spotify label`() =
+    @Test fun `a ready mix opens a playlist with the current song first and the finite mix`() =
         runTest(dispatcher) {
             val source = FakeSource(SpotifyRadioMix.Ready(mix))
             val vm = vm(source)
             advanceUntilIdle()
 
-            vm.startSpotifyRadioFromCurrent()
-            advanceUntilIdle()
+            vm.openPlaylist.test {
+                vm.startSpotifyRadioFromCurrent()
+                advanceUntilIdle()
+                assertEquals(555L, awaitItem())
+            }
 
-            val tracks = slot<List<Track>>()
-            val playbackSource = slot<PlaybackSource>()
-            coVerify(exactly = 1) { playerRepository.setQueue(capture(tracks), 0, capture(playbackSource)) }
-            assertEquals(listOf(current) + mix, tracks.captured)
-            assertEquals(PlaybackSource.Radio("Spotify · song"), playbackSource.captured)
+            coVerify(exactly = 1) {
+                musicRepository.createPlaylistWithTracks("song Radio", listOf(7L, 101L, 102L))
+            }
+            coVerify(exactly = 0) { playerRepository.setQueue(any(), any(), any()) }
             assertEquals(1, source.calls)
             assertEquals(false, vm.spotifyRadioStarting.value)
         }
@@ -114,6 +117,7 @@ class NowPlayingViewModelSpotifyRadioTest {
         }
 
         coVerify(exactly = 0) { playerRepository.setQueue(any(), any(), any()) }
+        coVerify(exactly = 0) { musicRepository.createPlaylistWithTracks(any(), any()) }
         assertEquals(false, vm.spotifyRadioStarting.value)
     }
 
@@ -128,6 +132,7 @@ class NowPlayingViewModelSpotifyRadioTest {
         }
 
         coVerify(exactly = 0) { playerRepository.setQueue(any(), any(), any()) }
+        coVerify(exactly = 0) { musicRepository.createPlaylistWithTracks(any(), any()) }
     }
 
     @Test fun `a double tap starts one lookup`() = runTest(dispatcher) {
@@ -142,7 +147,8 @@ class NowPlayingViewModelSpotifyRadioTest {
         advanceUntilIdle()
 
         assertEquals(1, source.calls)
-        coVerify(exactly = 1) { playerRepository.setQueue(any(), any(), any()) }
+        coVerify(exactly = 1) { musicRepository.createPlaylistWithTracks(any(), any()) }
+        coVerify(exactly = 0) { playerRepository.setQueue(any(), any(), any()) }
     }
 
     private class FakeSource(

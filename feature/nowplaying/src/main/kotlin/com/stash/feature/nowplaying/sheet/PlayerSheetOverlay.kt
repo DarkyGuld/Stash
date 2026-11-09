@@ -83,6 +83,8 @@ fun PlayerSheetOverlay(
     onNavigateToAlbum: (albumId: String, name: String, artUrl: String?, artistName: String) -> Unit,
     /** "Find a better match": open Failed Matches on this (just flagged) song, its finder searching. */
     onFixMatch: (trackId: Long) -> Unit,
+    /** Spotify radio: open the playlist the mix was saved as. */
+    onOpenPlaylist: (playlistId: Long) -> Unit,
     modifier: Modifier = Modifier,
     viewModel: NowPlayingViewModel = hiltViewModel(),
 ) {
@@ -129,6 +131,7 @@ fun PlayerSheetOverlay(
                     onNavigateToArtist = onNavigateToArtist,
                     onNavigateToAlbum = onNavigateToAlbum,
                     onFixMatch = onFixMatch,
+                    onOpenPlaylist = onOpenPlaylist,
                     viewModel = viewModel,
                     sheet = state,
                 )

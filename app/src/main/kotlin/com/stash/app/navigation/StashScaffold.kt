@@ -539,6 +539,12 @@ fun StashScaffold(
                 popUpTo<FailedMatchesRoute> { inclusive = true }
             }
         },
+        // Spotify radio lives in a real playlist: collapse the player and open it, the way the
+        // artist/album jumps above do. The playlist page's play button starts the radio.
+        onOpenPlaylist = { playlistId ->
+            playerSheet.collapse()
+            navController.navigate(PlaylistDetailRoute(playlistId))
+        },
     )
 
     // Above the player too: a heads-up shows over Now Playing, above the system bar there, and

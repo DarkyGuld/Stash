@@ -161,6 +161,7 @@ fun NowPlayingScreen(
     onNavigateToArtist: (id: String, name: String, avatarUrl: String?, focusAlbum: String?) -> Unit,
     onNavigateToAlbum: (albumId: String, name: String, artUrl: String?, artistName: String) -> Unit,
     onFixMatch: (trackId: Long) -> Unit,
+    onOpenPlaylist: (playlistId: Long) -> Unit,
     viewModel: NowPlayingViewModel = hiltViewModel(),
     sheet: PlayerSheetState? = null,
 ) {
@@ -404,6 +405,12 @@ fun NowPlayingScreen(
     // flag lands in milliseconds.
     LaunchedEffect(Unit) {
         viewModel.matchFixEvents.collect { trackId -> onFixMatch(trackId) }
+    }
+
+    // Spotify radio: the mix is saved as a playlist, then this opens it behind the player. The
+    // scaffold collapses the sheet before navigating, so the playlist is not hidden by it.
+    LaunchedEffect(viewModel) {
+        viewModel.openPlaylist.collect { playlistId -> onOpenPlaylist(playlistId) }
     }
 
     // TalkBack: when the player settles open, focus moves to its Dismiss button, so the reader

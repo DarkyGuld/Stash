@@ -421,14 +421,22 @@ class NowPlayingViewModel @Inject constructor(
     val spotifyRadioStarting: StateFlow<Boolean> = _spotifyRadioStarting.asStateFlow()
 
     /**
-     * Play Spotify's "Inspired by" mix for the current song as an ordinary finite queue: the
-     * playing song first, the mix after it. This is deliberately not [startRadioFromCurrent]: no
-     * station is built, nothing grows, and the Radio button's state is untouched. The resolver
-     * works off the main thread; only the final [com.stash.core.media.PlayerRepository.setQueue]
-     * changes what is playing. A song with no Spotify match, or a mix that comes back empty,
-     * leaves the current queue exactly as it was and says why.
+     * One-shot: open the local playlist built for a Spotify song radio. Emitted after the mix has
+     * been saved as a real playlist, so Now Playing can collapse and the playlist page can open.
+     * `extraBufferCapacity = 1` as for [matchFixEvents].
+     */
+    private val _openPlaylist = MutableSharedFlow<Long>(extraBufferCapacity = 1)
+    val openPlaylist: SharedFlow<Long> = _openPlaylist.asSharedFlow()
+
+    /**
+     * Open Spotify's "Inspired by" mix for the current song as a real playlist: the playing song
+     * first, the mix after it. This is deliberately not [startRadioFromCurrent]: no station is
+     * built, nothing grows, and the Radio button's state is untouched. The current audio keeps
+     * playing; the playlist page is where the listener starts it.
      *
-     * The guard is set synchronously so a double tap in one frame can't start two lookups.
+     * A song with no Spotify match, or a mix that comes back empty, leaves everything alone and
+     * says why. The guard is set synchronously so a double tap in one frame can't start two
+     * lookups.
      */
     fun startSpotifyRadioFromCurrent() {
         if (_spotifyRadioStarting.value) return
@@ -445,11 +453,37 @@ class NowPlayingViewModel @Inject constructor(
                         _userMessages.tryEmit("Spotify radio needs a Spotify match for this song")
                     SpotifyRadioMix.Unavailable ->
                         _userMessages.tryEmit("Spotify radio is unavailable for this song")
-                    is SpotifyRadioMix.Ready -> playerRepository.setQueue(
-                        tracks = listOf(current) + mix.tracks,
-                        startIndex = 0,
-                        source = com.stash.core.model.PlaybackSource.Radio("Spotify · ${current.title}"),
-                    )
+                    is SpotifyRadioMix.Ready -> {
+                        val name = "${current.title} Radio"
+                        // Repeat taps reopen the same radio playlist instead of filling the
+                        // library with identical snapshots.
+                        val existing = musicRepository.getUserCreatedPlaylists()
+                            .firstOrNull()
+                            ?.firstOrNull { it.name == name }
+                        if (existing != null) {
+                            _openPlaylist.emit(existing.id)
+                            return@launch
+                        }
+                        val currentId = if (current.id > 0L) {
+                            current.id
+                        } else {
+                            musicRepository.ensureTrackPersisted(current)
+                        }
+                        val trackIds = buildList {
+                            add(currentId)
+                            for (track in mix.tracks) {
+                                if (track.id > 0L && track.id != currentId && track.id !in this) {
+                                    add(track.id)
+                                }
+                            }
+                        }
+                        val playlistId = musicRepository.createPlaylistWithTracks(name, trackIds)
+                        if (playlistId <= 0L) {
+                            _userMessages.tryEmit("Spotify radio is unavailable for this song")
+                        } else {
+                            _openPlaylist.emit(playlistId)
+                        }
+                    }
                 }
             } catch (e: CancellationException) {
                 throw e
