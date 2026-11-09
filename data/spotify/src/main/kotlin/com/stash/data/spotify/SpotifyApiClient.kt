@@ -4,6 +4,7 @@ import android.util.Log
 import com.stash.core.auth.TokenManager
 import com.stash.core.auth.model.UserInfo
 import com.stash.core.auth.spotify.SpotifyAuthConfig
+import com.stash.core.common.ArtUrlUpgrader
 import com.stash.core.model.Track
 import com.stash.core.auth.spotify.SpotifyAuthManager
 import com.stash.data.spotify.model.SpotifyAlbum
@@ -103,6 +104,22 @@ class SpotifyApiClient @Inject constructor(
 
         /** A stalled ISRC lookup is dropped after this long; the caller may cancel sooner. */
         private const val ISRC_CALL_TIMEOUT_MS = 2_000L
+
+        /** Spotify's "Inspired by" mix endpoint, the web player's own source for song radio. */
+        private const val INSPIRED_BY_ENDPOINT =
+            "https://spclient.wg.spotify.com/inspiredby-mix/v2/seed_to_playlist"
+
+        /** A stalled seed lookup is dropped after this long; cancellation also drops the call. */
+        private const val INSPIRED_BY_CALL_TIMEOUT_MS = 3_000L
+
+        /** A resolved playlist URI stays fresh for a day: the mix is stable per seed. */
+        internal const val INSPIRED_BY_POSITIVE_TTL_MS = 24L * 60 * 60 * 1000
+
+        /** A miss is retried after ten minutes: a 204/404 may be a transient rollout gap. */
+        internal const val INSPIRED_BY_NEGATIVE_TTL_MS = 10L * 60 * 1000
+
+        /** Bound on the seed -> playlist URI LRU. */
+        internal const val INSPIRED_BY_CACHE_MAX_ENTRIES = 64
 
         /** Songs per `getAlbum` page: the web player's own size. */
         private const val ALBUM_TRACK_PAGE = 50
@@ -412,6 +429,44 @@ class SpotifyApiClient @Inject constructor(
         }
     }
 
+    // ── Inspired by cache ───────────────────────────────────────────────
+
+    /** One seed answer: [playlistUri] null means "no mix". Guarded by [inspiredByCacheLock]. */
+    private data class InspiredByCacheEntry(val playlistUri: String?, val expiresAtMillis: Long)
+
+    /**
+     * Bounded LRU of seed URI -> inspired-by playlist URI. Access-ordered so a
+     * long radio walk evicts the least recently used seed, never growing past
+     * [INSPIRED_BY_CACHE_MAX_ENTRIES]. Positives outlive negatives by design
+     * (see [INSPIRED_BY_POSITIVE_TTL_MS]).
+     */
+    private val inspiredByCache =
+        object : LinkedHashMap<String, InspiredByCacheEntry>(16, 0.75f, true) {
+            override fun removeEldestEntry(
+                eldest: MutableMap.MutableEntry<String, InspiredByCacheEntry>,
+            ): Boolean = size > INSPIRED_BY_CACHE_MAX_ENTRIES
+        }
+
+    /** Guards [inspiredByCache]. */
+    private val inspiredByCacheLock = Any()
+
+    private fun getInspiredByCache(key: String): InspiredByCacheEntry? = synchronized(inspiredByCacheLock) {
+        val entry = inspiredByCache[key] ?: return@synchronized null
+        if (entry.expiresAtMillis <= System.currentTimeMillis()) {
+            inspiredByCache.remove(key)
+            null
+        } else {
+            entry
+        }
+    }
+
+    private fun putInspiredByCache(key: String, playlistUri: String?) {
+        val ttl = if (playlistUri != null) INSPIRED_BY_POSITIVE_TTL_MS else INSPIRED_BY_NEGATIVE_TTL_MS
+        synchronized(inspiredByCacheLock) {
+            inspiredByCache[key] = InspiredByCacheEntry(playlistUri, System.currentTimeMillis() + ttl)
+        }
+    }
+
     // ── Public API ──────────────────────────────────────────────────────
 
     /**
@@ -706,6 +761,141 @@ class SpotifyApiClient @Inject constructor(
             if (e is kotlinx.coroutines.CancellationException) throw e
             return SyncResult.Error("getPlaylistTracks failed: ${e.message}", cause = e)
         }
+    }
+
+    // ── Inspired by (song radio source) ─────────────────────────────────
+
+    /**
+     * The playlist Spotify's web player uses for song radio: its "Inspired by"
+     * mix for [seedUri]. The seed is a `spotify:track:…` URI; the answer's
+     * `mediaItems[0].uri` must be a playlist URI, anything else is a miss.
+     *
+     * The same `spclient` endpoint and web-player headers as the web player,
+     * sent on OkHttp's threads so cancelling the caller drops the call. A
+     * missing token, an empty answer, 204, 404, a non-playlist URI or any
+     * failure is null. Answers are cached per seed: a hit for
+     * [INSPIRED_BY_POSITIVE_TTL_MS], a miss for
+     * [INSPIRED_BY_NEGATIVE_TTL_MS], in a bounded LRU. Never logs the seed URI
+     * or a token.
+     */
+    suspend fun inspiredByPlaylistUri(seedUri: String): String? = withContext(Dispatchers.IO) {
+        val seed = seedUri.trim()
+        if (!isSeedUri(seed)) return@withContext null
+
+        getInspiredByCache(seed)?.let { entry ->
+            Log.d(TAG, "inspiredByPlaylistUri: outcome=${if (entry.playlistUri != null) "cache-hit" else "cache-miss"}")
+            return@withContext entry.playlistUri
+        }
+
+        try {
+            val accessToken = tokenManager.getSpotifyAccessToken()
+            if (accessToken == null) {
+                Log.d(TAG, "inspiredByPlaylistUri: outcome=no-access-token")
+                putInspiredByCache(seed, null)
+                return@withContext null
+            }
+            val clientToken = ensureClientToken()
+            if (clientToken == null) {
+                Log.d(TAG, "inspiredByPlaylistUri: outcome=no-client-token")
+                putInspiredByCache(seed, null)
+                return@withContext null
+            }
+
+            val url = "$INSPIRED_BY_ENDPOINT/$seed".toHttpUrlOrNull()
+                ?.newBuilder()
+                ?.addQueryParameter("response-format", "json")
+                ?.build()
+            if (url == null) {
+                putInspiredByCache(seed, null)
+                return@withContext null
+            }
+
+            val request = Request.Builder()
+                .url(url)
+                .get()
+                .header("Authorization", "Bearer $accessToken")
+                .header("Client-Token", clientToken)
+                .header("App-Platform", "WebPlayer")
+                .header("Spotify-App-Version", spotifyAuthManager.getClientVersion())
+                .header("Origin", "https://open.spotify.com/")
+                .header("Referer", "https://open.spotify.com/")
+                .header(
+                    "User-Agent",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+                        "(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+                )
+                .build()
+
+            val response = sendWithHeaders(request, INSPIRED_BY_CALL_TIMEOUT_MS)
+            val playlistUri = when {
+                response.code == 200 -> parseInspiredByPlaylistUri(response.body)
+                else -> null
+            }
+            putInspiredByCache(seed, playlistUri)
+            Log.d(
+                TAG,
+                "inspiredByPlaylistUri: outcome=${if (playlistUri != null) "found" else "no-playlist"}" +
+                    " (HTTP ${response.code})",
+            )
+            playlistUri
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.d(TAG, "inspiredByPlaylistUri: outcome=error")
+            putInspiredByCache(seed, null)
+            null
+        }
+    }
+
+    /**
+     * The first [limit] songs of Spotify's "Inspired by" mix for [seedUri],
+     * ready to queue: title, artist, album, duration, Spotify URI and artwork,
+     * no audio. Fetches the mix through [inspiredByPlaylistUri], then reads it
+     * with the existing [getPlaylistTracks] walk (Web API, GraphQL fallback), so
+     * no GraphQL is duplicated here. The seed track is left out by URI; an
+     * unresolved mix or a failed playlist read is an empty list.
+     */
+    suspend fun inspiredByTracks(seedUri: String, limit: Int = 50): List<Track> =
+        withContext(Dispatchers.IO) {
+            if (limit <= 0) return@withContext emptyList()
+            val playlistUri = inspiredByPlaylistUri(seedUri) ?: return@withContext emptyList()
+            val playlistId = playlistUri.removePrefix("spotify:playlist:")
+            if (playlistId == playlistUri || playlistId.isBlank()) return@withContext emptyList()
+
+            val fetched = getPlaylistTracks(playlistId)
+            val items = (fetched as? SyncResult.Success)?.data?.tracks ?: return@withContext emptyList()
+            val seed = seedUri.trim()
+
+            items.asSequence()
+                .mapNotNull { it.track }
+                .filter { it.uri.isNotBlank() && it.uri != seed }
+                .mapNotNull { it.toInspiredTrack() }
+                .take(limit)
+                .toList()
+        }
+
+    /** A seed URI safe to append as one path segment: Spotify URI shape, no separators. */
+    private fun isSeedUri(seed: String): Boolean =
+        seed.startsWith("spotify:") &&
+            seed.none { it.isWhitespace() || it == '/' || it == '?' || it == '#' || it == '%' }
+
+    /** Maps a playlist entry to a queueable [Track]; no file/audio, id 0. */
+    private fun SpotifyTrackObject.toInspiredTrack(): Track? {
+        if (id.isBlank() || name.isBlank()) return null
+        val artistNames = artists.map { it.name.trim() }.filter { it.isNotEmpty() }
+        if (artistNames.isEmpty()) return null
+        return Track(
+            id = 0,
+            title = name,
+            artist = artistNames.joinToString(", "),
+            album = album?.name.orEmpty(),
+            durationMs = duration_ms,
+            spotifyUri = uri.takeIf { it.isNotBlank() },
+            albumArtUrl = ArtUrlUpgrader.upgrade(album?.images?.firstOrNull()?.url),
+            isrc = isrc,
+            explicit = explicit,
+            dateAdded = 0,
+        )
     }
 
     /**
