@@ -6,7 +6,12 @@ import io.mockk.every
 import io.mockk.mockk
 import io.mockk.verify
 import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class StreamCachePolicyTest {
@@ -63,6 +68,40 @@ class StreamCachePolicyTest {
 
         verify(exactly = 1) { cache.removeResource("p1") }
         assertEquals(1, policy.counters().pinnedEvictions)
+    }
+
+    /**
+     * Regression: Media3 calls onSpanAdded/onStartFile while holding SimpleCache's lock.
+     * setMaxBytes() runs on another thread and calls back into Cache.cacheSpace. A blocking
+     * policy lock inverted those two locks and ANR'd the main thread during startup/sync.
+     */
+    @Test
+    fun `a cache callback never blocks behind a resize holding the policy lock`() {
+        val cache = mockk<Cache>()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        every { cache.cacheSpace } answers {
+            if (Thread.currentThread().name == "resize") {
+                entered.countDown()
+                release.await(5, TimeUnit.SECONDS)
+            }
+            StreamCachePolicy.MB * 200
+        }
+        every { cache.keys } returns emptySet()
+        every { cache.getCachedSpans(any()) } returns sortedSetOf()
+        every { cache.removeResource(any()) } answers { }
+        val policy = StreamCachePolicy()
+
+        val resize = thread(name = "resize") { policy.setMaxBytes(100 * StreamCachePolicy.MB, cache) }
+        assertTrue("resize never reached cacheSpace", entered.await(2, TimeUnit.SECONDS))
+
+        val callback = thread(name = "callback") { policy.onSpanAdded(cache, span("x", 1)) }
+        callback.join(1_000)
+        assertFalse("onSpanAdded must not block on the policy lock", callback.isAlive)
+
+        release.countDown()
+        resize.join(2_000)
+        assertFalse("resize did not finish", resize.isAlive)
     }
 
     @Test

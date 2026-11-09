@@ -374,12 +374,14 @@ class SettingsViewModel @Inject constructor(
     val streamCacheBytes: StateFlow<Long> = _streamCacheBytes
 
     fun refreshStreamCacheSize() {
-        _streamCacheBytes.value = streamCacheMaintenance.sizeBytes()
+        viewModelScope.launch(Dispatchers.IO) {
+            _streamCacheBytes.value = streamCacheMaintenance.sizeBytes()
+        }
     }
 
     /** Clears every cached stream URL: memory, disk, HLS/segments/first chunks. */
     fun onClearStreamCache() {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             streamCacheMaintenance.clearAll()
             _streamCacheBytes.value = streamCacheMaintenance.sizeBytes()
         }
@@ -404,7 +406,7 @@ class SettingsViewModel @Inject constructor(
     )
 
     fun onStreamCacheSizeChanged(mb: Int) {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             streamingPreference.setStreamCacheSizeMb(mb)
             streamCacheMaintenance.setMaxBytes(mb * com.stash.core.media.streaming.StreamCachePolicy.MB)
             _streamCacheBytes.value = streamCacheMaintenance.sizeBytes()
@@ -477,7 +479,7 @@ class SettingsViewModel @Inject constructor(
 
     /** Stores a pasted Eclipse account token; blank clears it. Never logs or echoes it. */
     fun onEclipseTokenCommitted(raw: String) {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             eclipseAccountManager.saveToken(raw)
             // A different account: drop the URLs/Apple ids resolved under the old one.
             runCatching { streamCacheMaintenance.clearAll() }
@@ -543,7 +545,7 @@ class SettingsViewModel @Inject constructor(
 
     /** Forgets the Eclipse token and profile. */
     fun onEclipseSignOut() {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             eclipseAccountManager.signOut()
             // Account-bound caches must not outlive the account.
             runCatching { streamCacheMaintenance.clearAll() }
