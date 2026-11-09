@@ -287,8 +287,7 @@ class ArtistProfileViewModel @Inject constructor(
 
             // Popular is always YT-sourced (real videoIds), so keying on
             // videoId is safe here.
-            val popularTracks = state.popular
-                .filter { seen.add(trackKey(it)) }
+            val popularTracks = dedupedPopular(state, seen)
                 .map { it.toDomainTrack(albumFallback = artistName) }
 
             if (popularTracks.isEmpty() && state.albums.isEmpty() && state.singles.isEmpty()) {
@@ -337,10 +336,53 @@ class ArtistProfileViewModel @Inject constructor(
         }
     }
 
+    /**
+     * Play the Popular shelf starting at [tapped].
+     *
+     * A Popular row is a plain [TrackItem], not a queue: playing it through
+     * the preview path left the timeline with a single item, so Next and
+     * swipe-to-skip were disabled. Here the whole deduped Popular list becomes
+     * the queue — using the same [dedupedPopular] / [setQueue] path as
+     * [playArtist] — and playback starts on the row the user tapped. A row
+     * that isn't in the deduped list (shouldn't happen, but the profile can
+     * refresh between tap and dispatch) starts the shelf from its first track.
+     */
+    fun playPopular(tapped: TrackItem) {
+        viewModelScope.launch {
+            val state = _uiState.value
+            val popular = dedupedPopular(state)
+            if (popular.isEmpty()) {
+                _userMessages.emit("No tracks available for this artist")
+                return@launch
+            }
+
+            val tappedKey = trackKey(tapped.videoId, tapped.title, tapped.artist)
+            val startIndex = popular
+                .indexOfFirst { trackKey(it) == tappedKey }
+                .coerceAtLeast(0)
+
+            playerRepository.setQueue(
+                popular.map { it.toDomainTrack(albumFallback = state.hero.name) },
+                startIndex = startIndex,
+            )
+        }
+    }
+
+    /** Deduped Popular rows, shared by [playArtist] and [playPopular].
+     *  [seen] lets [playArtist] keep de-duping album tracks against Popular. */
+    private fun dedupedPopular(
+        state: ArtistProfileUiState,
+        seen: MutableSet<String> = mutableSetOf(),
+    ): List<TrackSummary> = state.popular.filter { seen.add(trackKey(it)) }
+
     /** Dedup key for the catalog fill: videoId when present (YT), else a
      *  title|artist identity (Qobuz tracks all carry a blank videoId). */
     private fun trackKey(t: TrackSummary): String =
-        t.videoId.ifBlank { "${t.title}|${t.artist}" }
+        trackKey(t.videoId, t.title, t.artist)
+
+    /** The same identity for a row that arrived as a [TrackItem]. */
+    private fun trackKey(videoId: String, title: String, artist: String): String =
+        videoId.ifBlank { "$title|$artist" }
 
     /** Build a domain [Track] for a catalog track, branching on the album's
      *  source. Qobuz → no videoId, id=0 (a real PK is assigned by

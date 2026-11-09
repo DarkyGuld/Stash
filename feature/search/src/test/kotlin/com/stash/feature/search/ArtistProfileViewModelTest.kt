@@ -11,6 +11,7 @@ import com.stash.core.media.PlayerRepository
 import com.stash.core.media.actions.TrackActionsDelegate
 import com.stash.core.media.preview.PreviewState
 import com.stash.core.model.Track
+import com.stash.core.model.TrackItem
 import com.stash.data.ytmusic.model.AlbumDetail
 import com.stash.data.ytmusic.model.AlbumSummary
 import com.stash.data.ytmusic.model.ArtistAbout
@@ -627,6 +628,116 @@ class ArtistProfileViewModelTest {
         // gated and the prior fill job was cancelled before it could append.
         verify(player, org.mockito.kotlin.times(2)).setQueue(any(), eq(0), any())
         verify(player, never()).addToQueue(any<List<Track>>())
+    }
+
+    @Test
+    fun `playPopular queues the full deduped shelf and starts on the tapped row`() = runTest {
+        val profile = ArtistProfile(
+            id = "UC1",
+            name = "A",
+            avatarUrl = null,
+            subscribersText = null,
+            popular = listOf(t("v1"), t("v2"), t("v3")),
+            albums = emptyList(),
+            singles = emptyList(),
+            related = emptyList(),
+        )
+        val cache = mock<ArtistCache>()
+        whenever(cache.get(eq("UC1"), eq(false))).thenReturn(flowOf(CachedProfile.Fresh(profile)))
+        val player = mock<PlayerRepository>()
+        val vm = vmWith(cache = cache, playerRepository = player)
+        advanceUntilIdle()
+
+        vm.playPopular(TrackItem(videoId = "v2", title = "t", artist = "a", durationSeconds = 0.0, thumbnailUrl = null))
+        advanceUntilIdle()
+
+        // The queue is the whole Popular shelf (so Next/swipe have somewhere
+        // to go), starting at the row the user tapped — not a one-item preview.
+        val tracksCaptor = argumentCaptor<List<Track>>()
+        val startCaptor = argumentCaptor<Int>()
+        verify(player).setQueue(tracksCaptor.capture(), startCaptor.capture(), any())
+        assertEquals(listOf("v1", "v2", "v3"), tracksCaptor.firstValue.map { it.youtubeId })
+        assertEquals(1, startCaptor.firstValue)
+    }
+
+    @Test
+    fun `playPopular maps the tapped row to its post-dedup index`() = runTest {
+        val profile = ArtistProfile(
+            id = "UC1",
+            name = "A",
+            avatarUrl = null,
+            subscribersText = null,
+            // v1 is listed twice: the queue holds it once, so v2 is index 1.
+            popular = listOf(t("v1"), t("v1"), t("v2")),
+            albums = emptyList(),
+            singles = emptyList(),
+            related = emptyList(),
+        )
+        val cache = mock<ArtistCache>()
+        whenever(cache.get(eq("UC1"), eq(false))).thenReturn(flowOf(CachedProfile.Fresh(profile)))
+        val player = mock<PlayerRepository>()
+        val vm = vmWith(cache = cache, playerRepository = player)
+        advanceUntilIdle()
+
+        vm.playPopular(TrackItem(videoId = "v2", title = "t", artist = "a", durationSeconds = 0.0, thumbnailUrl = null))
+        advanceUntilIdle()
+
+        val tracksCaptor = argumentCaptor<List<Track>>()
+        val startCaptor = argumentCaptor<Int>()
+        verify(player).setQueue(tracksCaptor.capture(), startCaptor.capture(), any())
+        assertEquals(listOf("v1", "v2"), tracksCaptor.firstValue.map { it.youtubeId })
+        assertEquals(1, startCaptor.firstValue)
+    }
+
+    @Test
+    fun `playPopular falls back to the first track when the tapped row is not in the deduped shelf`() = runTest {
+        val profile = ArtistProfile(
+            id = "UC1",
+            name = "A",
+            avatarUrl = null,
+            subscribersText = null,
+            popular = listOf(t("v1"), t("v2")),
+            albums = emptyList(),
+            singles = emptyList(),
+            related = emptyList(),
+        )
+        val cache = mock<ArtistCache>()
+        whenever(cache.get(eq("UC1"), eq(false))).thenReturn(flowOf(CachedProfile.Fresh(profile)))
+        val player = mock<PlayerRepository>()
+        val vm = vmWith(cache = cache, playerRepository = player)
+        advanceUntilIdle()
+
+        vm.playPopular(TrackItem(videoId = "gone", title = "t", artist = "a", durationSeconds = 0.0, thumbnailUrl = null))
+        advanceUntilIdle()
+
+        verify(player).setQueue(any<List<Track>>(), eq(0), any())
+    }
+
+    @Test
+    fun `playPopular emits the empty-shelf message and queues nothing`() = runTest {
+        val profile = ArtistProfile(
+            id = "UC1",
+            name = "A",
+            avatarUrl = null,
+            subscribersText = null,
+            popular = emptyList(),
+            albums = emptyList(),
+            singles = emptyList(),
+            related = emptyList(),
+        )
+        val cache = mock<ArtistCache>()
+        whenever(cache.get(eq("UC1"), eq(false))).thenReturn(flowOf(CachedProfile.Fresh(profile)))
+        val player = mock<PlayerRepository>()
+        val vm = vmWith(cache = cache, playerRepository = player)
+        advanceUntilIdle()
+
+        vm.userMessages.test {
+            vm.playPopular(TrackItem(videoId = "v1", title = "t", artist = "a", durationSeconds = 0.0, thumbnailUrl = null))
+            advanceUntilIdle()
+            assertEquals("No tracks available for this artist", awaitItem())
+            cancelAndIgnoreRemainingEvents()
+        }
+        verify(player, never()).setQueue(any(), any(), any())
     }
 
     private fun t(id: String) = TrackSummary(
