@@ -59,6 +59,19 @@ class SpotifyApiException(
     message: String,
 ) : Exception(message)
 
+/** One Canvas lookup outcome: a URL, a genuine "no Canvas", or a transient failure. */
+sealed interface CanvasLookup {
+    data class Found(val url: String) : CanvasLookup
+    data object NoCanvas : CanvasLookup
+    data object TransientFailure : CanvasLookup
+}
+
+/** A `searchDesktop` result plus whether the request/parse failed rather than returning nothing. */
+internal data class TrackSearchOutcome(
+    val candidates: List<SpotifyTrackCandidate>,
+    val failed: Boolean,
+)
+
 /**
  * High-level client for Spotify data access using a TWO-PRONGED approach:
  *
@@ -1338,26 +1351,37 @@ class SpotifyApiClient @Inject constructor(
      * public API — so the caller treats an empty list as "no candidates".
      */
     suspend fun searchTracksGraphQL(query: String, limit: Int = 10): List<SpotifyTrackCandidate> =
-        withContext(Dispatchers.IO) {
-            val variables = buildJsonObject {
-                put("searchTerm", query)
-                put("offset", 0)
-                put("limit", limit)
-                put("numberOfTopResults", 5)
-                put("includeAudiobooks", false)
-                put("includePreReleases", false)
-            }.toString()
+        searchTracksGraphQLOutcome(query, limit).candidates
 
-            val responseJson = executeGraphQL(
-                operationName = "searchDesktop",
-                variables = variables,
-                seedHash = SpotifyAuthConfig.HASH_SEARCH_DESKTOP,
-            ) ?: return@withContext emptyList<SpotifyTrackCandidate>()
+    /**
+     * [searchTracksGraphQL] with a failure flag. A transient GraphQL/HTTP/parse
+     * failure and a genuine empty result both yield no candidates, but callers
+     * that cache negatives (Canvas) must only cache the latter.
+     */
+    internal suspend fun searchTracksGraphQLOutcome(
+        query: String,
+        limit: Int = 10,
+    ): TrackSearchOutcome = withContext(Dispatchers.IO) {
+        val variables = buildJsonObject {
+            put("searchTerm", query)
+            put("offset", 0)
+            put("limit", limit)
+            put("numberOfTopResults", 5)
+            put("includeAudiobooks", false)
+            put("includePreReleases", false)
+        }.toString()
 
-            parseSearchDesktop(responseJson).also {
-                Log.d(TAG, "searchTracksGraphQL: parsed ${it.size} candidates for '$query'")
-            }
-        }
+        val responseJson = executeGraphQL(
+            operationName = "searchDesktop",
+            variables = variables,
+            seedHash = SpotifyAuthConfig.HASH_SEARCH_DESKTOP,
+        ) ?: return@withContext TrackSearchOutcome(emptyList(), failed = true)
+
+        val parsed = parseSearchDesktopOrNull(responseJson)
+            ?: return@withContext TrackSearchOutcome(emptyList(), failed = true)
+        Log.d(TAG, "searchTracksGraphQL: parsed ${parsed.size} candidates for '$query'")
+        TrackSearchOutcome(parsed, failed = false)
+    }
 
     /**
      * Parse a `searchDesktop` GraphQL response into [SpotifyTrackCandidate]s.
@@ -1368,9 +1392,10 @@ class SpotifyApiClient @Inject constructor(
      *  - `data.searchV2.tracksV2.items[].item.data`   (newer web-player hash)
      * Track fields: { uri, name, artists.items[].profile.name,
      * duration.totalMilliseconds, album|albumOfTrack.name, contentRating.label }.
-     * Null-safe at every hop so a schema tweak yields an empty list, never a crash.
+     * Null-safe at every hop so a schema tweak yields null (a failure/unknown
+     * response), never a crash.
      */
-    private fun parseSearchDesktop(root: JsonObject): List<SpotifyTrackCandidate> {
+    private fun parseSearchDesktopOrNull(root: JsonObject): List<SpotifyTrackCandidate>? {
         return try {
             val data = root["data"]?.jsonObject
             val items = data?.get("search")?.jsonObject
@@ -1382,7 +1407,7 @@ class SpotifyApiClient @Inject constructor(
                 ?: run {
                     Log.w(TAG, "parseSearchDesktop: no tracks container, " +
                         "data keys=${data?.keys}")
-                    return emptyList()
+                    return null
                 }
 
             items.mapNotNull { itemEl ->
@@ -1430,78 +1455,129 @@ class SpotifyApiClient @Inject constructor(
             }
         } catch (e: Exception) {
             Log.w(TAG, "parseSearchDesktop: parse failed: ${e.message}")
-            emptyList()
+            null
         }
     }
 
     /**
      * The Spotify Canvas video URL for [track], or null when there is none.
      *
-     * Uses [Track.spotifyUri] when it holds a track URI. Without one it asks
-     * `searchDesktop` for "[title] [artist]" and accepts only an unambiguous,
-     * normalized exact title + artist match (length within two seconds when
-     * both are known): a missing Canvas is invisible, a wrong one is not.
+     * [canvasLookup] carries the third state this convenience form cannot:
+     * [CanvasLookup.TransientFailure] means the answer is unknown, so a caller
+     * with a persisted negative cache must not write one.
+     */
+    suspend fun canvasUrl(track: Track): String? =
+        when (val lookup = canvasLookup(track)) {
+            is CanvasLookup.Found -> lookup.url
+            CanvasLookup.NoCanvas, CanvasLookup.TransientFailure -> null
+        }
+
+    /**
+     * The Canvas lookup for [track], distinguishing a genuine miss from a
+     * transient search/GraphQL failure.
+     *
+     * Uses [Track.spotifyUri] when it holds a track URI. Without one it tries
+     * the query variants from [SpotifyCanvas.searchQueries] (raw, parsed
+     * YouTube title+artist, title+primary artist, title only), merging
+     * candidates by id and stopping at the first unambiguous recording
+     * ([SpotifyCanvas.exactCandidate]). A failed variant does not let the
+     * result be cached as "no Canvas": the match may have been in the answer
+     * that never arrived.
      *
      * The Pathfinder `canvas` answer is read as `data.trackUnion.canvas`;
      * only an http(s) MP4 URL (or an explicit `video/mp4` type) is returned.
      * A URL-less `fileId` answer is a miss for now (no spclient fallback).
      *
-     * Positive answers are cached for [SpotifyCanvas.POSITIVE_TTL_MS], negative
-     * ones for [SpotifyCanvas.NEGATIVE_TTL_MS], in a bounded LRU keyed by the
-     * track URI or normalized title+artist. Never throws; logs only the
-     * operation outcome, never a URL or token.
+     * Positive answers are cached for [SpotifyCanvas.POSITIVE_TTL_MS], genuine
+     * misses for [SpotifyCanvas.NEGATIVE_TTL_MS], in a bounded LRU keyed by
+     * the track URI or normalized title+artist. Never throws; the debug line
+     * carries title/artist/duration, candidate count and a rejection reason,
+     * never a URL, URI, id or token.
      */
-    suspend fun canvasUrl(track: Track): String? = withContext(Dispatchers.IO) {
+    suspend fun canvasLookup(track: Track): CanvasLookup = withContext(Dispatchers.IO) {
         try {
             val key = SpotifyCanvas.cacheKey(track)
             if (key != null) {
                 getCanvasCache(key)?.let { entry ->
                     Log.d(TAG, "canvasUrl: outcome=${if (entry.url != null) "cache-hit" else "cache-miss"}")
-                    return@withContext entry.url
+                    return@withContext entry.url?.let { CanvasLookup.Found(it) } ?: CanvasLookup.NoCanvas
                 }
             }
 
-            val trackUri = SpotifyCanvas.trackUri(track.spotifyUri) ?: run {
-                val query = listOf(track.title, track.artist)
-                    .map { it.trim() }
-                    .filter { it.isNotEmpty() }
-                    .joinToString(" ")
-                if (query.isEmpty()) return@withContext null
+            var trackUri = SpotifyCanvas.trackUri(track.spotifyUri)
+            if (trackUri == null) {
+                val queries = SpotifyCanvas.searchQueries(track)
+                if (queries.isEmpty()) {
+                    Log.d(TAG, "canvasUrl: outcome=no-query")
+                    return@withContext CanvasLookup.NoCanvas
+                }
 
-                val exact = SpotifyCanvas.exactCandidate(
-                    track,
-                    searchTracksGraphQL(query, limit = 10),
+                val merged = LinkedHashMap<String, SpotifyTrackCandidate>()
+                var searchFailed = false
+                var reason = "no-candidates"
+                var match: SpotifyTrackCandidate? = null
+
+                for (query in queries) {
+                    val outcome = searchTracksGraphQLOutcome(query, limit = 10)
+                    if (outcome.failed) {
+                        searchFailed = true
+                        Log.d(TAG, "canvasUrl: search variant failed")
+                        continue
+                    }
+                    outcome.candidates.forEach { candidate -> merged.putIfAbsent(candidate.id, candidate) }
+
+                    val attempt = SpotifyCanvas.pickCandidate(track, merged.values.toList())
+                    reason = attempt.reason
+                    if (attempt.candidate != null) {
+                        match = attempt.candidate
+                        break
+                    }
+                }
+
+                Log.d(
+                    TAG,
+                    "canvasUrl: search title='${track.title}' artist='${track.artist}' " +
+                        "durationMs=${track.durationMs} variants=${queries.size} " +
+                        "candidates=${merged.size} reason=${if (match != null) "matched" else reason}",
                 )
-                if (exact == null) {
+
+                if (match == null) {
+                    // A failed variant makes "nothing matched" unknown, not a miss.
+                    if (searchFailed) {
+                        Log.d(TAG, "canvasUrl: outcome=search-failed")
+                        return@withContext CanvasLookup.TransientFailure
+                    }
                     if (key != null) putCanvasCache(key, null)
-                    Log.d(TAG, "canvasUrl: outcome=no-exact-track")
-                    return@withContext null
+                    Log.d(TAG, "canvasUrl: outcome=no-match")
+                    return@withContext CanvasLookup.NoCanvas
                 }
-                "spotify:track:${exact.id}"
+                trackUri = "spotify:track:${match.id}"
             }
+
+            val resolvedTrackUri = trackUri ?: return@withContext CanvasLookup.NoCanvas
 
             val response = executeGraphQL(
                 operationName = "canvas",
-                variables = buildJsonObject { put("trackUri", trackUri) }.toString(),
+                variables = buildJsonObject { put("trackUri", resolvedTrackUri) }.toString(),
                 seedHash = SpotifyAuthConfig.HASH_CANVAS,
             )
             if (response == null) {
                 // A failed request is not a "no Canvas" answer; let it retry next time.
                 Log.d(TAG, "canvasUrl: outcome=request-failed")
-                return@withContext null
+                return@withContext CanvasLookup.TransientFailure
             }
 
             val url = SpotifyCanvas.parseUrl(response)
-            val uriKey = "uri:$trackUri"
+            val uriKey = "uri:$resolvedTrackUri"
             putCanvasCache(uriKey, url)
             if (key != null && key != uriKey) putCanvasCache(key, url)
             Log.d(TAG, "canvasUrl: outcome=${if (url != null) "found" else "no-canvas"}")
-            url
+            if (url != null) CanvasLookup.Found(url) else CanvasLookup.NoCanvas
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
             Log.w(TAG, "canvasUrl: outcome=error")
-            null
+            CanvasLookup.TransientFailure
         }
     }
 

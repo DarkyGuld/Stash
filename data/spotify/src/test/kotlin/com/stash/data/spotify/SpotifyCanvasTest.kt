@@ -10,6 +10,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
@@ -17,6 +18,7 @@ import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -65,11 +67,20 @@ class SpotifyCanvasTest {
     }
 
     private fun searchAnswer(name: String, artist: String, durationMs: Long): String =
+        searchAnswer(name, listOf(artist), durationMs)
+
+    private fun searchAnswer(name: String, artists: List<String>, durationMs: Long): String =
         """{"data":{"search":{"tracks":{"items":[{"track":{
             "uri":"spotify:track:good","name":"$name",
-            "artists":{"items":[{"profile":{"name":"$artist"}}]},
+            "artists":{"items":[${artists.joinToString(",") { "{\"profile\":{\"name\":\"$it\"}}" }}]},
             "duration":{"totalMilliseconds":$durationMs}
         }}]}}}}"""
+
+    private fun emptySearchAnswer(): String =
+        """{"data":{"search":{"tracks":{"items":[]}}}}"""
+
+    private fun searchTerm(variables: String): String =
+        Json.parseToJsonElement(variables).jsonObject["searchTerm"]!!.jsonPrimitive.content
 
     private fun track(
         title: String,
@@ -139,7 +150,7 @@ class SpotifyCanvasTest {
         assertEquals(b, SpotifyCanvas.parseUrl(json(canvasAnswer(b))))
     }
 
-    // ── Exact-match rejection ──────────────────────────────────────────
+    // ── Recording match ────────────────────────────────────────────────
 
     @Test
     fun `an exact title artist and length match is accepted`() {
@@ -151,32 +162,149 @@ class SpotifyCanvasTest {
     }
 
     @Test
-    fun `normalized punctuation and split artist credits still match exactly`() {
-        val accepted = SpotifyCanvas.exactCandidate(
-            track("Don't Stop!", "A, B", 180_000),
-            listOf(candidate("good", "Dont Stop", listOf("A", "B"), 180_000)),
+    fun `official video audio and remaster tags are presentation only`() {
+        assertEquals(
+            "video",
+            SpotifyCanvas.exactCandidate(
+                track("Song (Official Video)", "Artist"),
+                listOf(candidate("video", "Song", listOf("Artist"))),
+            )?.id,
         )
-        assertNull(accepted)
-        val samePunctuation = SpotifyCanvas.exactCandidate(
-            track("Don't Stop!", "A, B", 180_000),
-            listOf(candidate("good", "DON'T STOP", listOf("A", "B"), 180_000)),
+        assertEquals(
+            "audio",
+            SpotifyCanvas.exactCandidate(
+                track("Song [Audio]", "Artist"),
+                listOf(candidate("audio", "Song", listOf("Artist"))),
+            )?.id,
         )
-        assertEquals("good", samePunctuation?.id)
+        assertEquals(
+            "remaster",
+            SpotifyCanvas.exactCandidate(
+                track("Song - Remastered 2011", "Artist"),
+                listOf(candidate("remaster", "Song", listOf("Artist"))),
+            )?.id,
+        )
+        assertEquals(
+            "candidateRemaster",
+            SpotifyCanvas.exactCandidate(
+                track("Song", "Artist"),
+                listOf(candidate("candidateRemaster", "Song (Remastered 2011)", listOf("Artist"))),
+            )?.id,
+        )
     }
 
     @Test
-    fun `a near-miss title is rejected`() {
-        assertNull(
+    fun `a performance version the track does not name is rejected`() {
+        val plain = track("Song", "Artist")
+        listOf("Live", "Remix", "Acoustic", "Instrumental", "Sped Up", "Karaoke", "Cover", "Demo")
+            .forEach { version ->
+                assertNull(
+                    version,
+                    SpotifyCanvas.exactCandidate(
+                        plain,
+                        listOf(candidate(version, "Song ($version)", listOf("Artist"))),
+                    ),
+                )
+            }
+    }
+
+    @Test
+    fun `a performance version both sides name is accepted`() {
+        assertEquals(
+            "live",
             SpotifyCanvas.exactCandidate(
-                track("Song", "Artist"),
+                track("Song - Live", "Artist"),
                 listOf(candidate("live", "Song (Live)", listOf("Artist"))),
-            ),
+            )?.id,
         )
-        assertNull(
+        assertEquals(
+            "acoustic",
             SpotifyCanvas.exactCandidate(
-                track("Song", "Artist"),
-                listOf(candidate("remaster", "Song - Remastered", listOf("Artist"))),
-            ),
+                track("Song (Acoustic)", "Artist"),
+                listOf(candidate("acoustic", "Song - Acoustic", listOf("Artist"))),
+            )?.id,
+        )
+    }
+
+    @Test
+    fun `apostrophes and accents are folded`() {
+        assertEquals(
+            "ascii",
+            SpotifyCanvas.exactCandidate(
+                track("Don't Stop", "Beyoncé"),
+                listOf(candidate("ascii", "Dont Stop", listOf("Beyonce"))),
+            )?.id,
+        )
+        assertEquals(
+            "typographic",
+            SpotifyCanvas.exactCandidate(
+                track("Don’t Stop", "Café"),
+                listOf(candidate("typographic", "DON'T STOP", listOf("Cafe"))),
+            )?.id,
+        )
+    }
+
+    @Test
+    fun `ampersand and and slash artist credits compare as the same acts`() {
+        assertEquals(
+            "amp",
+            SpotifyCanvas.exactCandidate(
+                track("Song", "A & B"),
+                listOf(candidate("amp", "Song", listOf("A", "B"))),
+            )?.id,
+        )
+        assertEquals(
+            "joined",
+            SpotifyCanvas.exactCandidate(
+                track("Song", "A, B"),
+                listOf(candidate("joined", "Song", listOf("A & B"))),
+            )?.id,
+        )
+        assertEquals(
+            "slash",
+            SpotifyCanvas.exactCandidate(
+                track("Song", "A/B"),
+                listOf(candidate("slash", "Song", listOf("A", "B"))),
+            )?.id,
+        )
+        assertEquals(
+            "and",
+            SpotifyCanvas.exactCandidate(
+                track("Song", "A and B"),
+                listOf(candidate("and", "Song", listOf("A", "B"))),
+            )?.id,
+        )
+        assertEquals(
+            "allowlisted",
+            SpotifyCanvas.exactCandidate(
+                track("Song", "Earth, Wind & Fire"),
+                listOf(candidate("allowlisted", "Song", listOf("Earth, Wind & Fire"))),
+            )?.id,
+        )
+    }
+
+    @Test
+    fun `VEVO topic and official channel names are cleaned`() {
+        assertEquals(
+            "vevo",
+            SpotifyCanvas.exactCandidate(
+                track("Song", "ArtistVEVO"),
+                listOf(candidate("vevo", "Song", listOf("Artist"))),
+            )?.id,
+        )
+        assertEquals(
+            "topic",
+            SpotifyCanvas.exactCandidate(
+                track("Song", "Artist - Topic"),
+                listOf(candidate("topic", "Song", listOf("Artist"))),
+            )?.id,
+        )
+        assertEquals(
+            "official",
+            SpotifyCanvas.exactCandidate(
+                track("Song", "Artist Official"),
+                listOf(candidate("official", "Song", listOf("Artist"))),
+            )?.id,
         )
     }
 
@@ -197,11 +325,28 @@ class SpotifyCanvasTest {
     }
 
     @Test
-    fun `a length more than two seconds away is rejected, unknown lengths pass`() {
+    fun `a different title is rejected`() {
+        assertNull(
+            SpotifyCanvas.exactCandidate(
+                track("Song", "Artist"),
+                listOf(candidate("other", "Another Song", listOf("Artist"))),
+            ),
+        )
+    }
+
+    @Test
+    fun `lengths within ten seconds pass and unknown lengths pass`() {
+        assertEquals(
+            "padded",
+            SpotifyCanvas.exactCandidate(
+                track("Song", "Artist", 180_000),
+                listOf(candidate("padded", "Song", listOf("Artist"), 189_000)),
+            )?.id,
+        )
         assertNull(
             SpotifyCanvas.exactCandidate(
                 track("Song", "Artist", 180_000),
-                listOf(candidate("long", "Song", listOf("Artist"), 182_001)),
+                listOf(candidate("long", "Song", listOf("Artist"), 191_000)),
             ),
         )
         assertEquals(
@@ -214,13 +359,36 @@ class SpotifyCanvasTest {
     }
 
     @Test
-    fun `two different exact ids are ambiguous and yield no canvas`() {
+    fun `duplicate masters are one recording and the closest length wins`() {
+        assertEquals(
+            "near",
+            SpotifyCanvas.exactCandidate(
+                track("Song", "Artist", 180_000),
+                listOf(
+                    candidate("far", "Song", listOf("Artist"), 181_500),
+                    candidate("near", "Song - Remastered", listOf("Artist"), 180_500),
+                ),
+            )?.id,
+        )
+    }
+
+    @Test
+    fun `distinct recordings are ambiguous and yield no canvas`() {
+        assertNull(
+            SpotifyCanvas.exactCandidate(
+                track("Song", "Artist", 180_000),
+                listOf(
+                    candidate("one", "Song", listOf("Artist"), 175_000),
+                    candidate("two", "Song", listOf("Artist"), 185_000),
+                ),
+            ),
+        )
         assertNull(
             SpotifyCanvas.exactCandidate(
                 track("Song", "Artist"),
                 listOf(
-                    candidate("one", "Song", listOf("Artist")),
-                    candidate("two", "Song", listOf("Artist")),
+                    candidate("plain", "Song", listOf("Artist")),
+                    candidate("featured", "Song", listOf("Artist", "Guest")),
                 ),
             ),
         )
@@ -269,7 +437,7 @@ class SpotifyCanvasTest {
     }
 
     @Test
-    fun `a near-miss search result never asks for a canvas`() = runBlocking {
+    fun `a near-miss search result never asks for a canvas and is cached`() = runBlocking {
         val client = client { operation, _ ->
             when (operation) {
                 "searchDesktop" -> searchAnswer("Song (Live)", "Artist", 181_000)
@@ -280,8 +448,112 @@ class SpotifyCanvasTest {
         val track = track("Song", "Artist", 180_000)
 
         assertNull(client.canvasUrl(track))
+        val afterFirst = requests.size
+        assertTrue(requests.all { it.first == "searchDesktop" })
         assertNull(client.canvasUrl(track))
-        assertEquals(listOf("searchDesktop"), requests.map { it.first })
+        assertEquals(afterFirst, requests.size)
+    }
+
+    @Test
+    fun `a cleaned query variant finds the track when the raw query does not`() = runBlocking {
+        val url = "https://canvas.scdn.co/canvas/abc.mp4"
+        val client = client { operation, variables ->
+            when (operation) {
+                "searchDesktop" ->
+                    if (searchTerm(variables) == "Song Artist") searchAnswer("Song", "Artist", 180_000)
+                    else emptySearchAnswer()
+                "canvas" -> canvasAnswer(url)
+                else -> "{}"
+            }
+        }
+        val track = track("Artist - Song (Official Video)", "ArtistVEVO", 180_000)
+
+        assertEquals(url, client.canvasUrl(track))
+        assertEquals(listOf("searchDesktop", "searchDesktop", "canvas"), requests.map { it.first })
+        assertEquals(
+            listOf("Artist - Song (Official Video) ArtistVEVO", "Song Artist"),
+            requests.filter { it.first == "searchDesktop" }.map { searchTerm(it.second) },
+        )
+    }
+
+    @Test
+    fun `a title and primary artist variant finds a collaboration`() = runBlocking {
+        val url = "https://canvas.scdn.co/canvas/abc.mp4"
+        val client = client { operation, variables ->
+            when (operation) {
+                "searchDesktop" ->
+                    if (searchTerm(variables) == "Song Artist")
+                        searchAnswer("Song", listOf("Artist", "Guest"), 180_000)
+                    else emptySearchAnswer()
+                "canvas" -> canvasAnswer(url)
+                else -> "{}"
+            }
+        }
+        val track = track("Song", "Artist, Guest", 180_000)
+
+        assertEquals(url, client.canvasUrl(track))
+        assertEquals(
+            listOf("Song Artist, Guest", "Song Artist"),
+            requests.filter { it.first == "searchDesktop" }.map { searchTerm(it.second) },
+        )
+    }
+
+    @Test
+    fun `title only is the last query variant`() = runBlocking {
+        val url = "https://canvas.scdn.co/canvas/abc.mp4"
+        val client = client { operation, variables ->
+            when (operation) {
+                "searchDesktop" ->
+                    if (searchTerm(variables) == "Song") searchAnswer("Song", "Artist", 180_000)
+                    else emptySearchAnswer()
+                "canvas" -> canvasAnswer(url)
+                else -> "{}"
+            }
+        }
+
+        assertEquals(url, client.canvasUrl(track("Song", "Artist", 180_000)))
+        assertEquals(
+            listOf("Song Artist", "Song"),
+            requests.filter { it.first == "searchDesktop" }.map { searchTerm(it.second) },
+        )
+    }
+
+    @Test
+    fun `a transient search failure is not cached as a miss`() = runBlocking {
+        val client = client { operation, _ ->
+            when (operation) {
+                "searchDesktop" -> "{}"
+                "canvas" -> canvasAnswer("https://canvas.scdn.co/canvas/abc.mp4")
+                else -> "{}"
+            }
+        }
+        val track = track("Song", "Artist", 180_000)
+
+        assertEquals(CanvasLookup.TransientFailure, client.canvasLookup(track))
+        val afterFirst = requests.size
+        assertEquals(2, afterFirst)
+        assertTrue(requests.none { it.first == "canvas" })
+
+        assertEquals(CanvasLookup.TransientFailure, client.canvasLookup(track))
+        assertEquals(afterFirst * 2, requests.size)
+        assertTrue(requests.none { it.first == "canvas" })
+    }
+
+    @Test
+    fun `a genuine empty search is cached as a miss`() = runBlocking {
+        val client = client { operation, _ ->
+            when (operation) {
+                "searchDesktop" -> emptySearchAnswer()
+                else -> "{}"
+            }
+        }
+        val track = track("Song", "Artist", 180_000)
+
+        assertEquals(CanvasLookup.NoCanvas, client.canvasLookup(track))
+        val afterFirst = requests.size
+        assertTrue(afterFirst > 0)
+        assertEquals(CanvasLookup.NoCanvas, client.canvasLookup(track))
+        assertEquals(afterFirst, requests.size)
     }
 
     @Test
