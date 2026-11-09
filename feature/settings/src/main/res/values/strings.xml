@@ -497,6 +497,13 @@
     <string name="settings_addon_add">Add</string>
     <string name="settings_addon_adding">Adding…</string>
     <string name="settings_addon_remove">Remove addon</string>
+    <string name="settings_addon_copy_url">Copy addon URL</string>
+    <string name="settings_addon_url_clip_label">Addon URL</string>
+    <string name="settings_addon_url_copied">Addon URL copied</string>
+    <string name="settings_addon_copy_url_warning_title">Copy addon URL?</string>
+    <string name="settings_addon_copy_url_warning_body">This addon URL contains a private token. Copy it?</string>
+    <string name="settings_addon_copy_url_confirm">Copy</string>
+    <string name="settings_addon_copy_url_cancel">Cancel</string>
     <string name="settings_addon_move_up">Move up</string>
     <string name="settings_addon_move_down">Move down</string>
     <string name="settings_addon_enabled">Enabled</string>

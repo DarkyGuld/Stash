@@ -1,7 +1,10 @@
 package com.stash.feature.settings
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
 import android.net.Uri
+import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.expandVertically
@@ -27,6 +30,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.rounded.ArrowDropDown
 import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.KeyboardArrowUp
@@ -713,10 +717,34 @@ private fun EclipseAddonsSection(
     onSettingChanged: (String, String, String) -> Unit,
 ) {
     val focusManager = LocalFocusManager.current
+    val context = LocalContext.current
     var draft by rememberSaveable { mutableStateOf("") }
     // The addon whose settings dialog is open (id, so a rename/reorder can't
     // point the dialog at the wrong row).
     var settingsAddonId by rememberSaveable { mutableStateOf<String?>(null) }
+    // The addon whose URL copy is waiting on the token warning (id, same
+    // reason as above).
+    var copyConfirmAddonId by rememberSaveable { mutableStateOf<String?>(null) }
+
+    // The manifest URL may carry a private token in its path or query
+    // (Nebula does), so only the explicit copy action ever puts it on the
+    // clipboard, and a token-looking URL asks first. Cloud's plain
+    // `.../manifest.json` copies straight through.
+    fun copyAddonUrl(addon: EclipseAddon) {
+        val clipboard = context.getSystemService(ClipboardManager::class.java)
+        clipboard?.setPrimaryClip(
+            ClipData.newPlainText(
+                context.getString(R.string.settings_addon_url_clip_label),
+                addon.manifestUrl,
+            ),
+        )
+        Toast.makeText(context, R.string.settings_addon_url_copied, Toast.LENGTH_SHORT).show()
+    }
+
+    fun copyNeedsWarning(addon: EclipseAddon): Boolean {
+        val uri = Uri.parse(addon.manifestUrl)
+        return uri.query != null || uri.lastPathSegment != "manifest.json"
+    }
     // The URL of the last Add attempt: the field is emptied for the request so
     // the spinner has somewhere to land, and a rejection puts the text back so
     // a typo can be fixed without pasting again.
@@ -958,6 +986,13 @@ private fun EclipseAddonsSection(
                     onToggle = { onToggle(addon.id, it) },
                     onMoveUp = { onMove(addon.id, -1) },
                     onMoveDown = { onMove(addon.id, 1) },
+                    onCopyUrl = {
+                        if (copyNeedsWarning(addon)) {
+                            copyConfirmAddonId = addon.id
+                        } else {
+                            copyAddonUrl(addon)
+                        }
+                    },
                     onRemove = { onRemove(addon.id) },
                     onOpenSettings = { settingsAddonId = addon.id },
                 )
@@ -975,6 +1010,32 @@ private fun EclipseAddonsSection(
                 onSettingChanged(settingsAddon.id, key, value)
             },
             onDismiss = { settingsAddonId = null },
+        )
+    }
+
+    // Re-read by id for the same reason as the settings dialog: a reorder
+    // between the tap and the confirm must not copy another addon's URL.
+    val copyAddon = copyConfirmAddonId?.let { id -> addons.firstOrNull { it.id == id } }
+    if (copyAddon != null) {
+        AlertDialog(
+            onDismissRequest = { copyConfirmAddonId = null },
+            title = { Text(stringResource(R.string.settings_addon_copy_url_warning_title)) },
+            text = { Text(stringResource(R.string.settings_addon_copy_url_warning_body)) },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        copyAddonUrl(copyAddon)
+                        copyConfirmAddonId = null
+                    },
+                ) {
+                    Text(stringResource(R.string.settings_addon_copy_url_confirm))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { copyConfirmAddonId = null }) {
+                    Text(stringResource(R.string.settings_addon_copy_url_cancel))
+                }
+            },
         )
     }
 }
@@ -1263,13 +1324,14 @@ private fun EclipseAddonRow(
     onToggle: (Boolean) -> Unit,
     onMoveUp: () -> Unit,
     onMoveDown: () -> Unit,
+    onCopyUrl: () -> Unit,
     onRemove: () -> Unit,
     onOpenSettings: () -> Unit,
 ) {
     val enabledLabel = stringResource(R.string.settings_addon_enabled)
     // Two lines: the name + host own the width, and the actions sit on their
-    // own row so a fourth icon (settings) can't squeeze the name on a narrow
-    // phone. The switch stays on the first line, where the eye looks.
+    // own row so the icon actions can't squeeze the name on a narrow phone.
+    // The switch stays on the first line, where the eye looks.
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -1351,6 +1413,16 @@ private fun EclipseAddonRow(
                 Icon(
                     imageVector = Icons.Rounded.KeyboardArrowDown,
                     contentDescription = stringResource(R.string.settings_addon_move_down),
+                    modifier = Modifier.size(20.dp),
+                )
+            }
+            IconButton(
+                onClick = onCopyUrl,
+                modifier = Modifier.size(40.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.ContentCopy,
+                    contentDescription = stringResource(R.string.settings_addon_copy_url),
                     modifier = Modifier.size(20.dp),
                 )
             }
