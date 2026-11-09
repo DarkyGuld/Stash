@@ -253,8 +253,14 @@ class StreamSourceRegistry internal constructor(
         // "Couldn't find this track" — see the chain loop below.
         val resolved = deferred.await()
         if (resolved == null) {
-            unavailableUntilMs[track.id] = System.currentTimeMillis() + UNAVAILABLE_TTL_MS
-            Log.i(TAG, "no source: every rung missed for ${track.id} '${track.title}'")
+            // Only a real play's miss is definitive. A speculative look-ahead can miss for
+            // reasons that say nothing about the track: it deliberately stops before Tidal,
+            // and a transient 429/timeout is not "every rung missed". Stamping here would let
+            // the background look-ahead suppress the user's tap for the full TTL.
+            if (!speculative) {
+                unavailableUntilMs[track.id] = System.currentTimeMillis() + UNAVAILABLE_TTL_MS
+                Log.i(TAG, "no source: every rung missed for ${track.id} '${track.title}'")
+            }
         } else {
             unavailableUntilMs.remove(track.id)
         }

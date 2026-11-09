@@ -623,6 +623,51 @@ class StreamSourceRegistryTest {
         coVerify(exactly = 1) { qbdlx.resolve(any()) }
     }
 
+    /**
+     * A look-ahead that misses (a transient 429/timeout, or the deliberate stop before
+     * Tidal) must not suppress the user's tap: only a real play's miss is definitive.
+     */
+    @Test
+    fun `a speculative miss does not suppress the real play`() = runTest {
+        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
+        var qbdlxCalls = 0
+        coEvery { qbdlx.resolve(any()) } answers {
+            qbdlxCalls++
+            if (qbdlxCalls == 1) null else stubStreamUrl("qbdlx")
+        }
+        coEvery { jiosaavn.resolve(any()) } returns null
+        coEvery { youtube.resolve(any(), any()) } returns null
+        val track = stubTrack()
+        val registry = registry()
+
+        // The prefetch misses first; that miss must leave no unavailable-TTL stamp.
+        assertThat(registry.resolve(track, speculative = true)).isNull()
+        // The user's tap still walks the chain and finds the source.
+        val result = registry.resolve(track)
+
+        assertThat(result!!.origin).isEqualTo("qbdlx")
+        coVerify(exactly = 2) { qbdlx.resolve(track) }
+    }
+
+    @Test
+    fun `a speculative miss does not hide a track the real play still cannot find`() = runTest {
+        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
+        coEvery { qbdlx.resolve(any()) } returns null
+        coEvery { jiosaavn.resolve(any()) } returns null
+        coEvery { youtube.resolve(any(), any()) } returns null
+        val track = stubTrack()
+        val registry = registry()
+
+        assertThat(registry.resolve(track, speculative = true)).isNull()
+        assertThat(registry.resolve(track)).isNull()
+        // The real play ran the full chain instead of taking a fast null.
+        coVerify(exactly = 2) { qbdlx.resolve(track) }
+
+        // Its own miss is definitive: the next play is short-circuited by the TTL.
+        assertThat(registry.resolve(track)).isNull()
+        coVerify(exactly = 2) { qbdlx.resolve(track) }
+    }
+
     @Test
     fun `normal foreground chain tries jiosaavn before youtube`() = runTest {        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
         coEvery { qbdlx.resolve(any()) } returns null
