@@ -12,6 +12,7 @@ import com.stash.core.data.prefs.NowPlayingAction.QUEUE
 import com.stash.core.data.prefs.NowPlayingAction.RADIO
 import com.stash.core.data.prefs.NowPlayingAction.SAVE_TO_PLAYLIST
 import com.stash.core.data.prefs.NowPlayingAction.SHARE
+import com.stash.core.data.prefs.NowPlayingAction.SPOTIFY_RADIO
 import com.stash.core.data.prefs.NowPlayingAction.STREAM_QUALITY
 import com.stash.core.data.prefs.NowPlayingAction.VIEW_ALBUM
 import org.junit.Assert.assertEquals
@@ -35,9 +36,9 @@ class NowPlayingActionsTest {
 
     // ── the default ──────────────────────────────────────────────────────────────────────────
 
-    @Test fun `default row is Radio, then the menu, then Queue`() {
-        val row = topRowActions(NowPlayingAction.DefaultPins, solo)
-        assertEquals(listOf(RADIO), row.leading)
+    @Test fun `default row is Radio, Spotify radio, then the menu, then Queue`() {
+        val row = topRowActions(NowPlayingAction.DefaultPins, ActionContext(streams = true))
+        assertEquals(listOf(RADIO, SPOTIFY_RADIO), row.leading)
         assertEquals(listOf(QUEUE), row.trailing)
     }
 
@@ -80,6 +81,7 @@ class NowPlayingActionsTest {
         assertEquals(emptyList<NowPlayingAction>(), row.trailing)
         val menu = menuActions(emptySet(), room)
         assertFalse(RADIO in menu)
+        assertFalse(SPOTIFY_RADIO in menu)
         assertFalse(QUEUE in menu)
         assertFalse(PLAYBACK_SPEED in menu)
         assertTrue(LISTEN_TOGETHER in menu)
@@ -115,6 +117,25 @@ class NowPlayingActionsTest {
         assertTrue(STREAM_QUALITY in menuActions(emptySet(), streaming.copy(inRoom = true)))
         assertTrue(STREAM_QUALITY in menuActions(emptySet(), streaming.copy(casting = true)))
         assertTrue(STREAM_QUALITY in topRowActions(setOf(STREAM_QUALITY), streaming).leading)
+    }
+
+    // ── Spotify song radio (separate from the Radio station) ─────────────────────────────────
+
+    @Test fun `Spotify radio shows only while songs stream, never in a room`() {
+        assertFalse(isActionAvailable(SPOTIFY_RADIO, solo))
+        assertTrue(isActionAvailable(SPOTIFY_RADIO, ActionContext(streams = true)))
+        assertFalse(isActionAvailable(SPOTIFY_RADIO, ActionContext(streams = true, inRoom = true)))
+        // The ordinary Radio button is untouched: still there outside a room in every mode.
+        assertTrue(isActionAvailable(RADIO, solo))
+        assertTrue(isActionAvailable(RADIO, ActionContext(streams = true)))
+    }
+
+    @Test fun `the editor keeps Spotify radio editable and says why it is hidden`() {
+        assertTrue(SPOTIFY_RADIO in editableActions(emptySet(), solo))
+        assertEquals(R.string.np_hidden_download_mode, hiddenReason(SPOTIFY_RADIO, solo))
+        assertEquals(R.string.np_hidden_together, hiddenReason(SPOTIFY_RADIO, ActionContext(inRoom = true)))
+        assertNull(hiddenReason(SPOTIFY_RADIO, ActionContext(streams = true)))
+        assertTrue(SPOTIFY_RADIO in topRowActions(setOf(SPOTIFY_RADIO), ActionContext(streams = true)).leading)
     }
 
     // ── Play on (Remote v2) ──────────────────────────────────────────────────────────────────
@@ -196,8 +217,8 @@ class NowPlayingActionsTest {
 
     @Test fun `the default row fits at 48dp on every phone`() {
         for (screen in listOf(320f, 360f, 393f)) {
-            val fit = fitTopRow(topRowActions(NowPlayingAction.DefaultPins, canCast), rowWidth(screen))
-            assertEquals(listOf(RADIO), fit.row.leading)
+            val fit = fitTopRow(topRowActions(NowPlayingAction.DefaultPins, canCast.copy(streams = true)), rowWidth(screen))
+            assertEquals(listOf(RADIO, SPOTIFY_RADIO), fit.row.leading)
             assertEquals(listOf(QUEUE), fit.row.trailing)
             assertEquals(emptyList<NowPlayingAction>(), fit.overflow)
             assertEquals(SLOT_PREFERRED_DP, fit.slotDp, 0f)

@@ -6,7 +6,10 @@ import org.junit.Test
 class NowPlayingActionTest {
 
     @Test fun `never saved reads as the default row`() {
-        assertEquals(setOf(NowPlayingAction.RADIO, NowPlayingAction.QUEUE), NowPlayingAction.parsePins(null))
+        assertEquals(
+            setOf(NowPlayingAction.RADIO, NowPlayingAction.SPOTIFY_RADIO, NowPlayingAction.QUEUE),
+            NowPlayingAction.parsePins(null),
+        )
     }
 
     @Test fun `an empty saved set stays empty - the user unpinned everything`() {
@@ -28,9 +31,14 @@ class NowPlayingActionTest {
     // ── the toggle rule ──────────────────────────────────────────────────────────────────────
 
     @Test fun `toggling pins and unpins`() {
-        assertEquals(setOf(NowPlayingAction.RADIO, NowPlayingAction.QUEUE, NowPlayingAction.SHARE),
-            NowPlayingAction.togglePin(NowPlayingAction.DefaultPins, NowPlayingAction.SHARE))
-        assertEquals(setOf(NowPlayingAction.QUEUE), NowPlayingAction.togglePin(NowPlayingAction.DefaultPins, NowPlayingAction.RADIO))
+        assertEquals(
+            setOf(NowPlayingAction.RADIO, NowPlayingAction.SPOTIFY_RADIO, NowPlayingAction.QUEUE, NowPlayingAction.SHARE),
+            NowPlayingAction.togglePin(NowPlayingAction.DefaultPins, NowPlayingAction.SHARE),
+        )
+        assertEquals(
+            setOf(NowPlayingAction.SPOTIFY_RADIO, NowPlayingAction.QUEUE),
+            NowPlayingAction.togglePin(NowPlayingAction.DefaultPins, NowPlayingAction.RADIO),
+        )
     }
 
     @Test fun `a full row refuses another pin but still unpins`() {
@@ -41,7 +49,7 @@ class NowPlayingActionTest {
 
     // ── Cast ─────────────────────────────────────────────────────────────────────────────────
 
-    @Test fun `Cast is not pinned by default - the default row is Radio, menu, Queue`() {
+    @Test fun `Cast is not pinned by default - the default row is Radio, Spotify radio, menu, Queue`() {
         assertEquals(false, NowPlayingAction.CAST in NowPlayingAction.parsePins(null))
     }
 

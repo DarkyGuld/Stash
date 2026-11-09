@@ -74,6 +74,8 @@ internal fun isActionAvailable(action: NowPlayingAction, ctx: ActionContext): Bo
 private fun isActionAvailableForAnySong(action: NowPlayingAction, ctx: ActionContext): Boolean = when (action) {
     NowPlayingAction.CAST -> (ctx.castSupported || ctx.hasBrowser) && !ctx.inRoom
     NowPlayingAction.RADIO, NowPlayingAction.QUEUE -> !ctx.inRoom
+    // Streams only: Download mode has nothing to play, and a room owns its own queue and pace.
+    NowPlayingAction.SPOTIFY_RADIO -> ctx.streams && !ctx.inRoom
     NowPlayingAction.PLAYBACK_SPEED -> !ctx.inRoom && !ctx.casting
     NowPlayingAction.POST_TO_COMMUNITY -> ctx.communityAvailable
     NowPlayingAction.STREAM_QUALITY -> ctx.streams && !ctx.onBrowser
@@ -194,6 +196,8 @@ internal fun hiddenReason(action: NowPlayingAction, ctx: ActionContext): Int? = 
     ctx.isPreview && action == NowPlayingAction.DOWNLOAD -> R.string.np_hidden_preview
     ctx.isSoundCloudSong && action == NowPlayingAction.FLAG_WRONG_MATCH -> R.string.np_hidden_soundcloud
     ctx.inRoom && action != NowPlayingAction.POST_TO_COMMUNITY -> R.string.np_hidden_together
+    // Spotify radio plays a streamed Spotify mix: nothing to build in Offline either.
+    action == NowPlayingAction.SPOTIFY_RADIO -> R.string.np_hidden_download_mode
     ctx.isScannedSong && action in SCANNED_HIDDEN -> R.string.np_hidden_scanned
     ctx.isCloudSong && action in CLOUD_HIDDEN -> R.string.np_hidden_cloud
     action == NowPlayingAction.CAST -> R.string.np_hidden_no_cast

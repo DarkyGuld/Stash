@@ -26,6 +26,7 @@ import androidx.compose.foundation.selection.toggleable
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material.icons.filled.Album
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Cast
 import androidx.compose.material.icons.filled.CastConnected
 import androidx.compose.material.icons.filled.CloseFullscreen
@@ -110,6 +111,8 @@ internal data class ActionVisualState(
      * screen (not parked under the mini player for its keep-warm span, where it costs no frames).
      */
     val radioPlaying: Boolean = false,
+    /** Spotify radio's mix is being fetched: its pin shows a spinner instead of a dead tap. */
+    val spotifyRadioStarting: Boolean = false,
 ) {
     /** How the Signal glyph shows the station: still and ink, still and accent, or breathing. */
     val radioGlyph: RadioGlyphState
@@ -140,6 +143,9 @@ internal fun actionVisual(action: NowPlayingAction, s: ActionVisualState, pinned
         },
         active = s.radioActive || s.radioTuning,
     )
+    // A different thing from Radio: a finite Spotify mix, never a station. Its own sparkle icon
+    // keeps the two apart; there is no radar sweep.
+    NowPlayingAction.SPOTIFY_RADIO -> ActionVisual(Icons.Default.AutoAwesome, "Spotify radio")
     NowPlayingAction.LYRICS -> ActionVisual(Icons.Default.Lyrics, if (s.lyricsOpen) "Hide lyrics" else "Lyrics", active = s.lyricsOpen)
     NowPlayingAction.QUEUE -> ActionVisual(Icons.AutoMirrored.Filled.QueueMusic, "Queue")
     NowPlayingAction.LISTEN_TOGETHER -> ActionVisual(
@@ -181,6 +187,7 @@ internal fun actionVisual(action: NowPlayingAction, s: ActionVisualState, pinned
 internal fun editorLabel(action: NowPlayingAction): String = when (action) {
     NowPlayingAction.CAST -> ""
     NowPlayingAction.RADIO -> "Radio"
+    NowPlayingAction.SPOTIFY_RADIO -> "Spotify radio"
     NowPlayingAction.LYRICS -> "Lyrics"
     NowPlayingAction.QUEUE -> "Queue"
     NowPlayingAction.LISTEN_TOGETHER -> "Listen together"
@@ -249,7 +256,7 @@ internal fun NowPlayingTopBar(
                 Box(Modifier.size(CAST_SLOT_DP.dp), contentAlignment = Alignment.Center) { castButton() }
                 return@forEach
             }
-            ActionSlot(action, actionVisual(action, visualState, pinned = true), slot, ink, accent, isDownloading, visualState.radioTuning, radioLock, visualState.radioGlyph, onAction)
+            ActionSlot(action, actionVisual(action, visualState, pinned = true), slot, ink, accent, isDownloading, visualState.spotifyRadioStarting, visualState.radioTuning, radioLock, visualState.radioGlyph, onAction)
         }
 
         // ⋮ — always present AND always tappable. While a download is in flight and Download is
@@ -283,12 +290,12 @@ internal fun NowPlayingTopBar(
         }
 
         row.trailing.forEach { action ->
-            ActionSlot(action, actionVisual(action, visualState, pinned = true), slot, ink, accent, isDownloading, visualState.radioTuning, radioLock, visualState.radioGlyph, onAction)
+            ActionSlot(action, actionVisual(action, visualState, pinned = true), slot, ink, accent, isDownloading, visualState.spotifyRadioStarting, visualState.radioTuning, radioLock, visualState.radioGlyph, onAction)
         }
     }
 }
 
-/** One pinned action. Radio carries its radar sweep; Download its spinner. */
+/** One pinned action. Radio carries its radar sweep; Spotify radio its build spinner; Download its spinner. */
 @Composable
 private fun ActionSlot(
     action: NowPlayingAction,
@@ -297,6 +304,7 @@ private fun ActionSlot(
     ink: Color,
     accent: Color,
     isDownloading: Boolean,
+    spotifyRadioStarting: Boolean,
     radioTuning: Boolean,
     radioLock: Boolean,
     radioGlyph: RadioGlyphState,
@@ -319,6 +327,9 @@ private fun ActionSlot(
             TopBarRadio(radioGlyph, v.label, tint, slot) { if (!radioTuning) onAction(action) }
         }
         NowPlayingAction.DOWNLOAD -> if (isDownloading) SlotSpinner(slot, ink) else {
+            TopBarIcon(v.icon, v.label, tint, slot) { onAction(action) }
+        }
+        NowPlayingAction.SPOTIFY_RADIO -> if (spotifyRadioStarting) SlotSpinner(slot, ink) else {
             TopBarIcon(v.icon, v.label, tint, slot) { onAction(action) }
         }
         else -> TopBarIcon(v.icon, v.label, tint, slot) { onAction(action) }
@@ -542,7 +553,7 @@ private fun PinEditor(
             if (pins != NowPlayingAction.DefaultPins) {
                 item(key = "reset") {
                     Box(Modifier.fillMaxWidth().animateItem().padding(top = 8.dp), contentAlignment = Alignment.Center) {
-                        TextButton(onClick = onResetPins) { Text("Reset to Radio and Queue") }
+                        TextButton(onClick = onResetPins) { Text("Reset to Radio, Spotify radio and Queue") }
                     }
                 }
             }

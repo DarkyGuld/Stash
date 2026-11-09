@@ -46,8 +46,10 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.mapNotNull
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
@@ -134,6 +136,9 @@ class NowPlayingViewModel @Inject constructor(
     private val canvasNetwork: com.stash.feature.nowplaying.canvas.CanvasNetworkGate =
         com.stash.feature.nowplaying.canvas.CanvasNetworkGate.Unrestricted,
     private val batterySaver: com.stash.core.common.power.BatterySaver = com.stash.core.common.power.BatterySaver.Off,
+    // Spotify song radio: the bounded Spotify "Inspired by" mix. Tests leave the default, which
+    // finds nothing and never touches the network.
+    private val spotifyRadioSource: SpotifyRadioSource = SpotifyRadioSource.None,
 ) : ViewModel() {
 
     /**
@@ -259,7 +264,7 @@ class NowPlayingViewModel @Inject constructor(
         viewModelScope.launch { nowPlayingPreference.togglePin(action) }
     }
 
-    /** Back to Radio · ⋮ · Queue. */
+    /** Back to Radio · Spotify radio · ⋮ · Queue. */
     fun onResetPins() {
         viewModelScope.launch { nowPlayingPreference.resetPinnedActions() }
     }
@@ -410,6 +415,51 @@ class NowPlayingViewModel @Inject constructor(
     /** True from radio tap until the station build returns (success or not). */
     private val _radioTuning = MutableStateFlow(false)
     val radioTuning: StateFlow<Boolean> = _radioTuning.asStateFlow()
+
+    /** True while a Spotify song radio's finite mix is being fetched (the pin shows a spinner). */
+    private val _spotifyRadioStarting = MutableStateFlow(false)
+    val spotifyRadioStarting: StateFlow<Boolean> = _spotifyRadioStarting.asStateFlow()
+
+    /**
+     * Play Spotify's "Inspired by" mix for the current song as an ordinary finite queue: the
+     * playing song first, the mix after it. This is deliberately not [startRadioFromCurrent]: no
+     * station is built, nothing grows, and the Radio button's state is untouched. The resolver
+     * works off the main thread; only the final [com.stash.core.media.PlayerRepository.setQueue]
+     * changes what is playing. A song with no Spotify match, or a mix that comes back empty,
+     * leaves the current queue exactly as it was and says why.
+     *
+     * The guard is set synchronously so a double tap in one frame can't start two lookups.
+     */
+    fun startSpotifyRadioFromCurrent() {
+        if (_spotifyRadioStarting.value) return
+        val playing = _uiState.value.currentTrack ?: return
+        _spotifyRadioStarting.value = true
+        viewModelScope.launch {
+            try {
+                // The player's Track can be a slim media-session reconstruction; the DB row has the
+                // Spotify identity the resolver needs. Fall back to the player's copy when there is
+                // no row (a stream, an All Songs file).
+                val current = musicRepository.observeTrackById(playing.id).firstOrNull() ?: playing
+                when (val mix = spotifyRadioSource.mix(current)) {
+                    SpotifyRadioMix.NoSpotifyMatch ->
+                        _userMessages.tryEmit("Spotify radio needs a Spotify match for this song")
+                    SpotifyRadioMix.Unavailable ->
+                        _userMessages.tryEmit("Spotify radio is unavailable for this song")
+                    is SpotifyRadioMix.Ready -> playerRepository.setQueue(
+                        tracks = listOf(current) + mix.tracks,
+                        startIndex = 0,
+                        source = com.stash.core.model.PlaybackSource.Radio("Spotify · ${current.title}"),
+                    )
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                _userMessages.tryEmit("Spotify radio is unavailable for this song")
+            } finally {
+                _spotifyRadioStarting.value = false
+            }
+        }
+    }
 
     /** Start a song radio seeded from the currently-playing track. Streaming-only;
      *  each [RadioStartResult] failure surfaces its own hint, not a dead tap. */
@@ -1093,11 +1143,17 @@ class NowPlayingViewModel @Inject constructor(
         }.launchIn(viewModelScope)
     }
 
+    /** The bounded look-ahead for the adjacent songs' Canvases; cancelled whenever the request changes. */
+    private var canvasPrefetchJob: Job? = null
+
     /**
      * Spotify Canvas (experimental): resolves the playing song's Canvas URL when, and only when, the
      * setting is on, the song is playing (not buffering), the network is unmetered and Battery Saver
-     * is off. Nothing is looked up for paused or buffered playback, and only the current song is
-     * ever asked for. A miss is remembered by the resolver, so a replay near in time is free.
+     * is off. The playing song itself is not looked up for paused or buffered playback. After that
+     * request (and while paused too), the immediate queue neighbours are warmed in the background —
+     * bounded to one each side — so a swipe has the next clip ready; the look-ahead never delays the
+     * current Canvas or the audio and is cancelled on every request change. A miss is remembered by
+     * the resolver, so a replay near in time is free.
      *
      * The resolved URL rides in [NowPlayingUiState.canvasVideo] with the song's key, so a skip can
      * never leave the previous song's video on screen.
@@ -1117,6 +1173,9 @@ class NowPlayingViewModel @Inject constructor(
         }
             .distinctUntilChanged()
             .collectLatest { request ->
+                // A skipped, paused or re-gated song cancels the look-ahead at once: its answers are
+                // for the song that is no longer coming.
+                canvasPrefetchJob?.cancel()
                 val key = request.trackKey
                 if (!request.enabled || key == null) {
                     clearCanvasVideo()
@@ -1127,22 +1186,60 @@ class NowPlayingViewModel @Inject constructor(
                     _uiState.update { it.copy(canvasVideo = null) }
                 }
                 val track = _uiState.value.currentTrack
-                if (!request.inForeground || !CanvasPlaybackRules.canResolve(
-                        enabled = request.enabled,
-                        hasTrack = track != null,
-                        playing = request.playing,
-                        buffering = request.buffering,
-                        unmetered = request.unmetered,
-                        batterySaverOn = request.batterySaverOn,
-                    )
-                ) {
-                    return@collectLatest
+                val canResolveNow = request.inForeground && CanvasPlaybackRules.canResolve(
+                    enabled = request.enabled,
+                    hasTrack = track != null,
+                    playing = request.playing,
+                    buffering = request.buffering,
+                    unmetered = request.unmetered,
+                    batterySaverOn = request.batterySaverOn,
+                )
+                if (canResolveNow && track != null && _uiState.value.canvasVideo?.trackKey != key) {
+                    val url = canvasVideoResolver.canvasUrl(track)
+                    // The song may have changed while the resolver was away: only this song's answer is kept.
+                    if (url != null && canvasTrackKey(_uiState.value.currentTrack) == key) {
+                        _uiState.update { it.copy(canvasVideo = CanvasVideo(trackKey = key, url = url)) }
+                    }
                 }
-                if (_uiState.value.canvasVideo?.trackKey == key) return@collectLatest
-                val url = canvasVideoResolver.canvasUrl(track!!)
-                // The song may have changed while the resolver was away: only this song's answer is kept.
-                if (url != null && canvasTrackKey(_uiState.value.currentTrack) == key) {
-                    _uiState.update { it.copy(canvasVideo = CanvasVideo(trackKey = key, url = url)) }
+                // After this song's own request: the look-ahead must never hold up the Canvas the
+                // listener is looking at (or the player). It also runs while paused/buffering, so
+                // a swipe from a still Canvas still finds the next clip.
+                prefetchCanvasNeighbours(key, request)
+            }
+        }
+    }
+
+    /**
+     * Warms the resolver for the songs either side of [key], so a swipe usually has the next clip
+     * ready by the time the new song starts. Bounded to the immediate queue neighbours — no queue
+     * walk — and cancelled by the next request (a skip, a pause, a network or power change). It is
+     * launched from the ViewModel scope after the current song's own answer, so it never delays the
+     * current Canvas or the audio. The resolver's own bounded in-memory cache keeps the answers,
+     * and a transient failure is not remembered as a miss (see [CanvasVideoResolver]).
+     */
+    private fun prefetchCanvasNeighbours(key: String, request: CanvasRequest) {
+        if (!request.enabled || !request.inForeground || !request.unmetered || request.batterySaverOn) {
+            return
+        }
+        canvasPrefetchJob?.cancel()
+        canvasPrefetchJob = viewModelScope.launch {
+            val state = _uiState.value
+            val index = state.currentIndex
+            val neighbours = listOfNotNull(
+                state.queue.getOrNull(index - 1),
+                state.queue.getOrNull(index + 1),
+            )
+            for (track in neighbours) {
+                if (!isActive) return@launch
+                // The listener may have skipped or left while the previous lookup was away.
+                if (canvasTrackKey(_uiState.value.currentTrack) != key) return@launch
+                try {
+                    canvasVideoResolver.canvasUrl(track)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    // A neighbour's Canvas is a bonus: a failure only leaves the swipe to fade the
+                    // ordinary cover in instead.
                 }
             }
         }

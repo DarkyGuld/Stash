@@ -264,6 +264,7 @@ fun NowPlayingScreen(
     val exportingLyricsTrackId by viewModel.exportingLyricsTrackId.collectAsStateWithLifecycle()
     val radioLabel by viewModel.radioSeedLabel.collectAsStateWithLifecycle()
     val radioTuning by viewModel.radioTuning.collectAsStateWithLifecycle()
+    val spotifyRadioStarting by viewModel.spotifyRadioStarting.collectAsStateWithLifecycle()
     // One-shot lock pulse: fires on the tuning→active transition. Also pulses
     // when the screen re-opens with a station already live — reads as "station
     // is active", not a bug. Keys on real state changes, not recomposition.
@@ -628,6 +629,22 @@ fun NowPlayingScreen(
         playWhenReady = uiState.playWhenReady,
         buffering = uiState.isBuffering,
     )
+    // Canvas wears the square art's swipe: the video follows the finger and the next song's Canvas
+    // (or the ordinary cover) takes over, while the text, progress and transport stay put. The
+    // square art's own handler stands down while Canvas is up, so a touch never skips twice.
+    val canvasSwipe = com.stash.feature.nowplaying.ui.rememberSwipeToSkip(
+        trackKey = track?.let { it.id to uiState.currentIndex },
+        enabled = canvasVisible && track != null && !isListener,
+        canNext = canSwipeNext,
+        canPrevious = canSwipePrevious,
+        onNext = viewModel::onSkipNext,
+        onPrevious = viewModel::onSwipePrevious,
+    )
+    // The Canvas clip and its scrim have already left when the new song is in. Until the swipe's
+    // entry spring settles, the ordinary cover takes the same translation/fade, so it slides in
+    // instead of popping in; a ready next Canvas uses the same content on its whole layer. Not in
+    // lyrics mode: there the cover is a shared element on its way into the header.
+    val canvasHandoff = canvasSwipe.moving.value && !canvasVisible && !reading
     // White type on a dark backdrop: full art's blend, or the Canvas' scrim.
     val darkBackdrop = fullArtDark || canvasVisible
     // The square art's pages and full art's line up (front, back, inside) when the back is known.
@@ -675,7 +692,7 @@ fun NowPlayingScreen(
     // The ⋮ row's words: where the music plays (or how a browser session stands), else "Play on".
     val castLabel = com.stash.feature.nowplaying.cast.playOnLine(playOn)
         ?: androidx.compose.ui.res.stringResource(R.string.play_on_title)
-    val visualState = remember(radioLabel != null, radioTuning, radioPlaying, reading, togetherState, playbackSpeed, isDownloaded, castConnectingTo, castingTo, castLabel) {
+    val visualState = remember(radioLabel != null, radioTuning, radioPlaying, spotifyRadioStarting, reading, togetherState, playbackSpeed, isDownloaded, castConnectingTo, castingTo, castLabel) {
         ActionVisualState(
             radioActive = radioLabel != null,
             radioTuning = radioTuning,
@@ -687,6 +704,7 @@ fun NowPlayingScreen(
             castingTo = castingTo,
             castLabel = castLabel,
             radioPlaying = radioPlaying,
+            spotifyRadioStarting = spotifyRadioStarting,
         )
     }
     // The row's width: the window less Now Playing's 24dp margins. Pins that don't fit at 44dp
@@ -707,6 +725,8 @@ fun NowPlayingScreen(
                     radioLabel != null -> viewModel.exitRadio()
                     else -> viewModel.startRadioFromCurrent()
                 }
+                // A finite Spotify mix from this song; never the station button above.
+                NowPlayingAction.SPOTIFY_RADIO -> viewModel.startSpotifyRadioFromCurrent()
                 NowPlayingAction.LYRICS -> viewModel.onToggleLyrics()
                 NowPlayingAction.QUEUE -> showQueue = true
                 // Start, or the Session sheet (invite, leave, end) once in a room.
@@ -1067,13 +1087,19 @@ fun NowPlayingScreen(
 
             // Spotify Canvas (experimental): the song's own video fills the background, under the
             // controls. It is outside full art's toggle entirely; here it is simply the backdrop.
+            // The gesture surface takes the empty screen behind the controls; the video and scrim
+            // move and fade together, so the title, progress and transport stay fixed and every
+            // button keeps its tap.
             if (canvasVisible && canvasUrl != null) {
-                com.stash.feature.nowplaying.ui.CanvasVideoLayer(
-                    url = canvasUrl,
-                    playing = canvasPlaying,
-                    onFailed = { canvasFailedUrl = canvasUrl },
-                    modifier = Modifier.fillMaxSize(),
-                )
+                Box(Modifier.fillMaxSize().then(canvasSwipe.gesture)) {
+                    com.stash.feature.nowplaying.ui.CanvasVideoLayer(
+                        url = canvasUrl,
+                        playing = canvasPlaying,
+                        onFailed = { canvasFailedUrl = canvasUrl },
+                        modifier = Modifier.fillMaxSize(),
+                        contentModifier = canvasSwipe.content,
+                    )
+                }
             }
 
             // Full art, behind the controls; it grows out of the square art and back into it.
@@ -1260,7 +1286,10 @@ fun NowPlayingScreen(
                                             .then(heroLayer(isCurrentMode = !reading, cornerDp = PlayerSheetMath.HERO_ART_CORNER_DP))
                                             // Full art draws the art while it's out (it grew from here);
                                             // Canvas hides the square so its video can fill the screen.
-                                            .graphicsLayer { alpha = if (canvasVisible || (fullArt.grow.value > 0f && fullArt.ready)) 0f else 1f },
+                                            .graphicsLayer { alpha = if (canvasVisible || (fullArt.grow.value > 0f && fullArt.ready)) 0f else 1f }
+                                            // A Canvas swipe's incoming cover enters with the same
+                                            // translation/fade (see canvasHandoff).
+                                            .then(if (canvasHandoff) canvasSwipe.content else Modifier),
                                         contentAlignment = Alignment.Center,
                                     ) {
                                         // Swipe for the next / previous song, double-tap a side to seek
@@ -1270,6 +1299,9 @@ fun NowPlayingScreen(
                                         SwipeableArt(
                                             trackKey = track?.let { it.id to uiState.currentIndex },
                                             gesturesEnabled = track != null && !isListener,
+                                            // Under Canvas the square is hidden and the video's own
+                                            // swipe owns the touch: no second skip, no hidden flips.
+                                            interactive = !canvasVisible,
                                             canNext = canSwipeNext,
                                             canPrevious = canSwipePrevious,
                                             canSeek = uiState.durationMs > 0L,

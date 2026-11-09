@@ -12,11 +12,17 @@ package com.stash.core.data.prefs
 enum class NowPlayingAction {
     /**
      * Play on a Cast speaker. First, so a pinned Cast sits where the automatic button used to,
-     * left of Radio. Not in [DefaultPins]: the default row is Radio · ⋮ · Queue, with Cast a
-     * ⋮ menu row until the user pins it.
+     * left of Radio. Not in [DefaultPins]: the default row is Radio · Spotify radio · ⋮ · Queue,
+     * with Cast a ⋮ menu row until the user pins it.
      */
     CAST,
     RADIO,
+    /**
+     * A finite queue from Spotify's "Inspired by" mix for this song, seeded by the playing track.
+     * Separate from [RADIO]: it never builds a station, grows, or takes over the Radio button.
+     * Only while songs stream: Download mode has nothing to play.
+     */
+    SPOTIFY_RADIO,
     LYRICS,
     QUEUE,
     LISTEN_TOGETHER,
@@ -35,12 +41,12 @@ enum class NowPlayingAction {
     ;
 
     companion object {
-        /** A fresh install's top row: Radio · ⋮ · Queue. */
-        val DefaultPins: Set<NowPlayingAction> = setOf(RADIO, QUEUE)
+        /** A fresh install's top row: Radio · Spotify radio · ⋮ · Queue. */
+        val DefaultPins: Set<NowPlayingAction> = setOf(RADIO, SPOTIFY_RADIO, QUEUE)
 
         /**
          * How many actions fit the top row on a small (360dp) phone beside Dismiss, Cast and ⋮
-         * at a still-tappable size: the two defaults plus three.
+         * at a still-tappable size: the three defaults plus two.
          */
         const val MAX_PINS = 5
 
