@@ -39,7 +39,7 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import java.io.File
-import kotlin.math.max
+import kotlin.math.min
 import kotlinx.coroutines.delay
 
 /**
@@ -73,8 +73,9 @@ private object CanvasVideoCacheStore {
  * its controls.
  *
  * The video is a TextureView, not a SurfaceView, so it composes under the app's own text and
- * controls instead of punching a hole behind the window. It is cropped to cover the screen, and a
- * dark scrim (the same vocabulary as full art's) keeps the white type readable over any frame.
+ * controls instead of punching a hole behind the window. The whole Canvas is fitted inside the
+ * screen and centred — never cropped — and a dark scrim (the same vocabulary as full art's) with a
+ * black ground for the letterbox keeps the white type readable over any frame.
  *
  * Playback failures are silent: [onFailed] lets the caller bring the ordinary cover (or full art)
  * back, and nothing here can throw into the player that owns the music.
@@ -82,6 +83,10 @@ private object CanvasVideoCacheStore {
  * @param url The resolved MP4 URL. Non-null only when the setting is on and this song has a Canvas.
  * @param playing The song is playing (not paused, not buffering): the Canvas follows it.
  * @param onFailed The video could not be built, prepared or decoded: fall back, do not retry.
+ * @param contentModifier Applied to the whole Canvas layer (video and scrim) as one Compose layer:
+ *   swipe-to-skip's translation and fade. Applying it here, not to the interop TextureView, keeps a
+ *   finger-tracked swipe on the normal Compose path. A black ground underneath stays put, so the
+ *   page never flashes through while the clip leaves.
  */
 @Composable
 internal fun CanvasVideoLayer(
@@ -89,6 +94,7 @@ internal fun CanvasVideoLayer(
     playing: Boolean,
     onFailed: () -> Unit,
     modifier: Modifier = Modifier,
+    contentModifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
     val currentOnFailed by rememberUpdatedState(onFailed)
@@ -110,6 +116,9 @@ internal fun CanvasVideoLayer(
     DisposableEffect(player) {
         val listener = object : Player.Listener {
             override fun onRenderedFirstFrame() {
+                // The view may have been measured after the video size arrived: make sure the
+                // first visible frame is already fitted for the view's real size.
+                textureRef[0]?.let { applyContain(it, videoSizePx[0], videoSizePx[1]) }
                 latestReady.value = true
             }
 
@@ -120,7 +129,14 @@ internal fun CanvasVideoLayer(
             override fun onVideoSizeChanged(videoSize: VideoSize) {
                 videoSizePx[0] = videoSize.width
                 videoSizePx[1] = videoSize.height
-                textureRef[0]?.let { applyCenterCrop(it, videoSize.width, videoSize.height) }
+                textureRef[0]?.let { view ->
+                    applyContain(view, videoSize.width, videoSize.height)
+                    // A size arriving in the same frame as a layout change can read the old bounds;
+                    // once the layout has settled, apply it against the real ones.
+                    view.post {
+                        if (view.isAttachedToWindow) applyContain(view, videoSize.width, videoSize.height)
+                    }
+                }
             }
         }
         player.addListener(listener)
@@ -167,22 +183,29 @@ internal fun CanvasVideoLayer(
     )
     val shownAlpha = if (reducedMotion) (if (ready) 1f else 0f) else alpha
 
-    Box(modifier = modifier.fillMaxSize()) {
-        AndroidView(
-            factory = { ctx ->
-                TextureView(ctx).also { view ->
-                    textureRef[0] = view
-                    view.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
-                        if (v is TextureView) {
-                            applyCenterCrop(v, videoSizePx[0], videoSizePx[1])
+    Box(modifier = modifier.fillMaxSize().background(Color.Black)) {
+        Box(Modifier.fillMaxSize().then(contentModifier)) {
+            AndroidView(
+                factory = { ctx ->
+                    TextureView(ctx).also { view ->
+                        textureRef[0] = view
+                        // The fitted clip does not fill the view: the letterbox must show the
+                        // Canvas ground and scrim, not an opaque black/garbage layer.
+                        view.isOpaque = false
+                        view.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
+                            if (v is TextureView) {
+                                applyContain(v, videoSizePx[0], videoSizePx[1])
+                            }
                         }
+                        player.setVideoTextureView(view)
                     }
-                    player.setVideoTextureView(view)
-                }
-            },
-            modifier = Modifier.fillMaxSize().graphicsLayer { this.alpha = shownAlpha },
-        )
-        CanvasScrim(Modifier.fillMaxSize())
+                },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer { this.alpha = shownAlpha },
+            )
+            CanvasScrim(Modifier.fillMaxSize())
+        }
     }
 }
 
@@ -236,20 +259,32 @@ private fun cacheFactory(cache: SimpleCache): CacheDataSource.Factory =
         .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
 
 /**
- * Centre-crops [view]'s video, the way full art crops a page: fill the screen, hide the overflow,
- * never letterbox. Called again on every layout or video-size change.
+ * Fits the whole of [view]'s video inside the viewport and centres it: full width for the usual
+ * portrait Canvas, nothing cut, the rest of the screen left to the dark ground and scrim. Called
+ * again on every layout or video-size change.
+ *
+ * A [TextureView] stretches its surface to the view's bounds, so its content is measured in *view*
+ * pixels, not the video's. A video-space factor applied directly would shrink or grow it wrongly;
+ * undo the stretch first by scaling the stretched content with the fit factor relative to each
+ * axis, then centre the video's box.
  */
-private fun applyCenterCrop(view: TextureView, videoWidth: Int, videoHeight: Int) {
+private fun applyContain(view: TextureView, videoWidth: Int, videoHeight: Int) {
     if (videoWidth <= 0 || videoHeight <= 0) return
     val viewWidth = view.width.toFloat()
     val viewHeight = view.height.toFloat()
     if (viewWidth <= 0f || viewHeight <= 0f) return
-    val scale = max(viewWidth / videoWidth, viewHeight / videoHeight)
-    val dx = (viewWidth - videoWidth * scale) / 2f
-    val dy = (viewHeight - videoHeight * scale) / 2f
+    // How much the stretched surface magnifies each axis. `fit` is the uniform scale that shows the
+    // whole video (the smaller of the two).
+    val fitX = viewWidth / videoWidth
+    val fitY = viewHeight / videoHeight
+    val fit = min(fitX, fitY)
+    val dx = (viewWidth - videoWidth * fit) / 2f
+    val dy = (viewHeight - videoHeight * fit) / 2f
     view.setTransform(
         Matrix().apply {
-            setScale(scale, scale)
+            // Back the surface's own stretch out of the requested fit scale, axis by axis, then
+            // move the video's box so its centre falls on the viewport's centre.
+            setScale(fit / fitX, fit / fitY)
             postTranslate(dx, dy)
         },
     )

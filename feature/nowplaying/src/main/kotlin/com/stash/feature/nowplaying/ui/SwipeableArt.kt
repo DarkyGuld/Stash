@@ -81,6 +81,8 @@ private const val FLIP_CAMERA_DISTANCE = 12f
  * @param trackKey Identifies the playing song; a change ends the post-skip wait.
  * @param gesturesEnabled False for a Listen Together listener, who can neither skip nor seek the
  *   room's song: no gestures and no actions.
+ * @param interactive False while the cover is hidden under a Canvas: the backdrop's own swipe
+ *   handles the touch, so the invisible art must not consume it (or offer its actions).
  * @param canSeek Whether double-tap seeking applies (a known duration).
  * @param positionMs The player's position, read only when a double-tap or an action lands.
  * @param flipKey Identifies the playing album: a change shows the new album's front.
@@ -95,6 +97,7 @@ private const val FLIP_CAMERA_DISTANCE = 12f
 internal fun SwipeableArt(
     trackKey: Any?,
     gesturesEnabled: Boolean,
+    interactive: Boolean = true,
     canNext: Boolean,
     canPrevious: Boolean,
     canSeek: Boolean,
@@ -135,7 +138,7 @@ internal fun SwipeableArt(
     // Both faces skip: the back's page indicator, not its swipe, changes the album pages.
     val swipe = rememberSwipeToSkip(
         trackKey = trackKey,
-        enabled = gesturesEnabled,
+        enabled = gesturesEnabled && interactive,
         canNext = canNext,
         canPrevious = canPrevious,
         onNext = onNext,
@@ -181,7 +184,7 @@ internal fun SwipeableArt(
             .fillMaxSize()
             .then(swipe.gesture)
             .then(
-                if (!gesturesEnabled && back == null) {
+                if (!interactive || (!gesturesEnabled && back == null)) {
                     Modifier
                 } else {
                     // detectTapGestures with onTap would hold every tap for the double-tap window;
@@ -214,7 +217,7 @@ internal fun SwipeableArt(
             // One node for TalkBack: the cover's description with every gesture as an action.
             .semantics(mergeDescendants = true) {
                 val actions = buildList {
-                    if (gesturesEnabled) {
+                    if (gesturesEnabled && interactive) {
                         if (canPrevious) add(CustomAccessibilityAction("Previous song") { onPrevious(); true })
                         if (canNext) add(CustomAccessibilityAction("Next song") { onNext(); true })
                         if (canSeek) {
@@ -230,7 +233,7 @@ internal fun SwipeableArt(
                             )
                         }
                     }
-                    if (back != null) {
+                    if (back != null && interactive) {
                         add(CustomAccessibilityAction(if (showBack) "Show front cover" else "Show back cover") { flip(); true })
                     }
                 }

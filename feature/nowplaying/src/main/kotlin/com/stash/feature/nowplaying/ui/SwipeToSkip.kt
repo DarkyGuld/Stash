@@ -8,6 +8,7 @@ import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.draggable
 import androidx.compose.foundation.gestures.rememberDraggableState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -49,8 +50,16 @@ private const val SKIP_ENTER_FRACTION = 0.35f
  * Swipe-to-skip's two halves: [gesture] goes on the surface that takes the drag, [content] on what
  * moves with the finger. [content] must sit inside [gesture]: a drag read in coordinates that move
  * with the dragged content would see almost no movement.
+ *
+ * [moving] is true from the first drag until the settle animation (including the new song's entry)
+ * finishes. Now Playing's Canvas reads it to let an incoming cover/Canvas take over with the same
+ * swipe instead of popping in; the album and mini player ignore it.
  */
-internal class SwipeToSkip(val gesture: Modifier, val content: Modifier)
+internal class SwipeToSkip(
+    val gesture: Modifier,
+    val content: Modifier,
+    val moving: State<Boolean>,
+)
 
 /**
  * A horizontal swipe that skips to the next / previous song: shared by the Now Playing art and the
@@ -84,6 +93,9 @@ internal fun rememberSwipeToSkip(
     // The finger's raw travel; drawn through swipeVisualOffset (rubber band toward nothing).
     var dragX by remember { mutableFloatStateOf(0f) }
     var settleJob by remember { mutableStateOf<Job?>(null) }
+    // A drag is live, or its settle (out, wait, entry) is still running. A State, not a plain
+    // Boolean: the caller reads it outside this composable and must be invalidated when it flips.
+    val moving = remember { mutableStateOf(false) }
 
     // The drag's callbacks outlive recompositions, so what they read that can change goes through
     // updated state.
@@ -113,6 +125,7 @@ internal fun rememberSwipeToSkip(
                 } else {
                     animate(dragX, 0f, initialVelocity = velocity, animationSpec = springBack) { v, _ -> dragX = v }
                 }
+                moving.value = false
                 return@launch
             }
             val keyBefore = currentTrackKey
@@ -123,6 +136,7 @@ internal fun rememberSwipeToSkip(
             if (outcome == SwipeSkip.NEXT) currentOnNext() else currentOnPrevious()
             if (reducedMotion) {
                 dragX = 0f
+                moving.value = false
                 return@launch
             }
             // Held off to the side until the next song is in, so the old song doesn't slide back
@@ -134,6 +148,7 @@ internal fun rememberSwipeToSkip(
             // The new song comes in from the far side, the way a pager's next page does.
             if (changed) dragX = -sign(outTo) * width * SKIP_ENTER_FRACTION
             animate(dragX, 0f, animationSpec = springBack) { v, _ -> dragX = v }
+            moving.value = false
         }
     }
 
@@ -147,6 +162,7 @@ internal fun rememberSwipeToSkip(
             onDragStarted = { _ ->
                 // A new swipe takes over from a settling one. If the content is still off to the
                 // side waiting for the song, it starts again from its place.
+                moving.value = true
                 settleJob?.cancel()
                 if (abs(dragX) >= widthPx * 0.9f) dragX = 0f
             },
@@ -161,5 +177,5 @@ internal fun rememberSwipeToSkip(
         alpha = if (widthPx > 0) 1f - (abs(x) / widthPx).coerceIn(0f, 1f) else 1f
         compositingStrategy = CompositingStrategy.ModulateAlpha
     }
-    return SwipeToSkip(gesture, content)
+    return SwipeToSkip(gesture, content, moving)
 }
