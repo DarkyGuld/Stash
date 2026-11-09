@@ -2101,6 +2101,17 @@ class SettingsViewModel @Inject constructor(
         viewModelScope.launch { nowPlayingPreference.setCycleAlbumArt(enabled) }
     }
 
+    /** Settings > Appearance > Spotify Canvas (experimental). Off until the listener turns it on. */
+    val canvasVideo: StateFlow<Boolean> = nowPlayingPreference.canvasVideo.stateIn(
+        viewModelScope,
+        SharingStarted.WhileSubscribed(5_000),
+        false,
+    )
+
+    fun onCanvasVideoChanged(enabled: Boolean) {
+        viewModelScope.launch { nowPlayingPreference.setCanvasVideo(enabled) }
+    }
+
     /** Settings > Appearance > Title alignment. */
     val titleAlign: StateFlow<com.stash.core.data.prefs.NpTitleAlign> = nowPlayingPreference.titleAlign.stateIn(
         viewModelScope,

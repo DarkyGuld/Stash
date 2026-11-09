@@ -91,6 +91,7 @@ fun SettingsAppearanceScreen(
     val titleAlign by viewModel.titleAlign.collectAsStateWithLifecycle()
     val titleButton by viewModel.titleButton.collectAsStateWithLifecycle()
     val fullArtBlend by viewModel.fullArtBlend.collectAsStateWithLifecycle()
+    val canvasVideo by viewModel.canvasVideo.collectAsStateWithLifecycle()
     val albumColours by viewModel.albumColours.collectAsStateWithLifecycle()
     val searchBrowseOn by viewModel.searchBrowseOn.collectAsStateWithLifecycle()
     var titleButtonSheet by rememberSaveable { mutableStateOf(false) }
@@ -227,6 +228,16 @@ fun SettingsAppearanceScreen(
                 subtitle = stringResource(R.string.settings_cycle_album_art_subtitle),
                 checked = uiState.cycleAlbumArt,
                 onCheckedChange = viewModel::onCycleAlbumArtChanged,
+            )
+        }
+        // Spotify Canvas (experimental): the song's own Canvas fills Now Playing. Off by default
+        // (it is unofficial), and separate from full art: while it is on, the full art toggle hides.
+        nowPlaying += {
+            SettingsToggleRow(
+                title = stringResource(R.string.settings_canvas_title),
+                subtitle = stringResource(R.string.settings_canvas_subtitle),
+                checked = canvasVideo,
+                onCheckedChange = viewModel::onCanvasVideoChanged,
             )
         }
         nowPlaying += {

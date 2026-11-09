@@ -32,7 +32,10 @@ class NowPlayingPreferenceTest {
     @After fun tearDown() {
         // The preferencesDataStore delegate is one instance per process, so deleting the file does
         // not reset what it holds in memory: put the pins back for whichever test runs next.
-        kotlinx.coroutines.runBlocking { preference.resetPinnedActions() }
+        kotlinx.coroutines.runBlocking {
+            preference.resetPinnedActions()
+            preference.setCanvasVideo(false)
+        }
         if (file.exists()) file.delete()
     }
 
@@ -55,6 +58,18 @@ class NowPlayingPreferenceTest {
 
     @Test fun ambientStyle_defaultsToSoftGlow() = runTest {
         org.junit.Assert.assertEquals(AmbientStyle.SOFT_GLOW, preference.ambientStyle.first())
+    }
+
+    /** The experimental Canvas is off on a fresh install: no extra network until opted in. */
+    @Test fun canvasVideo_defaultsToOff() = runTest {
+        assertFalse(preference.canvasVideo.first())
+    }
+
+    @Test fun canvasVideo_persistsBothWays() = runTest {
+        preference.setCanvasVideo(true)
+        assertTrue(preference.canvasVideo.first())
+        preference.setCanvasVideo(false)
+        assertFalse(preference.canvasVideo.first())
     }
 
     @Test fun ambientStyle_persistsClassicAndBack() = runTest {

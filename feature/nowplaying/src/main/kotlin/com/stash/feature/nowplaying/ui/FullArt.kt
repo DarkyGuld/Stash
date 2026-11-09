@@ -794,7 +794,7 @@ private fun bottomEdge(small: Bitmap): Color {
 
 /** Light status bar icons while [on] (the art's shade is dark), the theme's own after. */
 @Composable
-private fun LightStatusBarIcons(on: Boolean) {
+internal fun LightStatusBarIcons(on: Boolean) {
     val view = LocalView.current
     DisposableEffect(view, on) {
         val window = view.context.findActivity()?.window

@@ -127,6 +127,13 @@ class NowPlayingViewModel @Inject constructor(
     // Data saver: the back cover / inside pages / Discogs look-up waits for Wi-Fi. Tests leave the
     // default, which never applies.
     private val dataSaver: com.stash.core.data.prefs.DataSaver = com.stash.core.data.prefs.DataSaver.Off,
+    // Spotify Canvas (experimental): the data layer's resolver, and the Wi-Fi/power gates. Tests
+    // leave the defaults, which find no Canvas and never touch the network.
+    private val canvasVideoResolver: com.stash.feature.nowplaying.canvas.CanvasVideoResolver =
+        com.stash.feature.nowplaying.canvas.CanvasVideoResolver.None,
+    private val canvasNetwork: com.stash.feature.nowplaying.canvas.CanvasNetworkGate =
+        com.stash.feature.nowplaying.canvas.CanvasNetworkGate.Unrestricted,
+    private val batterySaver: com.stash.core.common.power.BatterySaver = com.stash.core.common.power.BatterySaver.Off,
 ) : ViewModel() {
 
     /**
@@ -201,6 +208,19 @@ class NowPlayingViewModel @Inject constructor(
     /** Settings > Appearance > Full art blend. */
     val fullArtBlend: StateFlow<com.stash.core.data.prefs.FullArtBlend> = nowPlayingPreference.fullArtBlend
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), com.stash.core.data.prefs.FullArtBlend.DEFAULT)
+
+    /**
+     * Settings > Appearance > Spotify Canvas (experimental), null until DataStore answers. Off by
+     * default; while it is on, Now Playing's full art toggle is hidden and the Canvas owns the
+     * background.
+     */
+    val canvasVideoEnabled: StateFlow<Boolean?> = nowPlayingPreference.canvasVideo
+        .map<Boolean, Boolean?> { it }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
+    /** The active network is unmetered (Wi-Fi, Ethernet, a non-metered hotspot): Canvas may run. */
+    val canvasNetworkUnmetered: StateFlow<Boolean> = canvasNetwork.unmetered
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), canvasNetwork.isUnmeteredNow())
 
     /** Settings > Appearance > Title alignment. */
     val titleAlign: StateFlow<com.stash.core.data.prefs.NpTitleAlign> = nowPlayingPreference.titleAlign
@@ -945,6 +965,7 @@ class NowPlayingViewModel @Inject constructor(
         prefetchLyricsWhileForeground()
         prefetchBackCoverWhileForeground()
         observeUserPlaylists()
+        observeCanvasVideo()
     }
 
     // ------------------------------------------------------------------
@@ -1071,6 +1092,77 @@ class NowPlayingViewModel @Inject constructor(
             }
         }.launchIn(viewModelScope)
     }
+
+    /**
+     * Spotify Canvas (experimental): resolves the playing song's Canvas URL when, and only when, the
+     * setting is on, the song is playing (not buffering), the network is unmetered and Battery Saver
+     * is off. Nothing is looked up for paused or buffered playback, and only the current song is
+     * ever asked for. A miss is remembered by the resolver, so a replay near in time is free.
+     *
+     * The resolved URL rides in [NowPlayingUiState.canvasVideo] with the song's key, so a skip can
+     * never leave the previous song's video on screen.
+     */
+    private fun observeCanvasVideo() {
+        viewModelScope.launch {
+        combine(
+            nowPlayingPreference.canvasVideo,
+            _uiState
+                .map { CanvasRequest(trackKey = canvasTrackKey(it.currentTrack), playing = it.playWhenReady, buffering = it.isBuffering) }
+                .distinctUntilChanged(),
+            canvasNetworkUnmetered,
+            batterySaver.isOn,
+            appForeground.foreground,
+        ) { enabled, request, unmetered, saverOn, foreground ->
+            request.copy(enabled = enabled, unmetered = unmetered, batterySaverOn = saverOn, inForeground = foreground)
+        }
+            .distinctUntilChanged()
+            .collectLatest { request ->
+                val key = request.trackKey
+                if (!request.enabled || key == null) {
+                    clearCanvasVideo()
+                    return@collectLatest
+                }
+                // A new song never wears the last one's video, even for a frame.
+                if (_uiState.value.canvasVideo?.trackKey != key) {
+                    _uiState.update { it.copy(canvasVideo = null) }
+                }
+                val track = _uiState.value.currentTrack
+                if (!request.inForeground || !CanvasPlaybackRules.canResolve(
+                        enabled = request.enabled,
+                        hasTrack = track != null,
+                        playing = request.playing,
+                        buffering = request.buffering,
+                        unmetered = request.unmetered,
+                        batterySaverOn = request.batterySaverOn,
+                    )
+                ) {
+                    return@collectLatest
+                }
+                if (_uiState.value.canvasVideo?.trackKey == key) return@collectLatest
+                val url = canvasVideoResolver.canvasUrl(track!!)
+                // The song may have changed while the resolver was away: only this song's answer is kept.
+                if (url != null && canvasTrackKey(_uiState.value.currentTrack) == key) {
+                    _uiState.update { it.copy(canvasVideo = CanvasVideo(trackKey = key, url = url)) }
+                }
+            }
+        }
+    }
+
+    private fun clearCanvasVideo() {
+        if (_uiState.value.canvasVideo != null) {
+            _uiState.update { it.copy(canvasVideo = null) }
+        }
+    }
+
+    private data class CanvasRequest(
+        val trackKey: String?,
+        val playing: Boolean,
+        val buffering: Boolean,
+        val enabled: Boolean = false,
+        val unmetered: Boolean = true,
+        val batterySaverOn: Boolean = false,
+        val inForeground: Boolean = false,
+    )
 
     /**
      * Observes the "Save to Playlist" picker destination list — custom

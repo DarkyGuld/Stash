@@ -110,6 +110,19 @@ class NowPlayingPreference @Inject constructor(@ApplicationContext private val c
         context.nowPlayingDataStore.edit { it[cycleAlbumArtKey] = enabled }
     }
 
+    private val canvasVideoKey = booleanPreferencesKey("canvas_video")
+
+    /**
+     * Settings > Appearance > Spotify Canvas (experimental): Now Playing's whole background becomes
+     * the playing song's Canvas video, when it has one. Off until turned on (it is unofficial and
+     * may break), and never tied to the full art toggle.
+     */
+    val canvasVideo = context.nowPlayingDataStore.data.map { it[canvasVideoKey] ?: false }
+
+    suspend fun setCanvasVideo(on: Boolean) {
+        context.nowPlayingDataStore.edit { it[canvasVideoKey] = on }
+    }
+
     private val fullArtKey = booleanPreferencesKey("full_art")
 
     /**

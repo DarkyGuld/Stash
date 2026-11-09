@@ -196,6 +196,13 @@ fun NowPlayingScreen(
     val fullArtBlend by viewModel.fullArtBlend.collectAsStateWithLifecycle()
     val titleAlign by viewModel.titleAlign.collectAsStateWithLifecycle()
     val titleButton by viewModel.titleButton.collectAsStateWithLifecycle()
+    // Spotify Canvas (experimental): the video fills the background only on Wi-Fi and with Battery
+    // Saver off, so both are watched here as well as in the ViewModel's look-up gate.
+    val canvasNetworkUnmetered by viewModel.canvasNetworkUnmetered.collectAsStateWithLifecycle()
+    val batterySaverOn = com.stash.core.ui.ambient.LocalBatterySaverOn.current
+    // A URL whose video failed to build, prepare or decode: its exact URL is never tried again, and
+    // the ordinary cover/full art comes back.
+    var canvasFailedUrl by remember { mutableStateOf<String?>(null) }
     // The text block's numbers (production values; a debug build's tuner overrides them live) and
     // its one alignment: title, artist and quality lines all follow it. Up next stays centred, as
     // View lyrics does.
@@ -268,17 +275,21 @@ fun NowPlayingScreen(
             radioLock = false
         }
     }
-    // Now Playing's own prefs, all from one DataStore: wait for the three together, so a Classic
-    // user never sees a frame of Soft glow and a customised row never shows a frame of the
-    // default pins. Subscribing to all three before returning keeps the waits from chaining a
-    // frame each.
+    // Now Playing's own prefs, all from one DataStore: wait for the four together, so a Classic
+    // user never sees a frame of Soft glow, a customised row never shows a frame of the default
+    // pins, and the full art toggle never appears before Canvas says whether it owns that corner.
+    // Subscribing to all of them before returning keeps the waits from chaining a frame each.
     val ambientAnimationEnabledPref = viewModel.ambientAnimationEnabled.collectAsStateWithLifecycle().value
     val ambientStylePref = viewModel.ambientStyle.collectAsStateWithLifecycle().value
     val pinsPref = viewModel.pinnedActions.collectAsStateWithLifecycle().value
-    if (ambientAnimationEnabledPref == null || ambientStylePref == null || pinsPref == null) return
+    // Canvas: waited for with the others, so the full art toggle never appears for a frame on a
+    // listener who has it on (or hides for one who does not).
+    val canvasVideoPref = viewModel.canvasVideoEnabled.collectAsStateWithLifecycle().value
+    if (ambientAnimationEnabledPref == null || ambientStylePref == null || pinsPref == null || canvasVideoPref == null) return
     val ambientAnimationEnabled: Boolean = ambientAnimationEnabledPref
     val ambientStyle: com.stash.core.data.prefs.AmbientStyle = ambientStylePref
     val pins: Set<NowPlayingAction> = pinsPref
+    val canvasVideoOn: Boolean = canvasVideoPref
     var showQueue by remember { mutableStateOf(false) }
     var showSaveSheet by remember { mutableStateOf(false) }
     var showOptionsSheet by remember { mutableStateOf(false) }
@@ -592,6 +603,33 @@ fun NowPlayingScreen(
         }
     }
     val fullArtOn = fullArtPref == true && fullArtPages.isNotEmpty()
+    // Spotify Canvas (experimental) is not the full art toggle: when this song's Canvas is in hand
+    // it owns the background and full art stands down, and the toggle hides altogether. With no
+    // Canvas (or a failed video) the ordinary cover/full art is exactly what it was.
+    val playingCanvasKey = com.stash.feature.nowplaying.canvasTrackKey(track)
+    val canvasVideo = uiState.canvasVideo
+    val canvasUrl = canvasVideo?.url?.takeIf { it.isNotBlank() && canvasVideo.trackKey == playingCanvasKey }
+    val canvasFailed = canvasUrl != null && canvasFailedUrl == canvasUrl
+    val canvasVideoUsable = canvasVideoOn && canvasUrl != null && !canvasFailed
+    val fullArtShown = fullArtOn && !canvasVideoUsable
+    val canvasVisible = com.stash.feature.nowplaying.CanvasPlaybackRules.shouldShow(
+        enabled = canvasVideoOn,
+        url = canvasUrl,
+        trackMatches = canvasVideo?.trackKey == playingCanvasKey,
+        inSight = npInSight,
+        casting = casting,
+        lyrics = reading,
+        fullArt = fullArtShown,
+        unmetered = canvasNetworkUnmetered,
+        batterySaverOn = batterySaverOn,
+    ) && !canvasFailed
+    val canvasPlaying = canvasVisible && com.stash.feature.nowplaying.CanvasPlaybackRules.videoShouldPlay(
+        isPlaying = uiState.isPlaying,
+        playWhenReady = uiState.playWhenReady,
+        buffering = uiState.isBuffering,
+    )
+    // White type on a dark backdrop: full art's blend, or the Canvas' scrim.
+    val darkBackdrop = fullArtDark || canvasVisible
     // The square art's pages and full art's line up (front, back, inside) when the back is known.
     val pagesLineUp = coverArt?.back != null
     // The holder only (no colour read here): each reader takes its colour where it draws, so the
@@ -996,7 +1034,7 @@ fun NowPlayingScreen(
     }
 
     // The controls go white on full art's dark blend, whatever the theme.
-    com.stash.feature.nowplaying.ui.FullArtTheme(on = fullArtDark) {
+    com.stash.feature.nowplaying.ui.FullArtTheme(on = darkBackdrop) {
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -1010,7 +1048,7 @@ fun NowPlayingScreen(
             // resolved app theme. It runs to the screen's bottom edge, under the
             // system navigation bar (the tab bar slides away under the player).
             // (Not under full art once it covers the screen: nothing of it would show.)
-            if (ambientAnimationEnabled && !fullArtCovers) SheetAmbient(sheet) { ambientModifier ->
+            if (ambientAnimationEnabled && !fullArtCovers && !canvasVisible) SheetAmbient(sheet) { ambientModifier ->
                 when (ambientStyle) {
                     com.stash.core.data.prefs.AmbientStyle.SOFT_GLOW -> AmbientBackground(
                         lightMode = MaterialTheme.colorScheme.background.luminance() >= 0.5f,
@@ -1027,10 +1065,21 @@ fun NowPlayingScreen(
                 }
             }
 
+            // Spotify Canvas (experimental): the song's own video fills the background, under the
+            // controls. It is outside full art's toggle entirely; here it is simply the backdrop.
+            if (canvasVisible && canvasUrl != null) {
+                com.stash.feature.nowplaying.ui.CanvasVideoLayer(
+                    url = canvasUrl,
+                    playing = canvasPlaying,
+                    onFailed = { canvasFailedUrl = canvasUrl },
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+
             // Full art, behind the controls; it grows out of the square art and back into it.
             com.stash.feature.nowplaying.ui.FullArtLayer(
                 state = fullArt,
-                active = fullArtOn,
+                active = fullArtShown,
                 visible = npAtTop,
                 // Lyrics read over the blend: the art fades while the cover flies to the header.
                 artShown = !reading,
@@ -1147,7 +1196,7 @@ fun NowPlayingScreen(
                                     onClick = { showCastSheet = true },
                                 )
                             },
-                            fullArt = if (hasArt) fullArtOn else null,
+                            fullArt = if (hasArt && !canvasVideoOn) fullArtShown else null,
                             onToggleFullArt = viewModel::onToggleFullArt,
                         )
                     }
@@ -1201,7 +1250,7 @@ fun NowPlayingScreen(
                                         .weight(1f)
                                         .padding(horizontal = spacing.sidePadding.dp),
                                     stackModifier = controlsLayer,
-                                    fullArtText = if (fullArtOn) fullArtTextAnchor else null,
+                                    fullArtText = if (fullArtShown) fullArtTextAnchor else null,
                                     art = {
                                     // -- Album art: NowPlayingBody sizes this slot (a square) --
                                     Box(
@@ -1209,8 +1258,9 @@ fun NowPlayingScreen(
                                             .fillMaxSize()
                                             .onGloballyPositioned { if (!reading && it.isAttached) artBounds = it.boundsInWindow() }
                                             .then(heroLayer(isCurrentMode = !reading, cornerDp = PlayerSheetMath.HERO_ART_CORNER_DP))
-                                            // Full art draws the art while it's out (it grew from here).
-                                            .graphicsLayer { alpha = if (fullArt.grow.value > 0f && fullArt.ready) 0f else 1f },
+                                            // Full art draws the art while it's out (it grew from here);
+                                            // Canvas hides the square so its video can fill the screen.
+                                            .graphicsLayer { alpha = if (canvasVisible || (fullArt.grow.value > 0f && fullArt.ready)) 0f else 1f },
                                         contentAlignment = Alignment.Center,
                                     ) {
                                         // Swipe for the next / previous song, double-tap a side to seek
@@ -1262,7 +1312,7 @@ fun NowPlayingScreen(
                                                     pageCount = 1 + insidePages.size,
                                                     index = cycleIndex,
                                                     onIndexChange = { cycleIndex = it },
-                                                    running = npInSight && !backUp && pageZoom.page == null && !(fullArtOn && !reading),
+                                                    running = npInSight && !canvasVisible && !backUp && pageZoom.page == null && !(fullArtShown && !reading),
                                                     snapKey = cycleSnap,
                                                     load = { n ->
                                                         n == 1 || insidePages.getOrNull(n - 2)
@@ -1289,7 +1339,7 @@ fun NowPlayingScreen(
                                         }
                                         // Full art: a sideways swipe skips the song; the pages still
                                         // turn by themselves. The square's seek/turn-over stay under it.
-                                        if (fullArtOn && !reading) com.stash.feature.nowplaying.ui.FullArtSwipe(
+                                        if (fullArtShown && !reading) com.stash.feature.nowplaying.ui.FullArtSwipe(
                                             canNext = canSwipeNext,
                                             canPrevious = canSwipePrevious,
                                             onNext = viewModel::onSkipNext,
@@ -1401,14 +1451,14 @@ fun NowPlayingScreen(
                                         // Over full art's dark blend the album's ink is used only when
                                         // it's light enough to read there; white otherwise.
                                         accentColor = barChrome.ink.let { ink ->
-                                            if (fullArtDark && ink.luminance() < 0.5f) androidx.compose.ui.graphics.Color.White else ink
+                                            if (darkBackdrop && ink.luminance() < 0.5f) androidx.compose.ui.graphics.Color.White else ink
                                         },
                                         liveEnabled = liveLyricsEnabled,
                                         onTap = viewModel::onShowLyrics,
                                         modifier = controlsLayer,
                                         isPlaying = uiState.isPlaying && !uiState.isBuffering,
                                         playbackSpeed = playbackSpeed,
-                                        transparent = fullArtDark,
+                                        transparent = darkBackdrop,
                                     )
                                 }
                             }

@@ -33,6 +33,12 @@ dependencies {
     // ⋮ › Streaming quality: the same Lossless / Save Data / Prefer Tidal AAC preferences
     // Settings › Audio & Quality writes (#716).
     implementation(project(":data:download"))
+    // Spotify Canvas (experimental): the data layer resolves the playing song's Canvas URL.
+    implementation(project(":data:spotify"))
+    // Canvas video: a small, muted ExoPlayer over its own MP4 cache (never the audio cache).
+    implementation(libs.media3.exoplayer)
+    implementation(libs.media3.datasource)
+    implementation(libs.media3.database)
     implementation(libs.work.runtime.ktx)
     implementation(libs.coil.compose)
     implementation(libs.compose.material.icons.extended)

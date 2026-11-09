@@ -56,12 +56,24 @@ data class NowPlayingUiState(
     val isStreaming: Boolean = false,
     /** What the current queue is playing from — shown in the queue sheet header. */
     val source: PlaybackSource = PlaybackSource.Unknown,
+    /**
+     * The playing song's Canvas video, once the data layer has found one (Settings > Appearance >
+     * Spotify Canvas). Null for no Canvas, a song without one, or while the setting is off. The
+     * track key keeps a skip from showing the previous song's video for a frame.
+     */
+    val canvasVideo: CanvasVideo? = null,
 ) {
 
     /** `true` when a track is loaded and ready to display. */
     val hasTrack: Boolean
         get() = currentTrack != null
 }
+
+/** A resolved Canvas video and the song it belongs to. */
+data class CanvasVideo(
+    val trackKey: String,
+    val url: String,
+)
 
 /**
  * Playback progress as a fraction in `[0f, 1f]`.
