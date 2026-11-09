@@ -65,6 +65,19 @@ class RadioPlaybackSupportTest {
     }
 
     @Test
+    fun `resuming after radio plays the song after the saved one`() {
+        assertThat(RadioExitRestore.resumeIndexAfterExit(savedIndex = 0, size = 3)).isEqualTo(1)
+        assertThat(RadioExitRestore.resumeIndexAfterExit(savedIndex = 1, size = 3)).isEqualTo(2)
+    }
+
+    @Test
+    fun `resuming after the last saved song reuses that song, and an empty queue starts at 0`() {
+        assertThat(RadioExitRestore.resumeIndexAfterExit(savedIndex = 2, size = 3)).isEqualTo(2)
+        assertThat(RadioExitRestore.resumeIndexAfterExit(savedIndex = 9, size = 3)).isEqualTo(2)
+        assertThat(RadioExitRestore.resumeIndexAfterExit(savedIndex = 0, size = 0)).isEqualTo(0)
+    }
+
+    @Test
     fun `a radio unavailable exception is found through the playback exception cause chain`() {
         val wrapped = IllegalStateException(
             "player",

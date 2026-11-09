@@ -38,6 +38,16 @@ internal data class RadioExitSnapshot(
 )
 
 /**
+ * A queue waiting for the next explicit skip/auto-advance to come back after
+ * radio was turned off. [resumeIndex] is already the slot to play (the saved
+ * song's slot + 1, clamped).
+ */
+internal data class PendingRadioRestore(
+    val snapshot: RadioExitSnapshot,
+    val resumeIndex: Int,
+)
+
+/**
  * The choice of queue slot to restore and whether an exit should restore at
  * all. Pure so [RadioExitRestoreTest] can pin the rules without a player.
  */
@@ -47,6 +57,17 @@ internal object RadioExitRestore {
         if (tracks.isEmpty()) return 0
         val byId = currentTrackId?.let { id -> tracks.indexOfFirst { it.id == id } } ?: -1
         return (if (byId >= 0) byId else capturedIndex).coerceIn(0, tracks.size - 1)
+    }
+
+    /**
+     * Where the previous queue resumes when radio hands it back on the next
+     * advance: the song AFTER the one that was playing before radio, or that
+     * song itself when it was the last one (and 0 when the queue is empty).
+     */
+    fun resumeIndexAfterExit(savedIndex: Int, size: Int): Int {
+        if (size <= 0) return 0
+        val next = savedIndex + 1
+        return if (next in 0 until size) next else savedIndex.coerceIn(0, size - 1)
     }
 
     /**

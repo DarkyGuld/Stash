@@ -242,8 +242,10 @@ interface PlayerRepository {
 
     /**
      * Leave the active station the way the Now Playing toggle does: stop radio
-     * and, unless the user turned it off or another output owns the player,
-     * restore the queue that was playing before the station started.
+     * but keep the current song playing. When the user wants it and another
+     * output doesn't own the player, the queue that was playing before the
+     * station is remembered and comes back on the next explicit skip/next or
+     * when the current song ends (auto-advance).
      *
      * [stopRadio] stays the auto-stop/grow path (no restore). Defaults to
      * [stopRadio] for stand-in repositories that never start a station.

@@ -600,10 +600,30 @@ class PlayerRepositoryImpl @Inject constructor(
 
     /**
      * What the player held just before the station took the queue. [exitRadio]
-     * puts it back; [stopRadio] (auto-stop/grow) drops it.
+     * keeps it as a [pendingRadioRestore] and it comes back on the next
+     * advance; [stopRadio] (auto-stop/grow) drops it.
      */
     @Volatile
     private var radioExitSnapshot: RadioExitSnapshot? = null
+
+    /**
+     * Set when radio is turned off with `restoreQueueAfterRadio` on. The next
+     * explicit skip or the end of the current radio song replaces the station
+     * queue with the snapshot, so turning radio off never jumps away from the
+     * song that is playing. Any new queue/station clears it.
+     */
+    @Volatile
+    private var pendingRadioRestore: PendingRadioRestore? = null
+    private val pendingRadioRestoreLock = Any()
+
+    private fun takePendingRadioRestore(): PendingRadioRestore? =
+        synchronized(pendingRadioRestoreLock) {
+            pendingRadioRestore.also { pendingRadioRestore = null }
+        }
+
+    private fun setPendingRadioRestore(pending: PendingRadioRestore?) {
+        synchronized(pendingRadioRestoreLock) { pendingRadioRestore = pending }
+    }
 
     /**
      * Candidates whose play-time resolve failed for this station, with a short
@@ -774,6 +794,13 @@ class PlayerRepositoryImpl @Inject constructor(
         cascadeGuard.onUserTransport()
         val controller = ensureController() ?: return
         if (inListenTogether) { controller.seekToNext(); return }
+        // Radio was turned off and the user asked for another song: NOW the
+        // previous queue comes back, one past the song that was playing before
+        // the station. That is the explicit "next" that ends the deferral.
+        takePendingRadioRestore()?.let { pending ->
+            restoreRadioExit(pending.snapshot, pending.resumeIndex)
+            return
+        }
         // Full timeline: ExoPlayer sees the whole queue, so the native seek is
         // always correct (shuffle order, repeat-all wraparound included).
         // hasNextMediaItem() is false only at the true end with repeat off —
@@ -968,6 +995,7 @@ class PlayerRepositoryImpl @Inject constructor(
         // also ends (the user picked something else), and its exit snapshot is
         // no longer the queue to come back to.
         radioExitSnapshot = null
+        setPendingRadioRestore(null)
         libraryShuffleActive = false
         librarySnapshot = emptyList()
         radioActive = false
@@ -1576,6 +1604,9 @@ class PlayerRepositoryImpl @Inject constructor(
         // Library ids before queueing: the generator's ids are videoId hashes with no row, so a
         // saved radio queue resumed into nothing after the app was closed (withQueueIdentity).
         val firstBatch = liveGenerated.map { it.withQueueIdentity() }
+        // Starting a station replaces whatever queue the player had, including
+        // a restore deferred by a previous radio exit.
+        setPendingRadioRestore(null)
         // Capture the queue radio is about to replace BEFORE any of it is touched.
         if (!radioActive) captureRadioExitSnapshot(controller)
         radioSession = session
@@ -1640,26 +1671,28 @@ class PlayerRepositoryImpl @Inject constructor(
         radioActive = false
         radioSession = null
         radioExitSnapshot = null
+        setPendingRadioRestore(null)
         radioUnavailable.clear()
         _radioSeedLabel.value = null
         currentSource = com.stash.core.model.PlaybackSource.Unknown
     }
 
     /**
-     * Leave the station from the Now Playing toggle: stop radio and, when the
-     * user wants it and no session/browser/cast owns the player, put back the
-     * queue that was playing before the station. [stopRadio] stays the
-     * auto-stop/grow path.
+     * Leave the station from the Now Playing toggle. The current radio song
+     * KEEPS PLAYING, exactly where it is: the station only stops growing and
+     * the queue gone from before radio is remembered as a pending restore.
+     * It comes back on the next explicit skip/next or when this song ends
+     * (auto-advance), when the user wants it and no session/browser/cast owns
+     * the player. [stopRadio] stays the auto-stop/grow path.
      */
     override suspend fun exitRadio() {
-        // Read before stopRadio drops them: the restore needs both the snapshot
-        // and the rest of the player state it captured.
+        // Read before stopRadio drops them: the deferred restore needs both the
+        // snapshot and the rest of the player state it captured.
         val snapshot = radioExitSnapshot
         val queueOwnedElsewhere = listenTogetherOwnsQueue ||
             playsOnBrowser ||
             browserOutputs?.served?.value == true ||
             browserOutputs?.isCasting == true
-        stopRadio()
         val restorePreference = try {
             streamingPreference.isRestoreQueueAfterRadio()
         } catch (e: CancellationException) {
@@ -1667,6 +1700,9 @@ class PlayerRepositoryImpl @Inject constructor(
         } catch (e: Exception) {
             true
         }
+        // Stop the grow watcher and drop the station flag/label, but do NOT
+        // pause, seek or replace the queue: the radio song keeps playing.
+        stopRadio()
         if (!RadioExitRestore.shouldRestore(
                 hasSnapshot = snapshot != null && snapshot.tracks.isNotEmpty(),
                 preference = restorePreference,
@@ -1675,7 +1711,18 @@ class PlayerRepositoryImpl @Inject constructor(
         ) {
             return
         }
-        restoreRadioExit(snapshot!!)
+        val captured = snapshot ?: return
+        val savedIndex = RadioExitRestore.startIndex(
+            tracks = captured.tracks,
+            currentTrackId = captured.currentTrackId,
+            capturedIndex = captured.capturedIndex,
+        )
+        setPendingRadioRestore(
+            PendingRadioRestore(
+                snapshot = captured,
+                resumeIndex = RadioExitRestore.resumeIndexAfterExit(savedIndex, captured.tracks.size),
+            ),
+        )
     }
 
     /** Snapshot the queue radio is about to replace. Main thread. */
@@ -1703,26 +1750,34 @@ class PlayerRepositoryImpl @Inject constructor(
     /**
      * Put the captured queue back through the normal queue path, then restore
      * the window/pins, shuffle/repeat, source and library-shuffle state it had.
-     * The queue list is already in play order, so Media3's shuffle is held off
-     * during the build and turned back on after it: restoring the mode, not
-     * shuffling the restored order a second time.
+     * [resumeIndex], when given, is the deferred-restore slot (the saved song's
+     * slot + 1): that song starts from the beginning and plays. The queue list
+     * is already in play order, so Media3's shuffle is held off during the
+     * build and turned back on after it: restoring the mode, not shuffling the
+     * restored order a second time.
      */
-    private suspend fun restoreRadioExit(snapshot: RadioExitSnapshot) {
+    private suspend fun restoreRadioExit(snapshot: RadioExitSnapshot, resumeIndex: Int? = null) {
         val controller = ensureController() ?: return
-        val startIndex = RadioExitRestore.startIndex(
+        val startIndex = resumeIndex ?: RadioExitRestore.startIndex(
             tracks = snapshot.tracks,
             currentTrackId = snapshot.currentTrackId,
             capturedIndex = snapshot.capturedIndex,
         )
+        // Resuming at the song after the saved one starts that song from its
+        // beginning; only a same-song restore keeps the captured position.
+        val startPositionMs = if (resumeIndex != null) 0L else snapshot.positionMs
+        // A deferred restore is triggered by Next or by the radio song ending,
+        // so the restored song starts playing even if radio was paused then.
+        val play = if (resumeIndex != null) true else snapshot.wasPlaying
         controller.shuffleModeEnabled = false
         var restored = false
         try {
             setQueueInternal(
                 tracks = snapshot.tracks,
                 startIndex = startIndex,
-                startPositionMs = snapshot.positionMs,
+                startPositionMs = startPositionMs,
                 source = snapshot.source,
-                play = snapshot.wasPlaying,
+                play = play,
                 restore = true,
             )
             // The build can bail (a snapshot whose songs can no longer play): the
@@ -1766,7 +1821,12 @@ class PlayerRepositoryImpl @Inject constructor(
             val session = radioSession ?: return
             val batch = radioGenerator.nextBatch(session)
             if (batch.isEmpty()) return
-            if (!radioActive || !streamAllowed()) {
+            // Radio was turned off while this batch was being generated: it is
+            // no longer this station's queue. Don't call stopRadio() here — the
+            // exit already did, and it may be holding a deferred restore that
+            // stopRadio() would drop.
+            if (!radioActive) return
+            if (!streamAllowed()) {
                 stopRadio()
                 return
             }
@@ -3464,6 +3524,7 @@ class PlayerRepositoryImpl @Inject constructor(
         librarySnapshot = emptyList()
         radioActive = false
         radioSession = null
+        setPendingRadioRestore(null)
         _radioSeedLabel.value = null
         val controller = ensureController() ?: return
         dropWindow("a single song replaced the queue")
@@ -3595,11 +3656,32 @@ class PlayerRepositoryImpl @Inject constructor(
         }
     }
 
+    /**
+     * The current radio song has ended (auto-advance) or the queue ran out
+     * while a restore was pending: put the previous queue back, one slot past
+     * the saved song. Consumed once so a second event can't restore twice.
+     */
+    private fun restorePendingRadioOnAdvance(): Boolean {
+        val pending = takePendingRadioRestore() ?: return false
+        scope.launch { restoreRadioExit(pending.snapshot, pending.resumeIndex) }
+        return true
+    }
+
     /** Listener that forwards Media3 player events into [_playerState]. */
     internal val playerListener = object : Player.Listener { // internal: test seam
 
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
             val controller = controllerDeferred ?: return
+            // The radio song the user kept playing just ended and the station
+            // advanced. The next song is the previous queue, not this one.
+            if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO &&
+                restorePendingRadioOnAdvance()
+            ) {
+                // Reflect the transition until the restore's own queue load
+                // lands, without recording the station song as history.
+                updateState(controller)
+                return
+            }
             noteCurrentItem(controller, reason)
             // Safety net: keep the chosen speed across transitions / queue rebuilds. Not in a session,
             // where drift correction nudges the speed on purpose.
@@ -3651,6 +3733,9 @@ class PlayerRepositoryImpl @Inject constructor(
         }
 
         override fun onPlaybackStateChanged(playbackState: Int) {
+            // The last radio song ended with no next item to transition to.
+            // A pending restore still comes back instead of ending in silence.
+            if (playbackState == Player.STATE_ENDED && restorePendingRadioOnAdvance()) return
             controllerDeferred?.let { updateState(it) }
         }
 
@@ -4123,7 +4208,7 @@ class PlayerRepositoryImpl @Inject constructor(
 
     internal fun maybeStampCurrentItemQuality(controller: MediaController) {
         val item = controller.currentMediaItem ?: return
-        val extras = item.mediaMetadata.extras ?: run {
+        val extras = item.mediaMetadata?.extras ?: run {
             Log.d(STAMP_TAG, "skip: current item has no extras")
             return
         }
