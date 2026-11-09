@@ -80,8 +80,10 @@ class PlayerRadioStarter @Inject constructor(
         if (!_tuning.compareAndSet(expect = false, update = true)) return null
         return try {
             if (lastFm != null && !lastFm.isConfigured) {
-                Log.w(TAG, "radio: no Last.fm key or proxy configured; not tuning")
-                return context.getString(R.string.radio_failed_not_configured)
+                // No Last.fm key: the generator still has the addon artist search
+                // (and its local graph) plus YouTube. Let it try instead of
+                // refusing a station that can play; the 25 s cap still bounds it.
+                Log.w(TAG, "radio: no Last.fm key; falling back to addons/YouTube")
             }
             val seedLabel = when (seed) {
                 is RadioSeed.Artist -> "artist:${seed.name}"

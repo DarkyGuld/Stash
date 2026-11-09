@@ -60,16 +60,56 @@ class RadioStationGenerator @Inject constructor(
         // multi-artist credit ("BENNETT, Creeds") is also queried as its primary
         // artist, in parallel, and the first non-empty answer wins.
         val neighborResult = firstNonEmptyByArtist(seed.name) { name ->
-            lastFm.getSimilarArtists(name, limit = NEIGHBOR_MAX).getOrDefault(emptyList())
+            lastFmOrEmpty { lastFm.getSimilarArtists(name, limit = NEIGHBOR_MAX) }
         }
         val allNeighbors = neighborResult.items
+        val youtubeOn = youtubeOn()
+        val addonsOn = addonsOn()
+        val addonList = if (addonsOn) enabledAddonList() else emptyList()
         Log.d(
             TAG,
             "artist seed: neighbors=${allNeighbors.size} artistVariant=${neighborResult.variantLabel} " +
+                "youtube=$youtubeOn addons=${addonList.size} " +
                 "(lastfm configured=${lastFm.isConfigured})",
         )
         val neighbors = allNeighbors.take(NEIGHBOR_POOL)
-        // Resolve seed (via known browseId) + each neighbor's popular list, in parallel.
+
+        // Addon-first artist radio. It is the only walk that can build a pool
+        // with YouTube off, and with addons enabled it is preferred over YT
+        // Popular (the catalogue's artist search is the taste-matched source;
+        // resolution at emit time still falls back to YouTube when that is on).
+        // Its search results are also the local artist graph used to keep an
+        // addon-only station widening when Last.fm has no neighbours or no key.
+        val addonQueue = ArrayDeque<Pair<String, Float>>()
+        val addonSeen = mutableSetOf(seed.name.trim().lowercase())
+        val addonPool = if (addonList.isNotEmpty()) {
+            addonArtistPool(seed.name, neighbors, addonList, addonQueue, addonSeen)
+        } else {
+            emptyList()
+        }
+
+        // Keep the YT Popular path when it is enabled and the addon walk yielded
+        // nothing (no search resource, an offline addon, or an obscure seed).
+        val pool = if (addonPool.isNotEmpty()) {
+            addonPool
+        } else if (youtubeOn) {
+            buildYoutubeArtistPool(seed, neighbors)
+        } else {
+            emptyList()
+        }
+        val session = RadioSession(seed, RadioInterleaver.order(pool).toMutableList(), mutableSetOf())
+        session.remainingNeighbors.addAll(allNeighbors.drop(NEIGHBOR_POOL))
+        session.addonNeighbors.addAll(addonQueue)
+        session.addonNeighborsSeen.addAll(addonSeen)
+        session.neighborsLoaded = true
+        return session to drainBatch(session, FIRST_BATCH)
+    }
+
+    /** The pre-addon artist-radio walk: seed browseId + every neighbour's YT Popular. */
+    private suspend fun buildYoutubeArtistPool(
+        seed: RadioSeed.Artist,
+        neighbors: List<LastFmSimilarArtist>,
+    ): List<RadioCandidate> {
         val artistTracks: Map<String, List<TrackSummary>> = coroutineScope {
             val seedJob = async { seed.name to seedPopular(seed) }
             val neighborJobs = neighbors.map { n ->
@@ -77,11 +117,7 @@ class RadioStationGenerator @Inject constructor(
             }
             (listOf(seedJob) + neighborJobs).awaitAll().toMap()
         }
-        val pool = buildArtistPool(seed.name, neighbors, artistTracks)
-        val session = RadioSession(seed, RadioInterleaver.order(pool).toMutableList(), mutableSetOf())
-        session.remainingNeighbors.addAll(allNeighbors.drop(NEIGHBOR_POOL))
-        session.neighborsLoaded = true
-        return session to drainBatch(session, FIRST_BATCH)
+        return buildArtistPool(seed.name, neighbors, artistTracks)
     }
 
     /**
@@ -134,35 +170,156 @@ class RadioStationGenerator @Inject constructor(
         result ?: ArtistVariantResult(variants.first().first, emptyList(), false)
     }
 
+    /** One artist search across all enabled addons: matches plus local-graph discoveries. */
+    private data class AddonArtistSearch(
+        val hits: List<EclipseAddonTrack>,
+        val discovered: List<String>,
+    )
+
     /**
-     * Artist-native fallback for an addon-only station: one `/search` for the
-     * artist's name (its primary credit — catalogues have no page for a
-     * multi-artist string) and the hits that are really by that artist, deduped
-     * by id and capped at [TRACKS_PER_ARTIST] * 2. No resolve round-trip: the
-     * candidates go through the normal addon resolution path at playback.
+     * Searches the artist (primary credit) on every enabled addon, in priority
+     * order. Raw hits are split into the ones that are the same artist and the
+     * other artists they surface — the latter are the local neighbour graph an
+     * addon-only station widens through.
      */
-    private suspend fun addonArtistTracks(artist: String, limit: Int): List<EclipseAddonTrack> {
-        val repo = eclipseAddons ?: return emptyList()
-        val addon = try {
-            repo.enabledNow().firstOrNull()
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            null
-        } ?: return emptyList()
-        val hits = try {
-            repo.search(addon, EclipseAddonQuery.primaryArtist(artist), limit = limit)
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            return emptyList()
-        }
-        return hits
-            .asSequence()
+    private suspend fun addonArtistSearch(
+        artist: String,
+        limit: Int,
+        addons: List<EclipseAddon>,
+    ): AddonArtistSearch {
+        val repo = eclipseAddons ?: return AddonArtistSearch(emptyList(), emptyList())
+        val query = EclipseAddonQuery.primaryArtist(artist).ifBlank { artist.trim() }
+        if (query.isEmpty() || addons.isEmpty()) return AddonArtistSearch(emptyList(), emptyList())
+        val raw = searchAllAddons(repo, addons, query, limit)
+        val hits = raw.asSequence()
             .filter { it.id.isNotBlank() && RadioAddonMatcher.artistOverlaps(artist, it.artist) }
             .distinctBy { it.id }
             .take(TRACKS_PER_ARTIST * 2)
             .toList()
+        val discovered = raw.asSequence()
+            .map { EclipseAddonQuery.primaryArtist(it.artist).ifBlank { it.artist.trim() } }
+            .filter { it.isNotEmpty() && !RadioAddonMatcher.artistOverlaps(artist, it) }
+            .distinctBy { it.lowercase() }
+            .toList()
+        return AddonArtistSearch(hits, discovered)
+    }
+
+    /**
+     * Runs `/search` on every enabled addon. Chunked so a user with several
+     * addons does not burst every catalogue at once; the addons' priority order
+     * is preserved in the flattened result (chunks run in order).
+     */
+    private suspend fun searchAllAddons(
+        repo: EclipseAddonRepository,
+        addons: List<EclipseAddon>,
+        query: String,
+        limit: Int,
+    ): List<EclipseAddonTrack> = coroutineScope {
+        addons.chunked(ADDON_SEARCH_PARALLELISM).flatMap { chunk ->
+            chunk.map { addon ->
+                async {
+                    try {
+                        repo.search(addon, query, limit)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        emptyList()
+                    }
+                }
+            }.awaitAll()
+        }.flatten()
+    }
+
+    /**
+     * The addon artist-radio pool: seed + Last.fm neighbours, each searched on
+     * all enabled addons in bounded chunks, with the hit retained on the
+     * candidate so no second network round-trip is needed to emit it.
+     * Discovered artists are queued for widen().
+     */
+    private suspend fun addonArtistPool(
+        seedName: String,
+        neighbors: List<LastFmSimilarArtist>,
+        addons: List<EclipseAddon>,
+        queueOut: ArrayDeque<Pair<String, Float>>,
+        seenOut: MutableSet<String>,
+    ): List<RadioCandidate> {
+        if (addons.isEmpty()) return emptyList()
+        val neighborWeightSum = neighbors.sumOf { it.match.coerceAtLeast(0.05f).toDouble() }.toFloat()
+        val seedWeight = if (neighborWeightSum <= 0f) 1f
+            else (SEED_SHARE / (1f - SEED_SHARE)) * neighborWeightSum
+        val targets = ArrayList<Pair<String, Float>>(neighbors.size + 1)
+        targets += seedName to seedWeight
+        neighbors.forEach { targets += it.name to it.match.coerceAtLeast(0.05f) }
+
+        val batches = addonArtistBatches(targets, ADDON_ARTIST_SEARCH_LIMIT, addons)
+        val out = ArrayList<RadioCandidate>()
+        for (batch in batches) {
+            val hop = if (batch.artist.equals(seedName, ignoreCase = true)) 0 else 1
+            for (hit in batch.search.hits.take(TRACKS_PER_ARTIST)) {
+                out += RadioCandidate(
+                    artist = hit.artist.ifBlank { batch.artist },
+                    title = hit.title,
+                    videoId = null,
+                    weight = batch.weight,
+                    thumbnailUrl = hit.artworkUrl,
+                    hop = hop,
+                    durationMs = hit.durationMs,
+                    addonTrack = hit,
+                )
+            }
+            enqueueAddonDiscovered(batch.search.discovered, batch.weight, queueOut, seenOut)
+        }
+        return out
+    }
+
+    /** One artist's search result, with the weight its candidates inherit. */
+    private data class AddonArtistBatch(
+        val artist: String,
+        val weight: Float,
+        val search: AddonArtistSearch,
+    )
+
+    /** Bounded fan-out over artist names; each name still fans out over addons internally. */
+    private suspend fun addonArtistBatches(
+        targets: List<Pair<String, Float>>,
+        limit: Int,
+        addons: List<EclipseAddon>,
+    ): List<AddonArtistBatch> = coroutineScope {
+        targets.chunked(ADDON_ARTIST_PARALLELISM).flatMap { chunk ->
+            chunk.map { (artist, weight) ->
+                async { AddonArtistBatch(artist, weight, addonArtistSearch(artist, limit, addons)) }
+            }.awaitAll()
+        }
+    }
+
+    /** Append newly discovered artists to the local widen graph, once each and bounded. */
+    private fun enqueueAddonDiscovered(
+        discovered: List<String>,
+        baseWeight: Float,
+        queueOut: ArrayDeque<Pair<String, Float>>,
+        seenOut: MutableSet<String>,
+    ) {
+        val weight = (baseWeight * ADDON_DISCOVERED_WEIGHT_FACTOR)
+            .coerceIn(ADDON_DISCOVERED_WEIGHT_MIN, ADDON_DISCOVERED_WEIGHT_MAX)
+        for (raw in discovered) {
+            val name = raw.trim()
+            if (name.isEmpty()) continue
+            if (seenOut.size >= ADDON_NEIGHBOR_QUEUE_MAX) return
+            if (!seenOut.add(name.lowercase())) continue
+            queueOut.addLast(name to weight)
+        }
+    }
+
+    /** Enabled addons in priority order, [] on any repository error (except cancellation). */
+    private suspend fun enabledAddonList(): List<EclipseAddon> {
+        val repo = eclipseAddons ?: return emptyList()
+        return try {
+            repo.enabledNow()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            emptyList()
+        }
     }
 
     /** One artist-variant answer: which string answered, and whether it was the primary. */
@@ -204,12 +361,28 @@ class RadioStationGenerator @Inject constructor(
             else (SEED_SHARE / (1f - SEED_SHARE)) * neighborWeightSum
         val out = ArrayList<RadioCandidate>()
         tracks[seedName]?.take(TRACKS_PER_ARTIST)?.forEach {
-            out += RadioCandidate(seedName, it.title, it.videoId, seedWeight, it.thumbnailUrl)
+            out += RadioCandidate(
+                seedName,
+                it.title,
+                it.videoId,
+                seedWeight,
+                it.thumbnailUrl,
+                hop = 0,
+                durationMs = (it.durationSeconds * 1_000).toLong(),
+            )
         }
         for (n in neighbors) {
             val w = n.match.coerceAtLeast(0.05f)
             tracks[n.name]?.take(TRACKS_PER_ARTIST)?.forEach {
-                out += RadioCandidate(n.name, it.title, it.videoId, w, it.thumbnailUrl)
+                out += RadioCandidate(
+                    n.name,
+                    it.title,
+                    it.videoId,
+                    w,
+                    it.thumbnailUrl,
+                    hop = 1,
+                    durationMs = (it.durationSeconds * 1_000).toLong(),
+                )
             }
         }
         return out
@@ -245,6 +418,18 @@ class RadioStationGenerator @Inject constructor(
                 session.played += id
                 session.played += vidKey
                 out += cand.toTrack(existingId)
+                continue
+            }
+            // An addon artist-search candidate already carries its catalogue hit:
+            // emit it directly, preserving the search's artwork/duration/artist
+            // instead of paying for another resolve/search round-trip.
+            val attached = cand.addonTrack
+            if (addonsOn && attached != null && attached.id.isNotBlank()) {
+                val addonKey = ADDON_PREFIX + attached.id
+                if (addonKey in session.played) continue
+                session.played += id
+                session.played += addonKey
+                out += cand.toAddonTrack(attached)
                 continue
             }
             val resolution =
@@ -297,6 +482,15 @@ class RadioStationGenerator @Inject constructor(
         return yt.searchCanonicalMatch(cand.artist, cand.title)?.let { Resolution.YouTube(it) }
     }
 
+    /** Runs one Last.fm list read, mapping a failure to [emptyList] (cancellation still propagates). */
+    private suspend fun <T> lastFmOrEmpty(block: suspend () -> Result<List<T>>): List<T> = try {
+        block().getOrDefault(emptyList())
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        emptyList()
+    }
+
     /** The user's YouTube switch; absent prefs (tests) mean on. */
     private suspend fun youtubeOn(): Boolean {
         val prefs = streamingPreference ?: return true
@@ -343,6 +537,8 @@ class RadioStationGenerator @Inject constructor(
         while (toResolve.size < count && i < session.ordered.size) {
             val cand = session.ordered[i++]
             if (!cand.videoId.isNullOrBlank()) continue
+            // Already carries its addon hit: drainBatch emits it directly.
+            if (addonsOn && !cand.addonTrack?.id.isNullOrBlank()) continue
             val id = cand.identity()
             if (id !in session.played) toResolve.putIfAbsent(id, cand)
         }
@@ -364,11 +560,12 @@ class RadioStationGenerator @Inject constructor(
     }
 
     /**
-     * Resolves [cand] through the first enabled Eclipse addon. Null when no
-     * addon repository is present, no addon is enabled, or the addon missed
-     * (including any error) — the caller then falls back to YouTube. The
-     * emitted track carries no videoId; playback resolves the addon stream
-     * from its title/artist/duration at play time.
+     * Resolves [cand] through the enabled Eclipse addons in priority order,
+     * stopping at the first hit. Each addon is asked on its own (bounded: one
+     * addon at a time, so a miss never bursts every catalogue), which is what
+     * makes a second or third enabled addon a real fallback instead of dead
+     * weight. Null when no addon is enabled or every addon misses (including
+     * any error) — the caller then falls back to YouTube.
      *
      * Non-Cloud addons try `/resolve` first, then `/search` (radio candidates
      * carry no ISRC/duration and `/resolve` misses songs the catalogue still
@@ -379,18 +576,15 @@ class RadioStationGenerator @Inject constructor(
      */
     private suspend fun addonResolve(cand: RadioCandidate): EclipseAddonTrack? {
         val repo = eclipseAddons ?: return null
-        val addon = try {
-            repo.enabledNow().firstOrNull()
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            null
-        } ?: return null
-        return if (addon.isEclipseCloud) {
-            addonSearch(repo, addon, cand) ?: addonResolveTry(repo, addon, cand)
-        } else {
-            addonResolveTry(repo, addon, cand) ?: addonSearch(repo, addon, cand)
+        for (addon in enabledAddonList()) {
+            val hit = if (addon.isEclipseCloud) {
+                addonSearch(repo, addon, cand) ?: addonResolveTry(repo, addon, cand)
+            } else {
+                addonResolveTry(repo, addon, cand) ?: addonSearch(repo, addon, cand)
+            }
+            if (hit != null) return hit
         }
+        return null
     }
 
     /** `/resolve` with its timing log; null on a miss or any error. */
@@ -496,8 +690,11 @@ class RadioStationGenerator @Inject constructor(
     /** Append more candidates by PAGING the unused neighbor list (never
      *  re-fetching the same top-N, which would only re-return already-played
      *  neighbors). Song radio lazy-loads the neighbor list here on first widen;
-     *  artist radio filled it at start. Sets [exhausted] only when no neighbors
-     *  remain to try. */
+     *  artist radio filled it at start. With addons enabled, the same slice is
+     *  also searched through every addon and the local artist graph is drained,
+     *  so an addon-only station keeps widening instead of stopping after its
+     *  first pool. Sets [exhausted] only when no neighbor remains in either
+     *  graph. */
     private suspend fun widen(session: RadioSession) {
         if (!session.neighborsLoaded) {
             val seedArtistName = when (val s = session.seed) {
@@ -505,38 +702,99 @@ class RadioStationGenerator @Inject constructor(
                 is RadioSeed.Song -> s.artist
             }
             session.remainingNeighbors.addAll(
-                lastFm.getSimilarArtists(seedArtistName, limit = NEIGHBOR_MAX).getOrDefault(emptyList()),
+                lastFmOrEmpty { lastFm.getSimilarArtists(seedArtistName, limit = NEIGHBOR_MAX) },
             )
             session.neighborsLoaded = true
         }
-        if (session.remainingNeighbors.isEmpty()) { session.exhausted = true; return }
-        // Page the next slice of never-used neighbors.
+        val youtubeOn = youtubeOn()
+        val addonsOn = addonsOn()
+        if (!youtubeOn && !addonsOn) {
+            session.exhausted = true
+            return
+        }
+        // Page the next slice of never-used Last.fm neighbors.
         val next = ArrayList<LastFmSimilarArtist>()
         while (next.size < NEIGHBOR_POOL && session.remainingNeighbors.isNotEmpty()) {
             next += session.remainingNeighbors.removeFirst()
         }
+        val hop = session.widenCount + 2
         val fresh = ArrayList<RadioCandidate>()
-        for (n in next) {
-            val id = yt.resolveArtist(n.name)?.id ?: continue
-            val popular = runCatching { yt.getArtist(id).popular }.getOrDefault(emptyList())
-            popular.take(TRACKS_PER_ARTIST).forEach {
-                val cand = RadioCandidate(n.name, it.title, it.videoId, n.match.coerceAtLeast(0.05f), it.thumbnailUrl)
-                if (cand.identity() !in session.played) fresh += cand
+        if (youtubeOn) {
+            for (n in next) {
+                val id = yt.resolveArtist(n.name)?.id ?: continue
+                val popular = runCatching { yt.getArtist(id).popular }.getOrDefault(emptyList())
+                popular.take(TRACKS_PER_ARTIST).forEach {
+                    val cand = RadioCandidate(
+                        n.name,
+                        it.title,
+                        it.videoId,
+                        n.match.coerceAtLeast(0.05f),
+                        it.thumbnailUrl,
+                        hop = hop,
+                        durationMs = (it.durationSeconds * 1_000).toLong(),
+                    )
+                    if (cand.identity() !in session.played) fresh += cand
+                }
+            }
+        }
+        if (addonsOn) {
+            val addons = enabledAddonList()
+            val targets = ArrayList<Pair<String, Float>>()
+            next.forEach { targets += it.name to it.match.coerceAtLeast(0.05f) }
+            // Drain the addon-only local graph too: with no Last.fm key the
+            // remainingNeighbors queue is empty, and these are the only names
+            // that can keep the station drifting.
+            while (targets.size < NEIGHBOR_POOL && session.addonNeighbors.isNotEmpty()) {
+                targets += session.addonNeighbors.removeFirst()
+            }
+            val uniqueTargets = targets.distinctBy { it.first.trim().lowercase() }
+            if (addons.isNotEmpty() && uniqueTargets.isNotEmpty()) {
+                val batches = addonArtistBatches(uniqueTargets, ADDON_NEIGHBOR_SEARCH_LIMIT, addons)
+                for (batch in batches) {
+                    for (hit in batch.search.hits.take(TRACKS_PER_ARTIST)) {
+                        val cand = RadioCandidate(
+                            artist = hit.artist.ifBlank { batch.artist },
+                            title = hit.title,
+                            videoId = null,
+                            weight = batch.weight,
+                            thumbnailUrl = hit.artworkUrl,
+                            hop = hop,
+                            durationMs = hit.durationMs,
+                            addonTrack = hit,
+                        )
+                        if (cand.identity() !in session.played) fresh += cand
+                    }
+                    enqueueAddonDiscovered(
+                        batch.search.discovered,
+                        batch.weight,
+                        session.addonNeighbors,
+                        session.addonNeighborsSeen,
+                    )
+                }
             }
         }
         if (fresh.isEmpty()) {
-            // This slice yielded nothing new; only truly done when no neighbors remain.
-            if (session.remainingNeighbors.isEmpty()) session.exhausted = true
+            // Only truly done when neither graph has an unused artist left.
+            // An addon discovery queued above counts as material for the next
+            // widen even if this slice itself produced nothing.
+            if (session.remainingNeighbors.isEmpty() && session.addonNeighbors.isEmpty()) {
+                session.exhausted = true
+            }
             return
         }
-        session.ordered += RadioInterleaver.order(fresh)
+        session.ordered += RadioInterleaver.order(
+            fresh,
+            matchFloor = WIDEN_MATCH_FLOOR,
+            skippedArtists = session.skippedArtists,
+        )
+        session.widenCount++
     }
 
     private fun RadioCandidate.toTrack(videoId: String, resolvedArt: String? = null) = Track(
         id = videoId.hashCode().toLong(),
         title = title,
         artist = artist,
-        durationMs = 0L,
+        durationMs = durationMs,
         // Album art, best-first: the candidate's own InnerTube cover (artist-radio
         // popular tracks carry a square 544px one), else the square album cover
         // pulled from the YT Music search that resolved the videoId (song-radio /
@@ -552,14 +810,14 @@ class RadioStationGenerator @Inject constructor(
      * Metadata-only track for an Eclipse addon match: no videoId, so playback
      * resolves the addon stream from title/artist/duration at play time. The id
      * is synthetic (the addon item-id hash, same convention as videoId hashes)
-     * because the song has no library row. Addon artwork fills in only when the
-     * candidate itself carried none.
+     * because the song has no library row. The catalogue hit's own artist and
+     * duration win; artist-search candidates also carry its artwork.
      */
     private fun RadioCandidate.toAddonTrack(match: EclipseAddonTrack) = Track(
         id = (ADDON_PREFIX + match.id).hashCode().toLong(),
         title = title.ifBlank { match.title },
-        artist = artist.ifBlank { match.artist },
-        durationMs = match.durationMs,
+        artist = match.artist.ifBlank { artist },
+        durationMs = match.durationMs.takeIf { it > 0 } ?: durationMs,
         albumArtUrl = thumbnailUrl ?: match.artworkUrl,
         youtubeId = null,
         source = MusicSource.YOUTUBE,
@@ -587,15 +845,13 @@ class RadioStationGenerator @Inject constructor(
         val (similarResult, seedTopResult) = coroutineScope {
             val similarJob = async {
                 firstNonEmptyByArtist(seed.artist) { artist ->
-                    lastFm.getSimilarTracks(artist, seed.title, limit = NEIGHBOR_LIMIT)
-                        .getOrDefault(emptyList())
+                    lastFmOrEmpty { lastFm.getSimilarTracks(artist, seed.title, limit = NEIGHBOR_LIMIT) }
                         .take(SONG_SIMILAR_POOL)
                 }
             }
             val seedTopJob = async {
                 firstNonEmptyByArtist(seed.artist) { artist ->
-                    lastFm.getArtistTopTracks(artist, limit = TRACKS_PER_ARTIST)
-                        .getOrDefault(emptyList())
+                    lastFmOrEmpty { lastFm.getArtistTopTracks(artist, limit = TRACKS_PER_ARTIST) }
                 }
             }
             similarJob.await() to seedTopJob.await()
@@ -622,10 +878,12 @@ class RadioStationGenerator @Inject constructor(
         // the only source for them — with YouTube off the addon-only path over the
         // seed + top tracks (plus search variants) is kept.
         val fallback = ArrayList<RadioCandidate>()
+        val addonQueue = ArrayDeque<Pair<String, Float>>()
+        val addonSeen = mutableSetOf(seed.artist.trim().lowercase())
         if (similar.isEmpty()) {
             if (youtubeOn()) {
                 val neighborResult = firstNonEmptyByArtist(seed.artist) { artist ->
-                    lastFm.getSimilarArtists(artist, limit = NEIGHBOR_MAX).getOrDefault(emptyList())
+                    lastFmOrEmpty { lastFm.getSimilarArtists(artist, limit = NEIGHBOR_MAX) }
                 }
                 val neighbors = neighborResult.items.take(NEIGHBOR_POOL)
                 val neighborTracks = coroutineScope {
@@ -634,7 +892,15 @@ class RadioStationGenerator @Inject constructor(
                 for ((neighbor, popular) in neighborTracks) {
                     val weight = neighbor.match.coerceAtLeast(0.05f)
                     popular.take(TRACKS_PER_ARTIST).forEach {
-                        fallback += RadioCandidate(neighbor.name, it.title, it.videoId, weight, it.thumbnailUrl)
+                        fallback += RadioCandidate(
+                            neighbor.name,
+                            it.title,
+                            it.videoId,
+                            weight,
+                            it.thumbnailUrl,
+                            hop = 2,
+                            durationMs = (it.durationSeconds * 1_000).toLong(),
+                        )
                     }
                 }
                 Log.d(
@@ -642,40 +908,49 @@ class RadioStationGenerator @Inject constructor(
                     "song seed fallback: similar=0 neighbours=${neighbors.size} candidates=${fallback.size}",
                 )
             } else if (addonsOn()) {
-                // YouTube off: there is no artist graph to borrow (neighbour
-                // candidates are YT popular lists). Ask the addon for the artist's
-                // own catalogue instead — one search, then the normal addon
-                // resolution path. Artist-keyed by the SEED so the station stays
-                // coherent; a fixed mid weight keeps them present without
-                // dominating the seed share.
-                val artistHits = addonArtistTracks(seed.artist, limit = ADDON_ARTIST_SEARCH_LIMIT)
-                for (hit in artistHits) {
+                // YouTube off: there is no YT popular list to borrow. Ask every
+                // enabled addon for the artist's own catalogue instead, keeping
+                // the hit on the candidate (artwork/duration/artist preserved)
+                // and queueing the other artists it surfaces for widening.
+                val enabled = enabledAddonList()
+                val search = if (enabled.isEmpty()) {
+                    AddonArtistSearch(emptyList(), emptyList())
+                } else {
+                    addonArtistSearch(seed.artist, ADDON_ARTIST_SEARCH_LIMIT, enabled)
+                }
+                for (hit in search.hits) {
                     fallback += RadioCandidate(
                         seed.artist,
                         hit.title,
                         null,
                         ADDON_ARTIST_WEIGHT,
                         hit.artworkUrl,
+                        hop = 1,
+                        durationMs = hit.durationMs,
+                        addonTrack = hit,
                     )
                 }
+                enqueueAddonDiscovered(search.discovered, ADDON_ARTIST_WEIGHT, addonQueue, addonSeen)
                 Log.d(
                     TAG,
-                    "song seed fallback: addonArtist=${artistHits.size} candidates=${fallback.size}",
+                    "song seed fallback: addonArtist=${search.hits.size} candidates=${fallback.size}",
                 )
             }
         }
 
         val pool = ArrayList<RadioCandidate>()
         // Seed share: the seeded track first, then the seed artist's top tracks.
-        pool += RadioCandidate(seed.artist, seed.title, seed.ytVideoId, seedWeight)
+        pool += RadioCandidate(seed.artist, seed.title, seed.ytVideoId, seedWeight, hop = 0)
         seedTop.filterNot { it.title.equals(seed.title, ignoreCase = true) }
-            .forEach { pool += RadioCandidate(seed.artist, it.title, null, seedWeight) }
+            .forEach { pool += RadioCandidate(seed.artist, it.title, null, seedWeight, hop = 0) }
         // Neighbors: each similar track, weighted by match; artist keyed for interleave.
         for (s in similar) {
-            pool += RadioCandidate(s.artist, s.title, null, s.match.coerceAtLeast(0.05f))
+            pool += RadioCandidate(s.artist, s.title, null, s.match.coerceAtLeast(0.05f), hop = 1)
         }
         pool += fallback
         val session = RadioSession(seed, RadioInterleaver.order(pool).toMutableList(), mutableSetOf())
+        session.addonNeighbors.addAll(addonQueue)
+        session.addonNeighborsSeen.addAll(addonSeen)
         return session to drainBatch(session, FIRST_BATCH)
     }
 
@@ -708,10 +983,30 @@ class RadioStationGenerator @Inject constructor(
         /** Query variants tried per candidate: full credit and cleaned+primary, in parallel. */
         private const val ADDON_SEARCH_VARIANT_LIMIT = 2
 
-        /** Artist-search limit for the addon-only artist fallback (one call). */
+        /** Artist-search limit for the addon-only artist fallback (one call per addon). */
         private const val ADDON_ARTIST_SEARCH_LIMIT = 25
+
+        /** Neighbour artist-search limit per widen slice. */
+        private const val ADDON_NEIGHBOR_SEARCH_LIMIT = 15
 
         /** Fixed mid weight for addon artist-fallback candidates. */
         private const val ADDON_ARTIST_WEIGHT = 0.6f
+
+        /** Addons searched at once (within one artist target). */
+        private const val ADDON_SEARCH_PARALLELISM = 2
+
+        /** Artist targets searched at once (each still fans out over addons). */
+        private const val ADDON_ARTIST_PARALLELISM = 3
+
+        /** Discovered artists kept for the local widen graph. */
+        private const val ADDON_NEIGHBOR_QUEUE_MAX = 60
+
+        /** A discovered artist's weight is its source's weight times this, clamped below. */
+        private const val ADDON_DISCOVERED_WEIGHT_FACTOR = 0.5f
+        private const val ADDON_DISCOVERED_WEIGHT_MIN = 0.2f
+        private const val ADDON_DISCOVERED_WEIGHT_MAX = 0.6f
+
+        /** Per-widen match floor: weak Last.fm neighbours are not worth a slot. */
+        private const val WIDEN_MATCH_FLOOR = 0.05f
     }
 }

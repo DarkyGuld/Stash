@@ -41,6 +41,11 @@ class RadioStationGeneratorAddonTest {
         resources = listOf("resolve", "stream"),
     )
     private val cloudAddon = addon.copy(id = "eclipse-music-cloud", name = "Eclipse Cloud")
+    private val secondAddon = addon.copy(
+        id = "second-addon",
+        name = "Second addon",
+        manifestUrl = "https://addons.test/second/manifest.json",
+    )
 
     private fun gen() = RadioStationGenerator(lastFm, yt, addons)
     private fun genWithPrefs() = RadioStationGenerator(lastFm, yt, addons, prefs)
@@ -562,5 +567,141 @@ class RadioStationGeneratorAddonTest {
         // Two 1 s searches in parallel finish at ~1 s; serialized they would take 2 s.
         assertThat(testScheduler.currentTime).isAtMost(1_000L)
         coVerify(exactly = 2) { addons.search(addon, any(), 10) }
+    }
+
+    @Test fun `addon-only artist radio builds from addon artist search and keeps metadata`() = runTest {
+        coEvery { prefs.isYoutubeEnabled() } returns false
+        coEvery { prefs.isEclipseAddonsEnabled() } returns true
+        coEvery { lastFm.getSimilarArtists("Seed Artist", any()) } returns
+            Result.success(listOf(LastFmSimilarArtist("Neighbour", 0.8f)))
+        coEvery { addons.enabledNow() } returns listOf(addon)
+        coEvery { addons.search(addon, "Seed Artist", 25) } returns listOf(
+            EclipseAddonTrack(
+                id = "seed-1",
+                title = "Seed Song",
+                artist = "Seed Artist",
+                duration = 201, // seconds per the addon protocol
+                artworkUrl = "https://cdn.test/seed.jpg",
+            ),
+        )
+        coEvery { addons.search(addon, "Neighbour", 25) } returns listOf(
+            EclipseAddonTrack(
+                id = "n-1",
+                title = "Neighbour Song",
+                artist = "Neighbour",
+                duration = 180,
+                artworkUrl = "https://cdn.test/neighbour.jpg",
+            ),
+        )
+
+        val (_, batch) = genWithPrefs().start(RadioSeed.Artist("Seed Artist"))
+
+        assertThat(batch).hasSize(2)
+        val seed = batch.single { it.title == "Seed Song" }
+        assertThat(seed.artist).isEqualTo("Seed Artist")
+        assertThat(seed.durationMs).isEqualTo(201_000L)
+        assertThat(seed.albumArtUrl).isEqualTo("https://cdn.test/seed.jpg")
+        assertThat(seed.youtubeId).isNull()
+        val neighbour = batch.single { it.title == "Neighbour Song" }
+        assertThat(neighbour.artist).isEqualTo("Neighbour")
+        assertThat(neighbour.durationMs).isEqualTo(180_000L)
+        assertThat(neighbour.albumArtUrl).isEqualTo("https://cdn.test/neighbour.jpg")
+        // The addon supplied the whole artist-radio pool: no YT Popular walk.
+        coVerify(exactly = 0) { yt.resolveArtist(any()) }
+        coVerify(exactly = 0) { yt.getArtist(any()) }
+        coVerify(exactly = 0) { yt.searchCanonicalMatch(any(), any()) }
+    }
+
+    @Test fun `addon-only artist radio widens through the next Lastfm neighbour`() = runTest {
+        coEvery { prefs.isYoutubeEnabled() } returns false
+        coEvery { prefs.isEclipseAddonsEnabled() } returns true
+        coEvery { addons.enabledNow() } returns listOf(addon)
+        coEvery { lastFm.getSimilarArtists("Seed Artist", any()) } returns Result.success(
+            (1..13).map { LastFmSimilarArtist("N$it", 1f - it * 0.01f) },
+        )
+        coEvery { addons.search(addon, any(), any()) } answers {
+            val query = secondArg<String>()
+            val title = if (query == "Seed Artist") "Seed Song" else "Song $query"
+            listOf(
+                EclipseAddonTrack(
+                    id = "id-$query",
+                    title = title,
+                    artist = query,
+                    duration = 180,
+                    artworkUrl = "https://cdn.test/$query.jpg",
+                ),
+            )
+        }
+
+        val generator = genWithPrefs()
+        val (session, first) = generator.start(RadioSeed.Artist("Seed Artist"))
+        val second = generator.nextBatch(session)
+
+        // The initial pool held N1..N12; N13 can only come from widen's addon leg.
+        assertThat((first + second).map { it.title }).contains("Song N13")
+        assertThat(session.exhausted).isFalse()
+        coVerify(exactly = 0) { yt.resolveArtist(any()) }
+        coVerify(exactly = 0) { yt.getArtist(any()) }
+    }
+
+    @Test fun `artist search tries every enabled addon in order`() = runTest {
+        coEvery { prefs.isYoutubeEnabled() } returns false
+        coEvery { prefs.isEclipseAddonsEnabled() } returns true
+        coEvery { lastFm.getSimilarArtists("Seed Artist", any()) } returns Result.success(emptyList())
+        coEvery { addons.enabledNow() } returns listOf(addon, secondAddon)
+        coEvery { addons.search(addon, any(), any()) } returns emptyList()
+        coEvery { addons.search(secondAddon, "Seed Artist", 25) } returns listOf(
+            EclipseAddonTrack(id = "second:1", title = "Second Song", artist = "Seed Artist", duration = 200),
+        )
+
+        val (_, batch) = genWithPrefs().start(RadioSeed.Artist("Seed Artist"))
+
+        assertThat(batch.single().id).isEqualTo(("addon:" + "second:1").hashCode().toLong())
+        coVerify(exactly = 1) { addons.search(addon, "Seed Artist", 25) }
+        coVerify(exactly = 1) { addons.search(secondAddon, "Seed Artist", 25) }
+    }
+
+    @Test fun `a Lastfm graph failure falls back to addon artist search`() = runTest {
+        coEvery { prefs.isYoutubeEnabled() } returns false
+        coEvery { prefs.isEclipseAddonsEnabled() } returns true
+        coEvery { lastFm.getSimilarArtists(any(), any()) } throws RuntimeException("no Last.fm key")
+        coEvery { addons.enabledNow() } returns listOf(addon)
+        coEvery { addons.search(addon, "Seed Artist", 25) } returns listOf(
+            EclipseAddonTrack(
+                id = "seed-1",
+                title = "Seed Song",
+                artist = "Seed Artist",
+                duration = 200,
+                artworkUrl = "https://cdn.test/seed.jpg",
+            ),
+        )
+
+        val (_, batch) = genWithPrefs().start(RadioSeed.Artist("Seed Artist"))
+
+        assertThat(batch.single().title).isEqualTo("Seed Song")
+        assertThat(batch.single().youtubeId).isNull()
+    }
+
+    @Test fun `resolve falls through to the next enabled addon`() = runTest {
+        coEvery { addons.enabledNow() } returns listOf(addon, secondAddon)
+        coEvery { addons.resolve(addon, any(), any(), any(), any()) } returns null
+        coEvery { addons.search(addon, any(), any()) } returns emptyList()
+        coEvery { addons.resolve(secondAddon, any(), any(), any(), any()) } returns EclipseAddonTrack(
+            id = "second:1",
+            title = "Fallback Song",
+            artist = "Fallback Artist",
+            duration = 210,
+        )
+
+        val session = RadioSession(
+            RadioSeed.Song("Fallback Song", "Fallback Artist"),
+            mutableListOf(RadioCandidate("Fallback Artist", "Fallback Song", null, 1f)),
+            mutableSetOf(),
+        )
+        val batch = gen().drainBatch(session, 10)
+
+        assertThat(batch.single().id).isEqualTo(("addon:" + "second:1").hashCode().toLong())
+        coVerify(exactly = 1) { addons.resolve(addon, "Fallback Song", "Fallback Artist", null, null) }
+        coVerify(exactly = 1) { addons.resolve(secondAddon, "Fallback Song", "Fallback Artist", null, null) }
     }
 }

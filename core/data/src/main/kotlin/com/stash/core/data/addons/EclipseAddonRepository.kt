@@ -157,7 +157,7 @@ class EclipseAddonRepository @Inject constructor(
     suspend fun enabledNow(): List<EclipseAddon> = prefs.addonsNow().filter { it.enabled }
 
     suspend fun search(addon: EclipseAddon, query: String, limit: Int): List<EclipseAddonTrack> =
-        client.search(addon.manifestUrl, query, limit, addon.settings)
+        client.search(addon.manifestUrl, query, limit, addon.settings, addonId = addon.id)
 
     suspend fun resolve(
         addon: EclipseAddon,
