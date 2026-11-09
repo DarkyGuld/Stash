@@ -7,16 +7,23 @@ import com.stash.data.ytmusic.model.ArtistProfile
 import com.stash.data.ytmusic.model.ArtistSummary
 import com.stash.data.ytmusic.model.TrackSummary
 import io.mockk.coEvery
+import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 
 class RadioStationGeneratorArtistTest {
     private val lastFm: LastFmApiClient = mockk()
     private val yt: YTMusicApiClient = mockk()
     private fun gen() = RadioStationGenerator(lastFm, yt)
+
+    /** The start diagnostics read this property; strict mocks need an answer. */
+    @Before fun stubDiagnostics() {
+        every { lastFm.isConfigured } returns true
+    }
 
     private fun ts(artist: String, n: Int) =
         TrackSummary(videoId = "$artist$n", title = "$artist song $n", artist = artist,

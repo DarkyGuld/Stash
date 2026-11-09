@@ -21,4 +21,6 @@
     <string name="radio_failed_player_not_ready">Player is still starting. Try again.</string>
     <string name="radio_failed_no_station">Couldn\'t find similar songs for this.</string>
     <string name="radio_failed_download_mode">Radio streams. Switch to Online to start one.</string>
+    <string name="radio_failed_not_configured">Radio needs Last.fm. Add your key in Settings → Last.fm.</string>
+    <string name="radio_failed_timeout">Radio took too long and was stopped. Try again.</string>
 </resources>

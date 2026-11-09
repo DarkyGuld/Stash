@@ -1,7 +1,9 @@
 package com.stash.core.media
 
 import android.content.Context
+import android.util.Log
 import androidx.annotation.StringRes
+import com.stash.core.data.lastfm.LastFmApiClient
 import com.stash.core.data.radio.RadioSeed
 import com.stash.core.model.RadioStartResult
 import com.stash.core.model.Track
@@ -13,6 +15,7 @@ import dagger.hilt.components.SingletonComponent
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withTimeoutOrNull
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -46,6 +49,8 @@ interface RadioStarter {
             RadioStartResult.PlayerNotReady -> R.string.radio_failed_player_not_ready
             RadioStartResult.NoStation -> R.string.radio_failed_no_station
             RadioStartResult.DownloadMode -> R.string.radio_failed_download_mode
+            RadioStartResult.NotConfigured -> R.string.radio_failed_not_configured
+            RadioStartResult.Timeout -> R.string.radio_failed_timeout
         }
     }
 }
@@ -55,6 +60,7 @@ interface RadioStarter {
 class PlayerRadioStarter @Inject constructor(
     private val playerRepository: PlayerRepository,
     @ApplicationContext private val context: Context,
+    private val lastFm: LastFmApiClient? = null,
 ) : RadioStarter {
 
     private val _tuning = MutableStateFlow(false)
@@ -73,7 +79,25 @@ class PlayerRadioStarter @Inject constructor(
     private suspend fun start(seed: RadioSeed): String? {
         if (!_tuning.compareAndSet(expect = false, update = true)) return null
         return try {
-            messageFor(playerRepository.startRadio(seed))
+            if (lastFm != null && !lastFm.isConfigured) {
+                Log.w(TAG, "radio: no Last.fm key or proxy configured; not tuning")
+                return context.getString(R.string.radio_failed_not_configured)
+            }
+            val seedLabel = when (seed) {
+                is RadioSeed.Artist -> "artist:${seed.name}"
+                is RadioSeed.Song -> "song:${seed.artist} - ${seed.title}"
+            }
+            Log.d(TAG, "radio: tuning $seedLabel")
+            val startedAt = System.currentTimeMillis()
+            val result = withTimeoutOrNull(RADIO_TIMEOUT_MS) { playerRepository.startRadio(seed) }
+            val took = System.currentTimeMillis() - startedAt
+            if (result == null) {
+                Log.w(TAG, "radio: timed out after $took ms for $seedLabel")
+                context.getString(R.string.radio_failed_timeout)
+            } else {
+                Log.d(TAG, "radio: $result in $took ms for $seedLabel")
+                messageFor(result)
+            }
         } finally {
             _tuning.value = false
         }
@@ -81,6 +105,11 @@ class PlayerRadioStarter @Inject constructor(
 
     private fun messageFor(result: RadioStartResult): String? =
         RadioStarter.failureMessage(result)?.let(context::getString)
+
+    private companion object {
+        const val TAG = "RadioStarter"
+        const val RADIO_TIMEOUT_MS = 25_000L
+    }
 }
 
 @Module

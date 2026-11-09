@@ -583,7 +583,10 @@ class EclipseAddonStreamResolver private constructor(
         isrcProvider: suspend () -> String?,
     ): EclipseAddonStream {
         var isrc = try { isrcProvider() } catch (e: CancellationException) { throw e } catch (e: Exception) { null }
-        val tiers = listOf(addon.appleQuality, "HI_RES", "LOSSLESS", "HI_RES_LOSSLESS").distinct()
+        // Only the configured tier and CD quality: the old HI_RES → LOSSLESS →
+        // HI_RES_LOSSLESS walk cost up to four serial round trips (~0.4-0.7 s each)
+        // on tracks the catalogue has no hi-res for. One fallback is enough.
+        val tiers = listOf(addon.appleQuality, "LOSSLESS").distinct()
         var last: Exception? = null
         for (tier in tiers) {
             try {
@@ -966,8 +969,25 @@ private const val HLS_TTL_MS = 6 * 60 * 60_000L
  */
 internal object EclipseAddonMatcher {
     private const val DURATION_TOLERANCE_MS = 15_000L
+
+    /**
+     * Edit labels differ between catalogues ("Radio Edit" vs "Edit"), so the title
+     * alone cannot prove it is the same file. Two edits of one song can also differ
+     * in length, so the alias is accepted only when the durations agree this closely
+     * (the rejected candidate above was 171 ms apart).
+     */
+    private const val EDIT_DURATION_TOLERANCE_MS = 2_000L
     private const val LOSSLESS_BONUS = 100.0
     private val MARKERS = listOf("live", "remix", "instrumental")
+
+    /**
+     * A trailing edit marker in either spelling a catalog uses:
+     * `- Radio Edit`, `(Radio Edit)`, `(Edit)`, `- Edit`. Only the label differs;
+     * the recording is the same one trimmed, so the two sides match.
+     */
+    private val EDIT_SUFFIX = Regex("(?i)\\s*[-–—]?\\s*\\(?\\s*(?:radio\\s+)?edit\\s*\\)?\\s*$")
+
+    private fun editless(raw: String): String = normalize(EDIT_SUFFIX.replace(raw, ""))
 
     fun best(track: TrackEntity, candidates: List<EclipseAddonTrack>): EclipseAddonTrack? {
         val isrc = track.isrc?.trim()?.takeIf { it.isNotEmpty() }
@@ -981,6 +1001,7 @@ internal object EclipseAddonMatcher {
         // catalog; the plain title is accepted as an alias. The marker check below
         // still rejects Remix/Live/Instrumental, which are different recordings.
         val cleanedTitle = normalize(EclipseAddonQuery.cleanedTitle(track.title))
+        val trackEditless = editless(track.title)
         val trackMarkers = markers(track.title)
 
         return candidates
@@ -988,7 +1009,15 @@ internal object EclipseAddonMatcher {
             .filter { candidate -> candidate.id.isNotBlank() }
             .filter { candidate ->
                 val candidateTitle = normalize(candidate.title)
-                candidateTitle == title || (cleanedTitle != title && candidateTitle == cleanedTitle)
+                if (candidateTitle == title || (cleanedTitle != title && candidateTitle == cleanedTitle)) {
+                    return@filter true
+                }
+                // "Radio Edit" vs "Edit": only the same file when the length agrees.
+                trackEditless.isNotEmpty() &&
+                    editless(candidate.title) == trackEditless &&
+                    track.durationMs > 0 &&
+                    candidate.durationMs > 0 &&
+                    kotlin.math.abs(track.durationMs - candidate.durationMs) <= EDIT_DURATION_TOLERANCE_MS
             }
             .filter { candidate -> markers(candidate.title) == trackMarkers }
             .filter { candidate -> artistMatches(track.artist, candidate.artist) }

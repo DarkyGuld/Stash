@@ -627,6 +627,15 @@ class EclipseAddonClient @Inject constructor(
             .header("User-Agent", userAgentFor(url))
             .header("X-Client-Platform", CLIENT_PLATFORM)
 
+        // Eclipse's addon routes answer 403 "Unavailable" to any request that has
+        // neither Origin nor Referer (backend change, Nov 2026), even with a valid
+        // account token. Eclipse's own web client sends neither on its GETs, so the
+        // hosted player fails the same way; a browser-shaped Origin is accepted.
+        if (url.host == ECLIPSE_HOST) {
+            builder.header("Origin", ECLIPSE_WEB_ORIGIN)
+            builder.header("Referer", "$ECLIPSE_WEB_ORIGIN/")
+        }
+
         val accountToken = tokenStore.getEclipseToken() ?: return builder
         if (!isEclipseAccountUrl(url)) return builder
 
@@ -673,6 +682,8 @@ class EclipseAddonClient @Inject constructor(
                 .url(url)
                 .header("User-Agent", BROWSER_USER_AGENT)
                 .header("X-Client-Platform", CLIENT_PLATFORM)
+                .header("Origin", ECLIPSE_WEB_ORIGIN)
+                .header("Referer", "$ECLIPSE_WEB_ORIGIN/")
                 .header("Authorization", "Bearer $accountToken")
                 .post(EMPTY_BODY)
                 .build()
@@ -715,6 +726,14 @@ class EclipseAddonClient @Inject constructor(
 
         /** Eclipse's web client identity; its addons gate on this. */
         const val CLIENT_PLATFORM: String = "web"
+
+        /**
+         * Eclipse's web origin. Its addon routes answer 403 "Unavailable" unless a
+         * request carries an Origin or Referer (Nov 2026 backend change), so every
+         * call to that host states the web origin it is shaped like.
+         */
+        const val ECLIPSE_WEB_ORIGIN = "https://eclipsemusic.app"
+
 
         private const val TAG = "EclipseAddonClient"
 

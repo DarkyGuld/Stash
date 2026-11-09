@@ -181,6 +181,11 @@ class StashApplication : Application(), Configuration.Provider {
     @Inject
     lateinit var eclipseAddonWarmup: com.stash.core.media.streaming.EclipseAddonWarmup
 
+    /** Last successful attempt at warming the addon socket (foreground + network change). */
+    private var lastEclipseWarmAtMs = 0L
+
+    private val eclipseWarmMinIntervalMs = 60_000L
+
     @Inject
     lateinit var streamingQualityPreferences: com.stash.data.download.prefs.StreamingQualityPreferences
 
@@ -403,6 +408,18 @@ class StashApplication : Application(), Configuration.Provider {
                     // start (Pixel 6, 2026-09-06). Reconnect while the user is still
                     // looking, so the first tap after coming back starts at once.
                     playerRepository.warmUp()
+                    // Re-warm the Eclipse addon socket on every return to the foreground:
+                    // the OS drops idle connections, and a cold DNS+TCP+TLS handshake is
+                    // ~550 ms on 5G while a warm one is RTT-bound (~200 ms). Throttled so
+                    // quick app switches don't re-fetch the manifest.
+                    val now = System.currentTimeMillis()
+                    if (now - lastEclipseWarmAtMs > eclipseWarmMinIntervalMs) {
+                        lastEclipseWarmAtMs = now
+                        applicationScope.launch {
+                            runCatching { eclipseAddonWarmup.warm() }
+                                .onFailure { Log.w("StashStartup", "addon re-warm failed", it) }
+                        }
+                    }
                     // Link Stash on the web: is another device's song waiting to be continued here? (at most every 30 s)
                     handoffOffers.onForeground()
                     // ...and did a linked browser send something here? (at most every 30 s; nothing in the background)
@@ -498,6 +515,25 @@ class StashApplication : Application(), Configuration.Provider {
             runCatching { eclipseAddonPreferences.migrateCloudAppleQualityOnce() }
                 .onFailure { Log.w("StashStartup", "cloud apple-quality migration failed", it) }
         }
+        // A network change (Wi-Fi ↔ 5G) discards every pooled socket: warm the addon
+        // host again once the new network is available, so the next tap is warm.
+        runCatching {
+            val cm = getSystemService(android.net.ConnectivityManager::class.java)
+            cm?.registerDefaultNetworkCallback(
+                object : android.net.ConnectivityManager.NetworkCallback() {
+                    override fun onAvailable(network: android.net.Network) {
+                        val now = System.currentTimeMillis()
+                        if (now - lastEclipseWarmAtMs < eclipseWarmMinIntervalMs) return
+                        lastEclipseWarmAtMs = now
+                        applicationScope.launch {
+                            runCatching { eclipseAddonWarmup.warm() }
+                                .onFailure { Log.w("StashStartup", "addon warm after network change failed", it) }
+                        }
+                    }
+                },
+            )
+        }.onFailure { Log.w("StashStartup", "network callback registration failed", it) }
+
         // After the first frame/idle, warm the addon host so the first resolve's TLS is already up.
         applicationScope.launch {
             kotlinx.coroutines.delay(2_500)

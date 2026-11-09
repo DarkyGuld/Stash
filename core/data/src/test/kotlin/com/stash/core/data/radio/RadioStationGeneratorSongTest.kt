@@ -5,16 +5,23 @@ import com.stash.core.data.lastfm.LastFmSimilarTrack
 import com.stash.core.data.lastfm.LastFmTopTrack
 import com.stash.data.ytmusic.YTMusicApiClient
 import io.mockk.coEvery
+import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 
 class RadioStationGeneratorSongTest {
     private val lastFm: LastFmApiClient = mockk()
     private val yt: YTMusicApiClient = mockk()
     private fun gen() = RadioStationGenerator(lastFm, yt)
+
+    /** The start diagnostics read this property; strict mocks need an answer. */
+    @Before fun stubDiagnostics() {
+        every { lastFm.isConfigured } returns true
+    }
 
     @Test fun `song seed blends seed-artist tracks with similar tracks, resolves via search`() = runTest {
         coEvery { lastFm.getSimilarTracks("Lil Wayne", "A Milli", any()) } returns

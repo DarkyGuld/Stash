@@ -17,4 +17,10 @@ sealed interface RadioStartResult {
 
     /** Download mode: a station streams, and Download mode plays only what is on the phone. */
     data object DownloadMode : RadioStartResult
+
+    /** No Last.fm key and no proxy: there is no taste graph to build a station from. */
+    data object NotConfigured : RadioStartResult
+
+    /** The generator did not finish in time (a hung or crawling upstream). */
+    data object Timeout : RadioStartResult
 }

@@ -69,6 +69,12 @@ object NetworkModule {
         }
 
         return OkHttpClient.Builder()
+            // Long-lived pool: the Eclipse addon host is one socket per app run.
+            // The default 5-minute idle eviction forces a fresh DNS+TCP+TLS
+            // handshake (measured ~550 ms on 5G) after any pause; warm requests
+            // are RTT-bound at ~200 ms. HTTP/2 pings keep the connection alive.
+            .connectionPool(okhttp3.ConnectionPool(5, 10, TimeUnit.MINUTES))
+            .pingInterval(30, TimeUnit.SECONDS)
             .connectionSpecs(listOf(ConnectionSpec.MODERN_TLS))
             // Survive the device resolver failing under the sync's 8-way download
             // burst (UnknownHostException for several simultaneous lookups of the

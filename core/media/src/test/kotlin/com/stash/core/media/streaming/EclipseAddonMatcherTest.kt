@@ -160,4 +160,86 @@ class EclipseAddonMatcherTest {
             assertThat(best).isNull()
         }
     }
+
+    @Test
+    fun `a Radio Edit resolves to the catalogue's Edit when the lengths agree within two seconds`() {
+        val edit = TrackEntity(
+            title = "Intoxicated - Radio Edit",
+            artist = "Martin Solveig, Good Times Ahead",
+            durationMs = 159_560,
+        )
+        val best = EclipseAddonMatcher.best(
+            edit,
+            listOf(
+                EclipseAddonTrack(
+                    id = "long",
+                    title = "Intoxicated",
+                    artist = "Martin Solveig & Good Times Ahead",
+                    duration = 255_934,
+                ),
+                EclipseAddonTrack(
+                    id = "edit",
+                    title = "Intoxicated (Edit)",
+                    artist = "Martin Solveig & Good Times Ahead",
+                    duration = 159_389,
+                ),
+            ),
+        )
+
+        assertThat(best?.id).isEqualTo("edit")
+    }
+
+    @Test
+    fun `a differently sized edit is a different file and is rejected`() {
+        val edit = TrackEntity(
+            title = "Intoxicated - Radio Edit",
+            artist = "Martin Solveig",
+            durationMs = 159_560,
+        )
+        val best = EclipseAddonMatcher.best(
+            edit,
+            listOf(
+                EclipseAddonTrack(
+                    id = "other-edit",
+                    title = "Intoxicated (Edit)",
+                    artist = "Martin Solveig",
+                    duration = 190_000,
+                ),
+            ),
+        )
+
+        assertThat(best).isNull()
+    }
+
+    @Test
+    fun `an edit alias still never matches a remix or a live version`() {
+        val edit = TrackEntity(title = "Intoxicated - Radio Edit", artist = "Martin Solveig", durationMs = 159_560)
+        val best = EclipseAddonMatcher.best(
+            edit,
+            listOf(
+                EclipseAddonTrack(id = "remix", title = "Intoxicated (Edit) [Remix]", artist = "Martin Solveig", duration = 159_500),
+                EclipseAddonTrack(id = "live", title = "Intoxicated - Radio Edit (Live)", artist = "Martin Solveig", duration = 159_500),
+            ),
+        )
+
+        assertThat(best).isNull()
+    }
+
+    @Test
+    fun `a Radio Edit resolves to the unsuffixed catalogue title at the same length`() {
+        val edit = TrackEntity(
+            title = "Freed From Desire - Radio Edit",
+            artist = "Fun[k]House",
+            durationMs = 183_089,
+        )
+        val best = EclipseAddonMatcher.best(
+            edit,
+            listOf(
+                EclipseAddonTrack(id = "club", title = "Freed From Desire (Club Mix)", artist = "Fun{k}house", duration = 256_383),
+                EclipseAddonTrack(id = "plain", title = "Freed From Desire", artist = "Fun{k}house", duration = 183_089),
+            ),
+        )
+
+        assertThat(best?.id).isEqualTo("plain")
+    }
 }
