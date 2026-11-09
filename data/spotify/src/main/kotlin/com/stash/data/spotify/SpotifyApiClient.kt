@@ -4,6 +4,7 @@ import android.util.Log
 import com.stash.core.auth.TokenManager
 import com.stash.core.auth.model.UserInfo
 import com.stash.core.auth.spotify.SpotifyAuthConfig
+import com.stash.core.model.Track
 import com.stash.core.auth.spotify.SpotifyAuthManager
 import com.stash.data.spotify.model.SpotifyAlbum
 import com.stash.data.spotify.model.SpotifyArtist
@@ -370,6 +371,42 @@ class SpotifyApiClient @Inject constructor(
      */
     @Volatile
     private var cachedClientToken: String? = null
+
+    // ── Canvas URL cache ────────────────────────────────────────────────
+
+    /** One Canvas answer: [url] null means "no Canvas". Guarded by [canvasCacheLock]. */
+    private data class CanvasCacheEntry(val url: String?, val expiresAtMillis: Long)
+
+    /**
+     * Bounded LRU of Canvas answers, keyed by Spotify URI or normalized
+     * title+artist. Access-ordered so a long library walk evicts the least
+     * recently used entry, never growing past [SpotifyCanvas.CACHE_MAX_ENTRIES].
+     */
+    private val canvasCache = object : LinkedHashMap<String, CanvasCacheEntry>(16, 0.75f, true) {
+        override fun removeEldestEntry(
+            eldest: MutableMap.MutableEntry<String, CanvasCacheEntry>,
+        ): Boolean = size > SpotifyCanvas.CACHE_MAX_ENTRIES
+    }
+
+    /** Guards [canvasCache]; Canvas lookups are shared by any caller. */
+    private val canvasCacheLock = Any()
+
+    private fun getCanvasCache(key: String): CanvasCacheEntry? = synchronized(canvasCacheLock) {
+        val entry = canvasCache[key] ?: return@synchronized null
+        if (entry.expiresAtMillis <= System.currentTimeMillis()) {
+            canvasCache.remove(key)
+            null
+        } else {
+            entry
+        }
+    }
+
+    private fun putCanvasCache(key: String, url: String?) {
+        val ttl = if (url != null) SpotifyCanvas.POSITIVE_TTL_MS else SpotifyCanvas.NEGATIVE_TTL_MS
+        synchronized(canvasCacheLock) {
+            canvasCache[key] = CanvasCacheEntry(url, System.currentTimeMillis() + ttl)
+        }
+    }
 
     // ── Public API ──────────────────────────────────────────────────────
 
@@ -1193,6 +1230,77 @@ class SpotifyApiClient @Inject constructor(
         } catch (e: Exception) {
             Log.w(TAG, "parseSearchDesktop: parse failed: ${e.message}")
             emptyList()
+        }
+    }
+
+    /**
+     * The Spotify Canvas video URL for [track], or null when there is none.
+     *
+     * Uses [Track.spotifyUri] when it holds a track URI. Without one it asks
+     * `searchDesktop` for "[title] [artist]" and accepts only an unambiguous,
+     * normalized exact title + artist match (length within two seconds when
+     * both are known): a missing Canvas is invisible, a wrong one is not.
+     *
+     * The Pathfinder `canvas` answer is read as `data.trackUnion.canvas`;
+     * only an http(s) MP4 URL (or an explicit `video/mp4` type) is returned.
+     * A URL-less `fileId` answer is a miss for now (no spclient fallback).
+     *
+     * Positive answers are cached for [SpotifyCanvas.POSITIVE_TTL_MS], negative
+     * ones for [SpotifyCanvas.NEGATIVE_TTL_MS], in a bounded LRU keyed by the
+     * track URI or normalized title+artist. Never throws; logs only the
+     * operation outcome, never a URL or token.
+     */
+    suspend fun canvasUrl(track: Track): String? = withContext(Dispatchers.IO) {
+        try {
+            val key = SpotifyCanvas.cacheKey(track)
+            if (key != null) {
+                getCanvasCache(key)?.let { entry ->
+                    Log.d(TAG, "canvasUrl: outcome=${if (entry.url != null) "cache-hit" else "cache-miss"}")
+                    return@withContext entry.url
+                }
+            }
+
+            val trackUri = SpotifyCanvas.trackUri(track.spotifyUri) ?: run {
+                val query = listOf(track.title, track.artist)
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+                    .joinToString(" ")
+                if (query.isEmpty()) return@withContext null
+
+                val exact = SpotifyCanvas.exactCandidate(
+                    track,
+                    searchTracksGraphQL(query, limit = 10),
+                )
+                if (exact == null) {
+                    if (key != null) putCanvasCache(key, null)
+                    Log.d(TAG, "canvasUrl: outcome=no-exact-track")
+                    return@withContext null
+                }
+                "spotify:track:${exact.id}"
+            }
+
+            val response = executeGraphQL(
+                operationName = "canvas",
+                variables = buildJsonObject { put("trackUri", trackUri) }.toString(),
+                seedHash = SpotifyAuthConfig.HASH_CANVAS,
+            )
+            if (response == null) {
+                // A failed request is not a "no Canvas" answer; let it retry next time.
+                Log.d(TAG, "canvasUrl: outcome=request-failed")
+                return@withContext null
+            }
+
+            val url = SpotifyCanvas.parseUrl(response)
+            val uriKey = "uri:$trackUri"
+            putCanvasCache(uriKey, url)
+            if (key != null && key != uriKey) putCanvasCache(key, url)
+            Log.d(TAG, "canvasUrl: outcome=${if (url != null) "found" else "no-canvas"}")
+            url
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "canvasUrl: outcome=error")
+            null
         }
     }
 

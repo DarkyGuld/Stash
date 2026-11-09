@@ -101,6 +101,17 @@ object SpotifyAuthConfig {
     const val HASH_GET_ALBUM = "0b6ce3511e1b02e4a40fa95440f992acbe85080eb308af9194322d708fc1914f"
 
     /**
+     * Persisted-query hash for the `canvas` operation (the web player's track
+     * Canvas lookup). Variables: `{"trackUri":"spotify:track:…"}`. Returns
+     * `data.trackUnion.canvas { type, uri, url, fileId }`.
+     *
+     * Seed as of Jan 2026. Canvas hashes rotate with the web-player build; on
+     * a `PersistedQueryNotFound` the client re-scrapes the live bundle
+     * (executeGraphQL) and retries once with the fresh hash.
+     */
+    const val HASH_CANVAS = "575138ab27cd5c1b3e54da54d0a7cc8d85485402de26340c2145f0f6bb5e7a9f"
+
+    /**
      * Persisted query hash for the `addToLibrary` / `removeFromLibrary`
      * mutations — the heart button in the Spotify web player. One
      * multi-operation persisted document backs both (also pinLibraryItem /
