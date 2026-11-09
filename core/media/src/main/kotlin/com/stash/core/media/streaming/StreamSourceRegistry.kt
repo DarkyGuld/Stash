@@ -365,6 +365,17 @@ class StreamSourceRegistry internal constructor(
         val eclipseAddonsOn = streamingPreference.isEclipseAddonsEnabled()
         val jiosaavnOn = streamingPreference.isJiosaavnEnabled()
         val youtubeOn = streamingPreference.isYoutubeEnabled()
+        // Radio's addon-only rows have no youtubeId (metadata-only catalogue
+        // matches). For those, and only for radio, the YouTube fallback searches
+        // by title+artist instead of using a stored video id. Every other path
+        // (library, search, queue) keeps resolve()'s stored-id-first behaviour.
+        val youTubeResolve: suspend (TrackEntity, Boolean) -> StreamUrl? = { t, ytDlp ->
+            if (radio && t.youtubeId.isNullOrBlank()) {
+                youtube.resolveByMetadata(t, ytDlp)
+            } else {
+                youtube.resolve(t, ytDlp)
+            }
+        }
         val resolvers = buildList<Pair<String, suspend (TrackEntity) -> StreamUrl?>> {
             if (streamingPreference.isForceQbdlxOnly()) {
                 // Test toggle: qbdlx (direct-Qobuz) ONLY — skip every other source
@@ -381,13 +392,13 @@ class StreamSourceRegistry internal constructor(
                 // same change, or a stale pref with no UI left to clear it routes
                 // every track through a dead source.
                 if (allowYouTube && allowYtDlp) add("jiosaavn" to jiosaavn::resolve)
-                if (allowYouTube) add("youtube" to { t: TrackEntity -> youtube.resolve(t, allowYtDlp) })
+                if (allowYouTube) add("youtube" to { t: TrackEntity -> youTubeResolve(t, allowYtDlp) })
             } else if (streamingPreference.isForceYouTubeFallback()) {
                 // Test toggle: skip the lossless sources, forcing the
                 // YouTube fallback path. Still gated by allowYouTube so the
                 // background-fill keeps resolving nothing (matching a genuine
                 // both-sources-down outage).
-                if (allowYouTube) add("youtube" to { t: TrackEntity -> youtube.resolve(t, allowYtDlp) })
+                if (allowYouTube) add("youtube" to { t: TrackEntity -> youTubeResolve(t, allowYtDlp) })
             } else {
                 // PARKED 2026-07-01: kennyy/squid hosts are down for us. Kept in
                 // sync with LosslessSourceRegistry.PARKED_SOURCE_IDS (download
@@ -405,7 +416,15 @@ class StreamSourceRegistry internal constructor(
                 // addon-only station has no source at all. `radio` is explicit, so no
                 // library or general playback path changes.
                 val addonRung = addons?.takeIf { eclipseAddonsOn && (radio || (allowYtDlp && losslessRungs)) }
-                if (addonsFirst && addonRung != null) add("addon" to { t: TrackEntity -> addonRung.resolve(t, speculative) })
+                // Radio puts Eclipse Cloud first and skips addons cooling after a
+                // 429/timeout/5xx; normal playback keeps the user's order.
+                val addonResolve: (suspend (TrackEntity) -> StreamUrl?)? = addonRung?.let { rung ->
+                    val resolve: suspend (TrackEntity) -> StreamUrl? = { t ->
+                        if (radio) rung.resolveForRadio(t, speculative) else rung.resolve(t, speculative)
+                    }
+                    resolve
+                }
+                if (addonsFirst && addonResolve != null) add("addon" to addonResolve)
 
                 // Prefer Tidal AAC: Tidal's 320 kbps AAC (`?aac=only&hires=0`, the AAC
                 // download mode's request) ahead of Qobuz, for a listener saving data. Only
@@ -472,7 +491,7 @@ class StreamSourceRegistry internal constructor(
                 }
                 // Eclipse addons, in their place after the relays unless addons-first
                 // moved them to the front above.
-                if (!addonsFirst && addonRung != null) add("addon" to { t: TrackEntity -> addonRung.resolve(t, speculative) })
+                if (!addonsFirst && addonResolve != null) add("addon" to addonResolve)
                 // AAC fallback at the policy's LossyQuality (320; 160 or 96 where Data saver
                 // applies). Foreground/next-up only: a
                 // speculative full-queue fill must not turn into one metadata
@@ -481,7 +500,7 @@ class StreamSourceRegistry internal constructor(
                 if (jiosaavnOn && allowYouTube && allowYtDlp) {
                     add("jiosaavn" to jiosaavn::resolve)
                 }
-                if (youtubeOn && allowYouTube) add("youtube" to { t: TrackEntity -> youtube.resolve(t, allowYtDlp) })
+                if (youtubeOn && allowYouTube) add("youtube" to { t: TrackEntity -> youTubeResolve(t, allowYtDlp) })
             }
         }
         // Which sources are actually IN PLAY for this resolve, and why.
@@ -526,7 +545,7 @@ class StreamSourceRegistry internal constructor(
                     null
                 }
                 val fastLane = if (hedged) {
-                    async { quietly("youtube-fast", track) { youtube.resolve(track, allowYtDlp = false) } }
+                    async { quietly("youtube-fast", track) { youTubeResolve(track, false) } }
                 } else {
                     null
                 }
@@ -575,7 +594,7 @@ class StreamSourceRegistry internal constructor(
                     return@coroutineScope it
                 }
                 if (hedged) {
-                    quietly("youtube", track) { youtube.resolve(track, allowYtDlp = true) }?.also {
+                    quietly("youtube", track) { youTubeResolve(track, true) }?.also {
                         Log.i(TAG, "youtube served ${track.id} '${track.title}'")
                         servedBy = "youtube"
                     }

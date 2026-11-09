@@ -57,6 +57,13 @@ class EclipseAddonStreamResolver private constructor(
     /** Apple ids that 404'd at every tier this session: never request them again. */
     private val deadAppleIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
+    /**
+     * Addons whose last call failed transiently (429, timeout/unreachable, 5xx):
+     * no request is made to them until this instant. In memory only — a relay or
+     * rights blip must not persist as a dead addon across restarts.
+     */
+    private val coolingUntilMs = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
     /** The addon/account epoch [deadAppleIds] belongs to. */
     @Volatile
     private var deadAppleEpoch: Pair<Long, Long>? = null
@@ -85,15 +92,34 @@ class EclipseAddonStreamResolver private constructor(
     internal constructor(repository: EclipseAddonRepository) :
         this(repository, EclipseAddonResolveCache(), { false }, null, null, null, null, null)
 
-    suspend fun resolve(track: TrackEntity, speculative: Boolean = false): StreamUrl? {
+    suspend fun resolve(track: TrackEntity, speculative: Boolean = false): StreamUrl? =
+        resolveInternal(track, speculative, radio = false)
+
+    /**
+     * Radio playback: Eclipse Cloud is tried before every non-Cloud addon (the
+     * user's order is kept inside each group), and an addon that recently failed
+     * transiently is skipped. Normal playback keeps the user's exact order.
+     */
+    internal suspend fun resolveForRadio(track: TrackEntity, speculative: Boolean = false): StreamUrl? =
+        resolveInternal(track, speculative, radio = true)
+
+    private suspend fun resolveInternal(
+        track: TrackEntity,
+        speculative: Boolean,
+        radio: Boolean,
+    ): StreamUrl? {
         val query = "${track.artist} ${track.title}".trim()
         if (query.isEmpty()) return null
         forgetDeadAppleIdsOnChange()
         val startedNs = System.nanoTime()
 
-        val addons = enabledAddons()
+        val addons = enabledAddons().let { list ->
+            if (radio) list.sortedByDescending { it.isEclipseCloud } else list
+        }
         memoryCachedUrl(track, addons)?.let { return it }
         for (addon in addons) {
+            // A transient failure just bought this addon a minute of silence.
+            if (isCooling(addon)) continue
             try {
                 // Disk below memory: a resolved URL that outlived the process, while
                 // still valid and still from an enabled addon in this walk.
@@ -134,7 +160,13 @@ class EclipseAddonStreamResolver private constructor(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                Log.w(TAG, "addon '${addon.name}' failed for ${track.id}: ${failureSummary(e)}")
+                // One line, no URL/token. A transient failure also buys a cooldown so
+                // the next track does not pay the same four timed-out calls.
+                if (isTransientFailure(e)) {
+                    coolDown(addon, e)
+                } else {
+                    Log.w(TAG, "addon '${addon.name}' failed for ${track.id}: ${failureSummary(e)}")
+                }
             }
         }
         return null
@@ -191,6 +223,7 @@ class EclipseAddonStreamResolver private constructor(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
+            if (isTransientFailure(e)) coolDown(addon, e)
             null
         }
 
@@ -241,6 +274,7 @@ class EclipseAddonStreamResolver private constructor(
         if (first.second != null) {
             (if (first.first === tidal) apple else tidal).cancel()
             first.second!!.commit()
+            clearCooling(addon)
             return@coroutineScope first.second!!.url
         }
 
@@ -255,11 +289,12 @@ class EclipseAddonStreamResolver private constructor(
         }
         if (second != null) {
             second.commit()
+            clearCooling(addon)
             return@coroutineScope second.url
         }
-        // Both missed: remember the Apple miss too (the Tidal miss is cached
-        // with the long Cloud TTL inside [tidalRace]).
-        rememberAppleId(addon, track, null)
+        // Both missed. Each route records its own negative only when the addon
+        // gave a definitive answer (404 / empty catalog); a 403 or a transient
+        // failure must not be remembered here as "not in the catalog".
         null
     }
 
@@ -276,14 +311,17 @@ class EclipseAddonStreamResolver private constructor(
     ): CloudRace? =
         try {
             val entry = resolveCache.get(tidalKey)
-            val itemId = when {
-                entry?.itemId != null -> entry.itemId
+            val resolved = when {
+                entry?.itemId != null -> ResolveId(entry.itemId, definitive = true)
                 // A speculative lookup may use a cached miss; a user play re-checks it.
-                entry != null && speculative -> null
+                entry != null && speculative -> ResolveId(null, definitive = true)
                 else -> resolveId(addon, track)
             }
+            val itemId = resolved.id
             if (itemId == null) {
-                resolveCache.putMiss(tidalKey, CLOUD_TIDAL_MISS_TTL_MS)
+                // Only a definitive 404 / empty catalog answer is a Tidal miss.
+                // A rights refusal (403), 429 or timeout must be retried next play.
+                if (resolved.definitive) resolveCache.putMiss(tidalKey, CLOUD_TIDAL_MISS_TTL_MS)
                 null
             } else {
                 val url = tidalStream(addon, track, itemId, startedNs) ?: run {
@@ -296,6 +334,7 @@ class EclipseAddonStreamResolver private constructor(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
+            if (isTransientFailure(e)) coolDown(addon, e)
             null
         }
 
@@ -314,9 +353,15 @@ class EclipseAddonStreamResolver private constructor(
         isrcProvider: suspend () -> String?,
     ): CloudRace? =
         try {
+            // Null means "no iTunes answer" (unknown, not a miss); an empty list
+            // is a definitive "catalog has nothing", which may be remembered.
             val hits = appleHits(addon, track, appleKey, speculative) ?: return null
             val strongId = strongAppleId(track, hits)
-            val appleId = strongId ?: matchAppleId(track, hits) ?: return null
+            val appleId = strongId ?: matchAppleId(track, hits)
+            if (appleId == null) {
+                rememberAppleId(addon, track, null)
+                return null
+            }
             if (strongId == null) {
                 Log.d(TAG, "apple fast-path rejected ${hits.size} hit(s); falling back to best() -> $appleId")
             }
@@ -327,6 +372,13 @@ class EclipseAddonStreamResolver private constructor(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
+            // 403 = rights/token refusal, 429/5xx/timeout = transient. Neither is
+            // a catalog miss, so no negative is written; only a dead 404 is dropped.
+            if (isDefinitiveAppleDead(e)) {
+                forgetAppleId(addon, track)
+            } else if (isTransientFailure(e)) {
+                coolDown(addon, e)
+            }
             null
         }
 
@@ -366,12 +418,14 @@ class EclipseAddonStreamResolver private constructor(
             if (!invalidatesResolve(e)) throw e
             resolveCache.invalidate(key)
             streamUrlStore?.remove(addon.id, settingsKey(addon), identityKey(track))
-            val fresh = resolveId(addon, track) ?: run {
-                resolveCache.put(key, null)
+            val fresh = resolveId(addon, track)
+            val freshId = fresh.id ?: run {
+                // A rights refusal or transient failure is not a catalog miss.
+                if (fresh.definitive) resolveCache.put(key, null)
                 return null
             }
-            resolveCache.put(key, fresh)
-            mapStream(streamWithRetry(addon, fresh))?.let { served(addon, track, it, startedNs) }
+            resolveCache.put(key, freshId)
+            mapStream(streamWithRetry(addon, freshId))?.let { served(addon, track, it, startedNs) }
         }
     }
 
@@ -390,13 +444,15 @@ class EclipseAddonStreamResolver private constructor(
             // A user play re-checks a cached Tidal miss; only a new miss is recorded.
             resolveCache.invalidate(key)
         }
-        val id = resolveId(addon, track)
-        if (id == null && missTtlMs != null) {
-            resolveCache.putMiss(key, missTtlMs)
-        } else {
-            resolveCache.put(key, id)
+        val resolved = resolveId(addon, track)
+        when {
+            resolved.id != null -> resolveCache.put(key, resolved.id)
+            // Only a definitive 404 / empty catalog answer is a negative. A 403,
+            // 429 or timeout must be asked again on the next play.
+            missTtlMs != null && resolved.definitive -> resolveCache.putMiss(key, missTtlMs)
+            missTtlMs == null && resolved.definitive -> resolveCache.put(key, null)
         }
-        return id
+        return resolved.id
     }
 
     /** A stream answer saying "that id is no longer usable": re-resolve once. */
@@ -413,8 +469,9 @@ class EclipseAddonStreamResolver private constructor(
     /**
      * The Apple candidates for this track, from the resolve cache when one is
      * already known (positive id or a short-lived negative), else one iTunes
-     * search. Null means "known miss"; an empty list means "searched, no hits"
-     * and gets cached as a miss by the caller once matching fails.
+     * search. Null means the catalogue gave no usable answer (a cached miss for
+     * a speculative lookup, or 429/timeout/5xx) and is NOT a negative. An empty
+     * list is a definitive "searched, no hits", which the caller may cache.
      */
     private suspend fun appleHits(
         addon: EclipseAddon,
@@ -449,8 +506,11 @@ class EclipseAddonStreamResolver private constructor(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            // No iTunes answer is just no Apple route on this play.
-            emptyList()
+            // No iTunes answer on this play: unknown, NOT a definitive empty
+            // catalog. Returning null keeps a 429/timeout from becoming a
+            // cached "not in the Apple catalog" negative.
+            if (isTransientFailure(e)) coolDown(addon, e)
+            null
         }
     }
 
@@ -511,8 +571,14 @@ class EclipseAddonStreamResolver private constructor(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            // A stale Apple id: drop it; the next play searches again.
-            if (invalidatesResolve(e)) forgetAppleId(addon, track)
+            // Only a definitive 404/410 says the id is gone. A 403 is a rights/
+            // token refusal and a 429/5xx/timeout is transient: keep the id and
+            // never turn either into a cached negative.
+            if (isDefinitiveAppleDead(e)) {
+                forgetAppleId(addon, track)
+            } else if (isTransientFailure(e)) {
+                coolDown(addon, e)
+            }
             null
         }
     }
@@ -682,54 +748,65 @@ class EclipseAddonStreamResolver private constructor(
         }
     }
 
-    /** `/resolve`, then `/resolve-isrc`; a miss (null) falls through to search, a throw does not escape. */
-    private suspend fun resolveId(addon: EclipseAddon, track: TrackEntity): String? {
+    /** A resolve attempt: an id, or null with whether the addon gave a definitive "not here". */
+    private data class ResolveId(val id: String?, val definitive: Boolean)
+
+    /**
+     * `/resolve`, then `/resolve-isrc`, then the cleaned-query variants. A
+     * definitive miss (404 / empty answer) falls through to search. A transient
+     * failure (429, timeout/unreachable, 5xx) is rethrown at once so the caller
+     * stops this addon's variants/search and cools it. A rights refusal (403)
+     * or a malformed answer makes the overall answer non-definitive: the routes
+     * below may still find the song, but no negative may be cached.
+     */
+    private suspend fun resolveId(addon: EclipseAddon, track: TrackEntity): ResolveId {
         val isrc = track.isrc?.trim()?.takeIf { it.isNotEmpty() }
-        if (addon.supportsResolve) {
+        var definitive = true
+
+        suspend fun route(name: String, call: suspend () -> String?): String? =
             try {
+                call()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (isTransientFailure(e)) throw e
+                if (!isDefinitiveMiss(e)) definitive = false
+                Log.d(TAG, "addon '${addon.name}' $name missed for ${track.id}: ${failureSummary(e)}")
+                null
+            }
+
+        if (addon.supportsResolve) {
+            route("resolve") {
                 repository.resolve(
                     addon = addon,
                     title = track.title,
                     artist = track.artist,
                     durationMs = track.durationMs.takeIf { it > 0 },
                     isrc = isrc,
-                )?.let { return it.id }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                Log.d(TAG, "addon '${addon.name}' resolve missed for ${track.id}: ${failureSummary(e)}")
-            }
+                )?.id
+            }?.let { return ResolveId(it, definitive = true) }
         }
         if ((addon.supportsIsrc || addon.isEclipseCloud) && isrc != null) {
-            try {
-                repository.resolveIsrc(addon, isrc)?.let { return it.id }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                Log.d(TAG, "addon '${addon.name}' resolve-isrc missed for ${track.id}: ${failureSummary(e)}")
-            }
+            route("resolve-isrc") { repository.resolveIsrc(addon, isrc)?.id }
+                ?.let { return ResolveId(it, definitive = true) }
         }
         // Version suffixes and multi-artist credits break some catalogs' search;
         // the cleaned variants are only tried after the full query missed. The id
         // goes into the same track-identity cache entry as a full-query hit.
         if (addon.supportsResolve) {
             for ((title, artist) in EclipseAddonQuery.variants(track.title, track.artist).drop(1)) {
-                try {
+                route("variant resolve") {
                     repository.resolve(
                         addon = addon,
                         title = title,
                         artist = artist,
                         durationMs = track.durationMs.takeIf { it > 0 },
                         isrc = null,
-                    )?.let { return it.id }
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    Log.d(TAG, "addon '${addon.name}' variant resolve missed for ${track.id}: ${failureSummary(e)}")
-                }
+                    )?.id
+                }?.let { return ResolveId(it, definitive = true) }
             }
         }
-        return null
+        return ResolveId(null, definitive)
     }
 
     /** The bounded, deduplicated catalog searches for one track: full credit first, then the cleaned variants. */
@@ -760,7 +837,11 @@ class EclipseAddonStreamResolver private constructor(
             0L
         }
         val epoch = addonGeneration to accountGeneration
-        if (deadAppleEpoch != null && deadAppleEpoch != epoch) deadAppleIds.clear()
+        if (deadAppleEpoch != null && deadAppleEpoch != epoch) {
+            deadAppleIds.clear()
+            // A new account/addon setting may fix a 429/5xx cause: let it retry now.
+            coolingUntilMs.clear()
+        }
         deadAppleEpoch = epoch
     }
 
@@ -795,6 +876,9 @@ class EclipseAddonStreamResolver private constructor(
     ): StreamUrl {
         // Never log the URL: it carries the addon's signed token.
         val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000
+        // A serve proves the addon is alive again (e.g. its Tidal route 429'd while
+        // Apple answered), so lift any cooldown left by the losing branch.
+        clearCooling(addon)
         // The listener-facing service label ("via <addon name>"): the base origin is
         // the prefix, the name follows it (StreamService.displayName).
         val labelled = url.copy(origin = originFor(addon.name))
@@ -826,6 +910,47 @@ class EclipseAddonStreamResolver private constructor(
     /** The HTTP status for a status failure, the class name otherwise; never the URL. */
     private fun failureSummary(e: Exception): String =
         (e as? EclipseAddonException.HttpFailure)?.let { "HTTP ${it.code}" } ?: e::class.java.simpleName
+
+    /** 429, a timeout/unreachable call, or a 5xx: the addon is worth trying again later. */
+    private fun isTransientFailure(e: Exception): Boolean =
+        e is EclipseAddonException.Unreachable ||
+            e is EclipseAddonException.Preparing ||
+            (e is EclipseAddonException.HttpFailure && (e.code == 408 || e.code == 429 || e.code in 500..599))
+
+    /** 404/410: the catalog's definitive "no such item". */
+    private fun isDefinitiveMiss(e: Exception): Boolean =
+        e is EclipseAddonException.HttpFailure && e.code in setOf(404, 410)
+
+    /** Apple: only a 404/410 proves the id is dead; 403 is a rights refusal. */
+    private fun isDefinitiveAppleDead(e: Exception): Boolean =
+        e is EclipseAddonException.HttpFailure && e.code in setOf(404, 410)
+
+    /** One line in, one line out; never a URL or a token. */
+    private fun coolDown(addon: EclipseAddon, e: Exception) {
+        val now = System.currentTimeMillis()
+        val until = coolingUntilMs[addon.id]
+        // Already cooling: extend the window silently rather than log per route.
+        if (until != null && now < until) {
+            coolingUntilMs[addon.id] = now + ADDON_COOLDOWN_MS
+            return
+        }
+        coolingUntilMs[addon.id] = now + ADDON_COOLDOWN_MS
+        Log.i(
+            TAG,
+            "addon '${addon.name}' cooling for ${ADDON_COOLDOWN_MS / 1_000}s after ${failureSummary(e)}",
+        )
+    }
+
+    private fun clearCooling(addon: EclipseAddon) {
+        coolingUntilMs.remove(addon.id)
+    }
+
+    private fun isCooling(addon: EclipseAddon, nowMs: Long = System.currentTimeMillis()): Boolean {
+        val until = coolingUntilMs[addon.id] ?: return false
+        if (nowMs < until) return true
+        coolingUntilMs.remove(addon.id, until)
+        return false
+    }
 
     /**
      * Warms the Apple ids for the queue ahead: iTunes search only, never a stream.
@@ -925,6 +1050,9 @@ class EclipseAddonStreamResolver private constructor(
 
         /** Cloud's Tidal miss is long-lived: Apple still serves the track, and the lookup is ~0.8 s. */
         private const val CLOUD_TIDAL_MISS_TTL_MS = 6 * 60 * 60_000L
+
+        /** How long a 429/timeout/5xx keeps an addon out of the walk. In memory only. */
+        private const val ADDON_COOLDOWN_MS = 60_000L
 
         /** Fast mode's stricter duration tolerance: 10 s, not the matcher's 15 s. */
         private const val STRONG_DURATION_TOLERANCE_MS = 10_000L

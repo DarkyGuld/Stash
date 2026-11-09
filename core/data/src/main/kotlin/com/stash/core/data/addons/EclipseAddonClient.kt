@@ -260,8 +260,9 @@ class EclipseAddonClient @Inject constructor(
     }
 
     /**
-     * `GET /resolve` (Eclipse's metadata→item lookup). Null on a miss: `{"item":null}`,
-     * 403 `Unavailable`, or 404. [isrc] is authoritative when the addon has one;
+     * `GET /resolve` (Eclipse's metadata→item lookup). Null on a definitive miss:
+     * `{"item":null}` or 404. A 403 (rights/token refusal) throws instead, so it
+     * is never mistaken for "not in the catalog". [isrc] is authoritative when the addon has one;
      * the title/artist/duration are the fallback key.
      */
     suspend fun resolve(
@@ -285,8 +286,8 @@ class EclipseAddonClient @Inject constructor(
     }
 
     /**
-     * `GET {base}/…/resolve-isrc?isrc=…`; null when the addon says 404/403 or has
-     * no id. [path] is `resolve-isrc` for a normal addon and `tidal/resolve-isrc`
+     * `GET {base}/…/resolve-isrc?isrc=…`; null when the addon says 404 or has
+     * no id. A 403 (rights/token refusal) throws. [path] is `resolve-isrc` for a normal addon and `tidal/resolve-isrc`
      * for Eclipse's Cloud addon.
      */
     suspend fun resolveIsrc(
@@ -371,44 +372,71 @@ class EclipseAddonClient @Inject constructor(
     }
 
     /**
+     * One iTunes answer. A 429 (or its cooldown) and a failed request are kept
+     * distinct from [Empty]: only an actual empty catalog answer may become a
+     * cached "not in the Apple catalog" negative.
+     */
+    private sealed class AppleAnswer {
+        data class Hits(val hits: List<EclipseAppleTrack>) : AppleAnswer()
+        data object Empty : AppleAnswer()
+        data object RateLimited : AppleAnswer()
+        data object Failed : AppleAnswer()
+    }
+
+    /**
      * Cloud's Apple Music route, part one: the public iTunes Search API (no
      * Eclipse auth). The device's country and the US fallback run concurrently
      * when they differ — the first non-empty result wins, the other is cancelled —
      * so a catalog miss costs one search, not two sequential ones.
+     *
+     * An empty list is a definitive catalog answer. A 429, its cooldown, or a
+     * failed request throws instead, so the resolver never caches it as a miss.
      */
-    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     suspend fun searchAppleTracks(title: String, artist: String): List<EclipseAppleTrack> {
+        var rateLimited = false
+        var failed = false
         // Full query first; a version suffix or a full artist list often returns
         // nothing, so the cleaned variants are tried only after a miss.
         for ((variantTitle, variantArtist) in EclipseAddonQuery.variants(title, artist)) {
             val term = "$variantTitle $variantArtist".trim()
             if (term.isEmpty()) continue
-            var hits = searchAppleTerm(term)
-            if (hits.isEmpty()) {
+            var answer = searchAppleTerm(term)
+            if (answer is AppleAnswer.Empty) {
                 // A transient empty (throttle, a dropped body) is not a catalog miss:
                 // one short retry before recording a negative for the variant.
                 delay(APPLE_EMPTY_RETRY_MS)
-                hits = searchAppleTerm(term)
+                answer = searchAppleTerm(term)
             }
-            if (hits.isNotEmpty()) return hits
+            when (answer) {
+                is AppleAnswer.Hits -> return answer.hits
+                AppleAnswer.RateLimited -> rateLimited = true
+                AppleAnswer.Failed -> failed = true
+                AppleAnswer.Empty -> Unit
+            }
         }
+        // Never return an empty list for a throttled/failed search: the resolver
+        // would record it as a definitive catalog miss and stop retrying Cloud.
+        if (rateLimited) throw EclipseAddonException.HttpFailure(429)
+        if (failed) throw EclipseAddonException.Unreachable()
         return emptyList()
     }
 
     /** One term across the device country and the US fallback (concurrently when they differ). */
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
-    private suspend fun searchAppleTerm(term: String): List<EclipseAppleTrack> {
+    private suspend fun searchAppleTerm(term: String): AppleAnswer {
         val localeCountry = java.util.Locale.getDefault().country.takeIf { it.length == 2 } ?: APPLE_FALLBACK_COUNTRY
-        if (localeCountry == APPLE_FALLBACK_COUNTRY) return fetchAppleSearch(term, localeCountry)
+        if (localeCountry == APPLE_FALLBACK_COUNTRY) {
+            return runAppleSearch(term, localeCountry)
+        }
 
         return coroutineScope {
             val locale = async { runAppleSearch(term, localeCountry) }
             val fallback = async { runAppleSearch(term, APPLE_FALLBACK_COUNTRY) }
-            val first = select<Pair<Deferred<List<EclipseAppleTrack>>, List<EclipseAppleTrack>>> {
+            val first = select<Pair<Deferred<AppleAnswer>, AppleAnswer>> {
                 locale.onAwait { locale to it }
                 fallback.onAwait { fallback to it }
             }
-            if (first.second.isNotEmpty()) {
+            if (first.second is AppleAnswer.Hits) {
                 (if (first.first === locale) fallback else locale).cancel()
                 return@coroutineScope first.second
             }
@@ -418,23 +446,30 @@ class EclipseAddonClient @Inject constructor(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                emptyList()
+                AppleAnswer.Failed
             }
-            second
+            when {
+                second is AppleAnswer.Hits -> second
+                first.second is AppleAnswer.RateLimited || second is AppleAnswer.RateLimited ->
+                    AppleAnswer.RateLimited
+                first.second is AppleAnswer.Failed || second is AppleAnswer.Failed ->
+                    AppleAnswer.Failed
+                else -> AppleAnswer.Empty
+            }
         }
     }
 
-    /** One country's search; a failed answer is an empty list so it never cancels its sibling. */
-    private suspend fun runAppleSearch(term: String, country: String): List<EclipseAppleTrack> =
+    /** One country's search; a failed answer never cancels its sibling. */
+    private suspend fun runAppleSearch(term: String, country: String): AppleAnswer =
         try {
             fetchAppleSearch(term, country)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            emptyList()
+            AppleAnswer.Failed
         }
 
-    private suspend fun fetchAppleSearch(term: String, country: String): List<EclipseAppleTrack> {
+    private suspend fun fetchAppleSearch(term: String, country: String): AppleAnswer {
         val url = ITUNES_SEARCH_URL.newBuilder()
             .addQueryParameter("term", term)
             .addQueryParameter("entity", "song")
@@ -445,7 +480,7 @@ class EclipseAddonClient @Inject constructor(
         return appleSearchPermits.withPermit {
             if (System.currentTimeMillis() < appleCooldownUntilMs) {
                 Log.d(TAG, "itunes country=$country cooling down after a 429")
-                return@withPermit emptyList()
+                return@withPermit AppleAnswer.RateLimited
             }
             val body = try {
                 getBody(url)
@@ -453,18 +488,18 @@ class EclipseAddonClient @Inject constructor(
                 if (e.code == 429) {
                     appleCooldownUntilMs = System.currentTimeMillis() + APPLE_429_COOLDOWN_MS
                     Log.d(TAG, "itunes country=$country rate limited; cooling down")
-                    return@withPermit emptyList()
+                    return@withPermit AppleAnswer.RateLimited
                 }
                 throw e
             } ?: run {
                 Log.d(TAG, "itunes country=$country empty body")
-                return@withPermit emptyList()
+                return@withPermit AppleAnswer.Failed
             }
             parseBody(body) { text ->
                 val root = runCatching { json.parseToJsonElement(text) as? JsonObject }.getOrNull()
                 if (root == null) {
                     Log.d(TAG, "itunes country=$country unparseable body (${text.length} chars)")
-                    return@parseBody emptyList()
+                    return@parseBody AppleAnswer.Failed
                 }
                 val results = (root["results"] as? JsonArray)?.mapNotNull { element ->
                     runCatching {
@@ -480,7 +515,7 @@ class EclipseAddonClient @Inject constructor(
                     "itunes country=$country resultCount=${declared ?: results.size} parsed=${results.size} " +
                         "top=${top?.let { "${it.trackId}|${it.trackName}|${it.artistName}|${it.trackTimeMillis}" } ?: "none"}",
                 )
-                results
+                if (results.isEmpty()) AppleAnswer.Empty else AppleAnswer.Hits(results)
             }
         }
     }
@@ -744,7 +779,14 @@ class EclipseAddonClient @Inject constructor(
 
         private const val MAX_RETRY_AFTER_SECONDS = 30
         private const val MANIFEST = "manifest.json"
-        private val MISS_CODES = setOf(403, 404)
+
+        /**
+         * Only 404 is "not in this catalog". A 403 is a rights/token refusal
+         * (Eclipse's "Unavailable", a stale account header, a WAF) and must not
+         * become a cached negative for the track; it propagates as an HTTP
+         * failure so the resolver can retry on the next play.
+         */
+        private val MISS_CODES = setOf(404)
 
         const val LOSSLESS_QUALITY: String = "LOSSLESS"
 

@@ -755,13 +755,13 @@ class StreamSourceRegistryTest {
         coEvery { qbdlx.resolve(any()) } returns null
         coEvery { youtube.resolve(any(), any()) } returns null
         val addon: EclipseAddonStreamResolver = mockk {
-            coEvery { resolve(any(), any()) } returns stubStreamUrl("addon")
+            coEvery { resolveForRadio(any(), any()) } returns stubStreamUrl("addon")
         }
 
         val result = registryWithAddon(addon).resolve(stubTrack(), radio = true)
 
         assertThat(result!!.origin).isEqualTo("addon")
-        coVerify(exactly = 1) { addon.resolve(any(), any()) }
+        coVerify(exactly = 1) { addon.resolveForRadio(any(), any()) }
     }
 
     @Test
@@ -769,7 +769,7 @@ class StreamSourceRegistryTest {
         coEvery { streamingPreference.isForceYouTubeFallback() } returns false
         coEvery { losslessPrefs.enabledNow() } returns true
         val addon: EclipseAddonStreamResolver = mockk {
-            coEvery { resolve(any(), any()) } returns stubStreamUrl("addon")
+            coEvery { resolveForRadio(any(), any()) } returns stubStreamUrl("addon")
         }
 
         val result = registryWithAddon(addon).resolve(
@@ -780,7 +780,7 @@ class StreamSourceRegistryTest {
         )
 
         assertThat(result!!.origin).isEqualTo("addon")
-        coVerify(exactly = 1) { addon.resolve(any(), any()) }
+        coVerify(exactly = 1) { addon.resolveForRadio(any(), any()) }
     }
 
     @Test
@@ -788,7 +788,7 @@ class StreamSourceRegistryTest {
         coEvery { streamingPreference.isForceYouTubeFallback() } returns false
         coEvery { losslessPrefs.enabledNow() } returns true
         val addon: EclipseAddonStreamResolver = mockk {
-            coEvery { resolve(any(), any()) } returns stubStreamUrl("addon")
+            coEvery { resolveForRadio(any(), any()) } returns stubStreamUrl("addon")
         }
         val policy: StreamQualityPolicy = mockk {
             coEvery { dataSaverApplies() } returns true
@@ -805,6 +805,28 @@ class StreamSourceRegistryTest {
         val result = registry.resolve(stubTrack(), radio = true)
 
         assertThat(result!!.origin).isEqualTo("addon")
+    }
+
+    @Test
+    fun `radio addon miss falls back to a YouTube title and artist search`() = runTest {
+        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
+        coEvery { losslessPrefs.enabledNow() } returns false
+        coEvery { qbdlx.resolve(any()) } returns null
+        // The addon-only radio row has no youtubeId: YouTube must search by metadata.
+        val track = stubTrack().copy(youtubeId = null)
+        val addon: EclipseAddonStreamResolver = mockk {
+            coEvery { resolveForRadio(any(), any()) } returns null
+        }
+        coEvery { youtube.resolveByMetadata(track, false) } returns null // fast lane misses
+        coEvery { youtube.resolveByMetadata(track, true) } returns stubStreamUrl("youtube")
+        coEvery { youtube.resolve(any(), any()) } returns null
+
+        val result = registryWithAddon(addon).resolve(track, radio = true)
+
+        assertThat(result!!.origin).isEqualTo("youtube")
+        coVerify(exactly = 1) { addon.resolveForRadio(track, any()) }
+        coVerify(exactly = 1) { youtube.resolveByMetadata(track, true) }
+        coVerify(exactly = 0) { youtube.resolve(track, any()) }
     }
 
     @Test

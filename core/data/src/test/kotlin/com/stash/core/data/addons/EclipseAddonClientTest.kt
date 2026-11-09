@@ -336,10 +336,16 @@ class EclipseAddonClientTest {
     }
 
     @Test
-    fun `resolve 403 Unavailable is a normal miss, not a failure`() = kotlinx.coroutines.test.runTest {
+    fun `resolve 403 is a rights refusal, not a catalog miss`() = kotlinx.coroutines.test.runTest {
         server.enqueue(MockResponse().setResponseCode(403).setBody("""{"detail":"Unavailable"}"""))
 
-        assertThat(client.resolve("https://addons.test/manifest.json", "X", "Y", null, null)).isNull()
+        val failure = runCatching {
+            client.resolve("https://addons.test/manifest.json", "X", "Y", null, null)
+        }.exceptionOrNull()
+
+        // A 403 must not become a cached "not in catalog" negative.
+        assertThat(failure).isInstanceOf(EclipseAddonException.HttpFailure::class.java)
+        assertThat((failure as EclipseAddonException.HttpFailure).code).isEqualTo(403)
     }
 
     @Test
@@ -650,8 +656,13 @@ class EclipseAddonClientTest {
             java.util.Locale.setDefault(java.util.Locale.US)
             server.enqueue(MockResponse().setResponseCode(429))
 
-            assertThat(client.searchAppleTracks("Stay", "Artist")).isEmpty()
-            assertThat(client.searchAppleTracks("Stay", "Artist")).isEmpty()
+            // A 429 is not an empty catalog: it surfaces as a transient failure
+            // so the resolver does not cache an Apple negative for the track.
+            val first = runCatching { client.searchAppleTracks("Stay", "Artist") }.exceptionOrNull()
+            assertThat(first).isInstanceOf(EclipseAddonException.HttpFailure::class.java)
+            assertThat((first as EclipseAddonException.HttpFailure).code).isEqualTo(429)
+            val second = runCatching { client.searchAppleTracks("Stay", "Artist") }.exceptionOrNull()
+            assertThat(second).isInstanceOf(EclipseAddonException.HttpFailure::class.java)
             assertThat(server.requestCount).isEqualTo(1)
         } finally {
             java.util.Locale.setDefault(previous)

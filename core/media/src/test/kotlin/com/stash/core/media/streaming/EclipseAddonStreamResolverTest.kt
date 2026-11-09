@@ -321,6 +321,86 @@ class EclipseAddonStreamResolverTest {
         coVerify(exactly = 2) { repository.stream(addon, "r1") }
     }
 
+    // ── Transient failures and cooldown ───────────────────────────────────
+
+    @Test
+    fun `a 429 cools the addon, stops its other routes, and skips it on the next play`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val aero = addon("aero", resources = listOf("stream", "resolve", "isrc", "search"))
+        val next = addon("next", resources = listOf("stream", "search"))
+        coEvery { repository.enabledNow() } returns listOf(aero, next)
+        coEvery { repository.resolve(aero, any(), any(), any(), any()) } throws
+            EclipseAddonException.HttpFailure(429)
+        coEvery { repository.search(aero, any(), any()) } returns listOf(
+            EclipseAddonTrack(id = "late", title = "Blinding Lights", artist = "The Weeknd", duration = 200),
+        )
+        coEvery { repository.search(next, any(), any()) } returns listOf(
+            EclipseAddonTrack(id = "n1", title = "Blinding Lights", artist = "The Weeknd", duration = 200),
+        )
+        coEvery { repository.stream(next, "n1") } returns stream()
+        val resolver = EclipseAddonStreamResolver(repository)
+
+        assertThat(resolver.resolve(track())?.origin).isEqualTo("addon:next")
+        // The first transient failure stops resolve-isrc/search/query variants
+        // and moves straight to the next addon.
+        coVerify(exactly = 1) { repository.resolve(aero, any(), any(), any(), any()) }
+        coVerify(exactly = 0) { repository.resolveIsrc(aero, any()) }
+        coVerify(exactly = 0) { repository.search(aero, any(), any()) }
+        coVerify(exactly = 1) { repository.search(next, any(), any()) }
+
+        // The addon is cooling: the next play does not call it at all.
+        assertThat(resolver.resolve(track())?.origin).isEqualTo("addon:next")
+        coVerify(exactly = 1) { repository.resolve(aero, any(), any(), any(), any()) }
+        coVerify(exactly = 0) { repository.search(aero, any(), any()) }
+        coVerify(exactly = 2) { repository.search(next, any(), any()) }
+    }
+
+    @Test
+    fun `a 403 Tidal resolve is not cached as a catalog miss`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val cloud = resolveOnly("eclipse-music-cloud")
+        coEvery { repository.enabledNow() } returns listOf(cloud)
+        coEvery { repository.resolve(cloud, any(), any(), any(), any()) } throws
+            EclipseAddonException.HttpFailure(403)
+        coEvery { repository.searchApple(cloud, any(), any()) } returns emptyList()
+        val resolver = cachedResolver(repository)
+
+        assertThat(resolver.resolve(track())).isNull()
+        assertThat(resolver.resolve(track())).isNull()
+
+        // A rights refusal is not "not in the catalog": both plays ask again.
+        coVerify(exactly = 2) {
+            repository.resolve(cloud, "Blinding Lights", "The Weeknd", any(), any())
+        }
+    }
+
+    // ── Radio: Cloud first, non-Cloud after ────────────────────────────────
+
+    @Test
+    fun `radio tries Eclipse Cloud before a non-Cloud addon regardless of user order`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val local = addon("local", resources = listOf("stream", "search"))
+        val cloud = resolveOnly("eclipse-music-cloud")
+        coEvery { repository.enabledNow() } returns listOf(local, cloud)
+        coEvery { repository.resolve(cloud, any(), any(), any(), any()) } returns EclipseAddonTrack(id = "c1")
+        coEvery { repository.stream(cloud, "c1") } returns stream()
+        coEvery { repository.search(local, any(), any()) } returns listOf(
+            EclipseAddonTrack(id = "l1", title = "Blinding Lights", artist = "The Weeknd", duration = 200),
+        )
+        coEvery { repository.stream(local, "l1") } returns stream()
+        val resolver = EclipseAddonStreamResolver(repository)
+
+        val radio = resolver.resolveForRadio(track())
+
+        assertThat(radio?.origin).isEqualTo("addon:eclipse-music-cloud")
+        coVerify(exactly = 0) { repository.search(local, any(), any()) }
+
+        // Normal playback keeps the user's order: local comes first and serves.
+        val normal = resolver.resolve(track())
+        assertThat(normal?.origin).isEqualTo("addon:local")
+        coVerify(exactly = 1) { repository.search(local, any(), any()) }
+    }
+
     // ── Resolve cache ──────────────────────────────────────────────────────
 
     private fun cachedResolver(
@@ -1119,7 +1199,9 @@ class EclipseAddonStreamResolverTest {
         assertThat(resolver.resolve(track())).isNull()
         assertThat(resolver.resolve(track())).isNull()
 
-        // A rights refusal is not a permanent 404: the next play asks again.
+        // A rights refusal is not a permanent 404 or an Apple negative: the next
+        // play searches iTunes again and asks for the same id.
+        coVerify(exactly = 2) { repository.searchApple(cloud, any(), any()) }
         coVerify(exactly = 2) { repository.streamApple(cloud, "6812560833", any()) }
     }
 

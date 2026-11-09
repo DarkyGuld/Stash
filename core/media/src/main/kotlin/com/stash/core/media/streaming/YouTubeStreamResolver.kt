@@ -98,7 +98,22 @@ class YouTubeStreamResolver @Inject constructor(
         val videoId = track.youtubeId?.takeIf(YouTubeVideoId::isValid)
             ?: searchYouTubeForVideoId(track)
             ?: return null
+        return resolveVideo(videoId, allowYtDlp)
+    }
 
+    /**
+     * Radio's addon-only items carry no `youtubeId`: search YouTube by the
+     * title+artist metadata once (bounded by [YT_SEARCH_TIMEOUT_MS]) and resolve
+     * that video for playback. Only radio uses this — normal playback keeps
+     * [resolve]'s stored-id-first behaviour.
+     */
+    internal suspend fun resolveByMetadata(track: TrackEntity, allowYtDlp: Boolean = true): StreamUrl? {
+        val videoId = searchYouTubeForVideoId(track) ?: return null
+        return resolveVideo(videoId, allowYtDlp)
+    }
+
+    /** The extractor and URL mapping shared by [resolve] and [resolveByMetadata]. */
+    private suspend fun resolveVideo(videoId: String, allowYtDlp: Boolean): StreamUrl? {
         val url = withTimeoutOrNull(YT_RESOLVE_TIMEOUT_MS) {
             // Playback resolution (allowYtDlp=true: tap / prefetch / 403-refresh)
             // goes straight to yt-dlp. The InnerTube fast lane returns
