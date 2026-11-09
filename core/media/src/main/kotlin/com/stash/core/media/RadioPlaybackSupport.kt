@@ -14,7 +14,9 @@ internal const val RADIO_UNAVAILABLE_TTL_MS = 5 * 60_000L
 
 /**
  * Everything radio replaced when it took the queue, so leaving the station can
- * put the user's own queue back exactly where it was.
+ * put the user's own queue back. On exit the playing radio song is kept and the
+ * snapshot's upcoming songs are spliced behind it; the snapshot is also the
+ * fallback for a deferred restore when that splice cannot be applied.
  *
  * Captured immediately before [PlayerRepositoryImpl.startRadio] mutates the
  * player. The queue list is the logical queue at that moment; for a big queue
@@ -39,8 +41,9 @@ internal data class RadioExitSnapshot(
 
 /**
  * A queue waiting for the next explicit skip/auto-advance to come back after
- * radio was turned off. [resumeIndex] is already the slot to play (the saved
- * song's slot + 1, clamped).
+ * radio was turned off, when the previous queue could not be spliced behind
+ * the playing radio song immediately. [resumeIndex] is already the slot to
+ * play (the saved song's slot + 1, clamped).
  */
 internal data class PendingRadioRestore(
     val snapshot: RadioExitSnapshot,

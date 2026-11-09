@@ -1,9 +1,7 @@
 package com.stash.core.media
 
-import android.os.Looper
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
-import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.test.core.app.ApplicationProvider
 import com.google.common.truth.Truth.assertThat
@@ -29,11 +27,9 @@ import io.mockk.verify
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.test.runTest
 import org.junit.Before
-import org.junit.Ignore
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
-import org.robolectric.Shadows.shadowOf
 
 @RunWith(RobolectricTestRunner::class)
 class PlayerRepositoryRadioTest {
@@ -359,12 +355,13 @@ class PlayerRepositoryRadioTest {
         coVerify(exactly = 1) { musicRepository.ensureTrackPersisted(any()) }
     }
 
-    // ---- Leaving radio: keep the song, restore the old queue on the next advance ----
+    // ---- Leaving radio: keep the song, put the old queue's upcoming songs behind it ----
 
     /**
      * Seed [previous] as the user's queue at [savedIndex], start a one-song
      * station, then turn radio off. The repo is left holding the station's
-     * song, with the old queue pending (unless [restore] is off).
+     * song with the old queue's upcoming songs spliced behind it (unless
+     * [restore] is off).
      */
     private suspend fun playQueueThenRadioThenExit(
         previous: List<Track>,
@@ -374,66 +371,50 @@ class PlayerRepositoryRadioTest {
         coEvery { streamingPreference.current() } returns true
         coEvery { streamingPreference.isRestoreQueueAfterRadio() } returns restore
         repo.setQueue(previous, startIndex = savedIndex)
+        // Before radio takes the queue: the saved song's slot.
         every { controller.currentMediaItemIndex } returns savedIndex
         val session = mockk<RadioSession>(relaxed = true)
         coEvery { radioGenerator.start(any()) } returns (session to listOf(track(20)))
         repo.startRadio(RadioSeed.Artist("MBV", "id"))
+        // After radio: the player holds just the station's song.
+        every { controller.mediaItemCount } returns 1
+        every { controller.currentMediaItemIndex } returns 0
+        every { controller.currentMediaItem } returns
+            MediaItem.Builder().setMediaId("20").setMediaMetadata(MediaMetadata.EMPTY).build()
+        every { controller.removeMediaItems(any(), any()) } returns Unit
+        every { controller.addMediaItems(any<List<MediaItem>>()) } returns Unit
         repo.exitRadio()
     }
 
-    /** The listener's restore is fire-and-forget on the repository's main scope; drain the looper until it lands. */
-    private fun awaitCaptured(items: io.mockk.CapturingSlot<List<MediaItem>>) {
-        repeat(200) {
-            shadowOf(Looper.getMainLooper()).idle()
-            if (items.isCaptured) return
-            Thread.sleep(5)
-        }
-    }
-
-    @Test fun `exit radio keeps the current radio song playing and restores nothing yet`() = runTest {
+    @Test fun `exit radio keeps the current radio song playing and puts the previous upcoming behind it`() = runTest {
         playQueueThenRadioThenExit(listOf(track(10), track(11), track(12)), savedIndex = 1)
+        // The splice already happened inside the helper; record it before clearing the setup calls.
+        verify { controller.addMediaItems(match<List<MediaItem>> { items -> items.size == 1 }) }
         clearMocks(controller, answers = false)
 
         assertThat(repo.radioSeedLabel.value).isNull()
-        assertThat(repo.currentQueueTracks.map { it.id }).containsExactly(20L)
+        // The station's song stays current; the previous queue's upcoming song is already Up Next.
+        assertThat(repo.currentQueueTracks.map { it.id }).containsExactly(20L, 12L).inOrder()
         // The radio song must not jump, pause or seek when the station is turned off.
         verify(exactly = 0) { controller.pause() }
         verify(exactly = 0) { controller.seekTo(any<Long>()) }
+        verify(exactly = 0) { controller.seekToNextMediaItem() }
         verify(exactly = 0) { controller.setMediaItems(any<List<MediaItem>>(), any<Int>(), any<Long>()) }
+        verify(exactly = 0) { controller.play() }
     }
 
-    @Test fun `manual next after radio restores the previous queue one past the saved song`() = runTest {
-        playQueueThenRadioThenExit(listOf(track(10), track(11), track(12)), savedIndex = 0)
+    @Test fun `manual next after radio plays the first previous upcoming without rebuilding the queue`() = runTest {
+        playQueueThenRadioThenExit(listOf(track(10), track(11), track(12)), savedIndex = 1)
         clearMocks(controller, answers = false)
-        val items = slot<List<MediaItem>>()
-        every { controller.setMediaItems(capture(items), any<Int>(), any<Long>()) } returns Unit
+        every { controller.hasNextMediaItem() } returns true
+        every { controller.nextMediaItemIndex } returns 1
 
         repo.skipNext()
 
-        assertThat(items.captured.map { it.mediaId }).containsExactly("10", "11", "12").inOrder()
-        // Saved the song at 0 before radio; next resumes at 1, not the radio song and not 0.
-        verify { controller.setMediaItems(any<List<MediaItem>>(), 1, any<Long>()) }
-        verify(exactly = 0) { controller.seekToNextMediaItem() }
-    }
-
-    @Ignore("Robolectric's real MediaController service bind NPEs while idling; auto-advance uses the same restore path as the passing manual-next test, plus RadioExitRestore tests.")
-    @Test fun `the end of the radio song restores the previous queue on auto-advance`() = runTest {
-        playQueueThenRadioThenExit(listOf(track(10), track(11), track(12)), savedIndex = 0)
-        clearMocks(controller, answers = false)
-        every { controller.isConnected } returns true
-        every { controller.currentMediaItem } returns
-            MediaItem.Builder().setMediaId("20").setMediaMetadata(MediaMetadata.EMPTY).build()
-        val items = slot<List<MediaItem>>()
-        every { controller.setMediaItems(capture(items), any<Int>(), any<Long>()) } returns Unit
-
-        repo.playerListener.onMediaItemTransition(
-            MediaItem.Builder().setMediaId("20").setMediaMetadata(MediaMetadata.EMPTY).build(),
-            Player.MEDIA_ITEM_TRANSITION_REASON_AUTO,
-        )
-        awaitCaptured(items)
-
-        assertThat(items.captured.map { it.mediaId }).containsExactly("10", "11", "12").inOrder()
-        verify { controller.setMediaItems(any<List<MediaItem>>(), 1, any<Long>()) }
+        // The previous queue is already behind the radio song: Next is a plain timeline move to slot 1.
+        assertThat(repo.currentQueueTracks.map { it.id }).containsExactly(20L, 12L).inOrder()
+        verify { controller.seekToNextMediaItem() }
+        verify(exactly = 0) { controller.setMediaItems(any<List<MediaItem>>(), any<Int>(), any<Long>()) }
     }
 
     @Test fun `restoreQueueAfterRadio off keeps the radio queue on exit and next`() = runTest {
@@ -444,9 +425,11 @@ class PlayerRepositoryRadioTest {
 
         repo.skipNext()
 
-        // No pending restore was armed: Next walks the station's own queue.
+        // The station's own queue stays current and is what Next walks.
+        assertThat(repo.currentQueueTracks.map { it.id }).containsExactly(20L)
         verify { controller.seekToNextMediaItem() }
         verify(exactly = 0) { controller.setMediaItems(any<List<MediaItem>>(), any<Int>(), any<Long>()) }
+        verify(exactly = 0) { controller.addMediaItems(any<List<MediaItem>>()) }
     }
 
     @Test fun `starting a new queue clears a pending radio restore`() = runTest {

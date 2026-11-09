@@ -607,10 +607,11 @@ class PlayerRepositoryImpl @Inject constructor(
     private var radioExitSnapshot: RadioExitSnapshot? = null
 
     /**
-     * Set when radio is turned off with `restoreQueueAfterRadio` on. The next
-     * explicit skip or the end of the current radio song replaces the station
-     * queue with the snapshot, so turning radio off never jumps away from the
-     * song that is playing. Any new queue/station clears it.
+     * Fallback when radio is turned off with `restoreQueueAfterRadio` on and the previous queue
+     * cannot be spliced behind the playing song immediately ([spliceRadioExitTail]). The next
+     * explicit skip or the end of the current radio song then replaces the station queue with the
+     * snapshot, so turning radio off never jumps away from the song that is playing. Any new
+     * queue/station clears it.
      */
     @Volatile
     private var pendingRadioRestore: PendingRadioRestore? = null
@@ -1680,10 +1681,12 @@ class PlayerRepositoryImpl @Inject constructor(
     /**
      * Leave the station from the Now Playing toggle. The current radio song
      * KEEPS PLAYING, exactly where it is: the station only stops growing and
-     * the queue gone from before radio is remembered as a pending restore.
-     * It comes back on the next explicit skip/next or when this song ends
-     * (auto-advance), when the user wants it and no session/browser/cast owns
-     * the player. [stopRadio] stays the auto-stop/grow path.
+     * the queue gone from before radio is put back behind it immediately (so
+     * Up Next already shows the songs Next will play). The playing item is
+     * never paused, seeked or replaced. If the tail cannot be spliced, the
+     * previous queue is kept as a pending restore instead and comes back on
+     * the next explicit skip/next or auto-advance. [stopRadio] stays the
+     * auto-stop/grow path.
      */
     override suspend fun exitRadio() {
         // Read before stopRadio drops them: the deferred restore needs both the
@@ -1717,12 +1720,110 @@ class PlayerRepositoryImpl @Inject constructor(
             currentTrackId = captured.currentTrackId,
             capturedIndex = captured.capturedIndex,
         )
-        setPendingRadioRestore(
-            PendingRadioRestore(
-                snapshot = captured,
-                resumeIndex = RadioExitRestore.resumeIndexAfterExit(savedIndex, captured.tracks.size),
-            ),
+        val pending = PendingRadioRestore(
+            snapshot = captured,
+            resumeIndex = RadioExitRestore.resumeIndexAfterExit(savedIndex, captured.tracks.size),
         )
+        // Preferred: leave the radio song playing and put the previous queue's upcoming songs
+        // straight behind it. Then Up Next, Next and auto-advance all agree without a deferred
+        // jump. Only when the player cannot take the splice do we keep the next-advance restore.
+        if (spliceRadioExitTail(captured, pending.resumeIndex)) {
+            setPendingRadioRestore(null)
+        } else {
+            setPendingRadioRestore(pending)
+        }
+    }
+
+    /**
+     * Keep the playing radio item where it is and replace the station's upcoming songs with the
+     * previous queue's songs after [resumeIndex]. [currentQueueTracks], the source, the
+     * window/pins and shuffle/repeat follow, so the published queue is what Next will play.
+     *
+     * The playing item is never paused, seeked or replaced, and the current position is untouched:
+     * only its neighbours change. Returns false (and leaves the caller's pending restore armed)
+     * when the player is not in a usable state or the window cannot be rebuilt.
+     */
+    private suspend fun spliceRadioExitTail(
+        captured: RadioExitSnapshot,
+        resumeIndex: Int,
+    ): Boolean {
+        val controller = ensureController() ?: return false
+        val currentIndex = controller.currentMediaItemIndex
+        if (currentIndex !in 0 until controller.mediaItemCount) return false
+        val playing = currentQueueTracks.getOrNull(currentIndex)
+            ?: controller.currentMediaItem?.toTrack()
+            ?: return false
+        val upcoming = captured.tracks.drop(resumeIndex)
+        if (upcoming.isEmpty()) return false
+
+        // Publish the previous queue's context as part of the same step as the timeline change:
+        // the queue's player-state listener may refresh during the add below.
+        currentSource = captured.source
+        libraryShuffleActive = captured.libraryShuffleActive
+        librarySnapshot = captured.librarySnapshot
+
+        // The tail goes in play order: hold Media3's shuffle off until it is built (as a restore
+        // does), then put back the mode the previous queue had.
+        controller.shuffleModeEnabled = false
+        try {
+            // Drop the station's upcoming songs; the playing item and anything before it stay.
+            if (currentIndex + 1 < controller.mediaItemCount) {
+                controller.removeMediaItems(currentIndex + 1, controller.mediaItemCount)
+            }
+
+            val capturedWindow = captured.queueWindow
+            if (capturedWindow == null) {
+                // A queue the player holds whole: its upcoming tracks are the whole tail.
+                val items = withContext(Dispatchers.IO) { upcoming.map { it.toQueueMediaItem() } }
+                val head = currentQueueTracks.take(currentIndex + 1)
+                    .takeIf { it.lastOrNull()?.id == playing.id } ?: listOf(playing)
+                currentQueueTracks = head + upcoming
+                dropWindow("radio exit returned the previous queue")
+                controller.addMediaItems(items)
+            } else {
+                // A big queue's window is the timeline slot for slot: the playing song becomes its
+                // first slot, so the station's already-played head goes (the song keeps playing).
+                if (currentIndex > 0) controller.removeMediaItems(0, currentIndex)
+                // Keep the whole previous order (ids only) from the resume point, with the playing
+                // radio song as its first slot. The songs we already hold as Tracks fill the window
+                // now; later ones join by id when the window slides.
+                val total = capturedWindow.total
+                val resumePosition = capturedWindow.position(resumeIndex)
+                val steps = if (captured.repeatMode == Player.REPEAT_MODE_ALL) {
+                    total
+                } else {
+                    total - resumePosition
+                }
+                val ids = LongArray(1 + steps)
+                ids[0] = playing.id
+                for (i in 0 until steps) {
+                    ids[i + 1] = capturedWindow.idAtPosition((resumePosition + i) % total)
+                }
+                val knownTail = upcoming.take((QUEUE_WINDOW_SIZE - 1).coerceAtLeast(0))
+                val items = withContext(Dispatchers.IO) { knownTail.map { it.toQueueMediaItem() } }
+                currentQueueTracks = listOf(playing) + knownTail
+                queueWindow = QueueWindow.ordered(
+                    ids = ids,
+                    count = 1 + knownTail.size,
+                    shuffled = captured.shuffleModeEnabled,
+                )
+                // All Songs rows cannot be read back by id: keep the pins for the order that is
+                // still queued (the playing item too, if it is one of those files).
+                val sortedIds = ids.copyOf().also { it.sort() }
+                windowPinned = captured.windowPinned.filterKeys {
+                    java.util.Arrays.binarySearch(sortedIds, it) >= 0
+                } + (if (playing.isScannedSong) mapOf(playing.id to playing) else emptyMap())
+                windowUnconfirmed = false
+                controller.addMediaItems(items)
+                setKeepTimelineOrder(controller, true)
+            }
+        } finally {
+            controller.shuffleModeEnabled = captured.shuffleModeEnabled
+            controller.repeatMode = captured.repeatMode
+        }
+
+        _radioSeedLabel.value = null
+        return true
     }
 
     /** Snapshot the queue radio is about to replace. Main thread. */

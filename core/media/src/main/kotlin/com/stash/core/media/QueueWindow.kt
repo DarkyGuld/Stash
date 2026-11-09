@@ -369,6 +369,17 @@ internal class QueueWindow private constructor(
         fun whole(ids: LongArray): QueueWindow = QueueWindow(ids.copyOf(), null, start = 0, count = ids.size)
 
         /**
+         * A window over [ids] in exactly the given play order, holding its first [count] songs.
+         * [shuffled] only records that the order came from a shuffle walk (the permutation is the
+         * identity): used when restoring an order that is already in play order, so the window
+         * agrees with the player's shuffle flag without shuffling the songs a second time.
+         */
+        fun ordered(ids: LongArray, count: Int = ids.size, shuffled: Boolean = false): QueueWindow {
+            require(ids.isNotEmpty() && count in 1..ids.size) { "ordered: $count of ${ids.size}" }
+            return QueueWindow(ids.copyOf(), if (shuffled) IntArray(ids.size) { it } else null, start = 0, count = count)
+        }
+
+        /**
          * A window over [ids] (the playable queue, in its unshuffled order) for a play starting at
          * [startIndex]. With [shuffle] the order is the whole list shuffled with that song first;
          * otherwise the window keeps up to [behind] songs before it and fills the rest after it

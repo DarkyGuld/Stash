@@ -14,6 +14,9 @@ import com.google.common.util.concurrent.Futures
 import com.stash.core.data.db.dao.TrackDao
 import com.stash.core.data.db.entity.TrackEntity
 import com.stash.core.data.prefs.StreamingPreference
+import com.stash.core.data.radio.RadioSeed
+import com.stash.core.data.radio.RadioSession
+import com.stash.core.data.radio.RadioStationGenerator
 import com.stash.core.data.repository.MusicRepository
 import com.stash.core.data.sync.TrackIdentityEvents
 import com.stash.core.media.service.StashPlaybackService
@@ -55,6 +58,7 @@ class PlayerRepositoryBigQueueTest {
     private val connectivity: ConnectivityMonitor = mockk(relaxed = true)
     private val trackDao: TrackDao = mockk(relaxed = true)
     private val controller: MediaController = mockk(relaxed = true)
+    private val radioGenerator: RadioStationGenerator = mockk(relaxed = true)
     private val trackIdentityEvents: TrackIdentityEvents = mockk {
         every { changes } returns MutableSharedFlow()
     }
@@ -195,7 +199,7 @@ class PlayerRepositoryBigQueueTest {
             connectivity = connectivity,
             trackDao = trackDao,
             playbackResumer = PlaybackResumer(playbackStateStore, trackDao),
-            radioGenerator = mockk(relaxed = true),
+            radioGenerator = radioGenerator,
             trackIdentityEvents = trackIdentityEvents,
             // The service is up, as it always is while a window exists (the bus starts at false: no service).
             playbackSessionBus = PlaybackSessionBus().apply { onServiceCreated() },
@@ -311,6 +315,34 @@ class PlayerRepositoryBigQueueTest {
         assertThat(fake.ids().count { it > 9_000 }).isGreaterThan(10)
         assertThat(fake.ids().count { it < 1_000 }).isGreaterThan(10)
         assertThat(fake.walksTimelineOrder()).isTrue()
+    }
+
+    @Test
+    fun `exiting radio splices the previous big queue's upcoming songs behind the playing song`() = runTest {
+        coEvery { streamingPreference.isRestoreQueueAfterRadio() } returns true
+        repo.setQueue(library(2_000), startIndex = 1_000)
+        // Saved song: id 1001 at window slot 50. Its previous queue resumes at 1002.
+        val session = mockk<RadioSession>(relaxed = true)
+        coEvery { radioGenerator.start(any()) } returns (session to listOf(track(5_000)))
+
+        repo.startRadio(RadioSeed.Artist("A", "id"))
+        assertThat(fake.currentId()).isEqualTo(5_000L)
+
+        repo.exitRadio()
+
+        // The radio song keeps playing at slot 0; the previous queue's next songs are already Up Next.
+        assertThat(fake.currentId()).isEqualTo(5_000L)
+        assertThat(fake.cur).isEqualTo(0)
+        assertThat(fake.ids()).isEqualTo(listOf(5_000L) + (1_002L..1_450L).toList())
+        assertThat(repo.currentQueueTracks.map { it.id }).isEqualTo(fake.ids())
+        // The whole order from the resume point is still known; only its window is in the player.
+        assertThat(repo.queueWindow!!.total).isEqualTo(1_000)
+        assertThat(repo.queueWindow!!.windowIds().toList()).isEqualTo(fake.ids())
+        assertThat(repo.queueWindow!!.isShuffled).isFalse()
+        assertThat(fake.keepsTimelineOrder).isTrue()
+
+        repo.skipNext()
+        assertThat(fake.currentId()).isEqualTo(1_002L)
     }
 
     /** Runs the main looper until [done] (the repository's own coroutines run there, IO hops come back to it). */
