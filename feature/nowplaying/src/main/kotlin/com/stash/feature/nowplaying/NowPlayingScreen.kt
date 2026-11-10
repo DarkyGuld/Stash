@@ -641,7 +641,7 @@ fun NowPlayingScreen(
     // square art's own handler stands down while Canvas is up, so a touch never skips twice.
     val canvasSwipe = com.stash.feature.nowplaying.ui.rememberSwipeToSkip(
         trackKey = track?.let { it.id to uiState.currentIndex },
-        enabled = canvasVisible && track != null && !isListener,
+        enabled = canvasVisible && track != null && !isListener && !showQueue,
         canNext = canSwipeNext,
         canPrevious = canSwipePrevious,
         onNext = viewModel::onSkipNext,
@@ -1067,6 +1067,11 @@ fun NowPlayingScreen(
                 .fillMaxSize()
                 // Full art fills this box: the text block measures the art's bottom against it.
                 .onPlaced { npRoot = it }
+                // Canvas wears the art's swipe over the whole page, not just the empty backdrop:
+                // the same draggable as the album, so a drag can start on the video, the title,
+                // the transport or anywhere else. Child taps and the seek bar keep priority; only
+                // a horizontal drag past touch slop is claimed.
+                .then(if (canvasVisible) canvasSwipe.gesture else Modifier)
                 // In the sheet the card draws the ground (it fades in as the card grows).
                 .then(if (sheet == null) Modifier.background(MaterialTheme.colorScheme.background) else Modifier),
         ) {
@@ -1094,19 +1099,16 @@ fun NowPlayingScreen(
 
             // Spotify Canvas (experimental): the song's own video fills the background, under the
             // controls. It is outside full art's toggle entirely; here it is simply the backdrop.
-            // The gesture surface takes the empty screen behind the controls; the video and scrim
-            // move and fade together, so the title, progress and transport stay fixed and every
-            // button keeps its tap.
+            // The root Box above owns the swipe over the whole page; the video and scrim move and
+            // fade together, so the title, progress and transport stay fixed.
             if (canvasVisible && canvasUrl != null) {
-                Box(Modifier.fillMaxSize().then(canvasSwipe.gesture)) {
-                    com.stash.feature.nowplaying.ui.CanvasVideoLayer(
-                        url = canvasUrl,
-                        playing = canvasPlaying,
-                        onFailed = { canvasFailedUrl = canvasUrl },
-                        modifier = Modifier.fillMaxSize(),
-                        contentModifier = canvasSwipe.content,
-                    )
-                }
+                com.stash.feature.nowplaying.ui.CanvasVideoLayer(
+                    url = canvasUrl,
+                    playing = canvasPlaying,
+                    onFailed = { canvasFailedUrl = canvasUrl },
+                    modifier = Modifier.fillMaxSize(),
+                    contentModifier = canvasSwipe.content,
+                )
             }
 
             // Full art, behind the controls; it grows out of the square art and back into it.
