@@ -10,6 +10,7 @@ import androidx.compose.animation.SharedTransitionLayout
 import androidx.compose.animation.SizeTransform
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.VisibilityThreshold
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -78,6 +79,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.TextButton
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -89,6 +91,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.painter.ColorPainter
@@ -652,6 +656,18 @@ fun NowPlayingScreen(
     // instead of popping in; a ready next Canvas uses the same content on its whole layer. Not in
     // lyrics mode: there the cover is a shared element on its way into the header.
     val canvasHandoff = canvasSwipe.moving.value && !canvasVisible && !reading
+    // Tap the Canvas to slide the whole player UI down and leave the clip alone; tap again to
+    // bring it back. It is the same idea as MySpoti's immersive player and only exists with a
+    // Canvas: the clip, not the ordinary cover, is what remains. The tap target is the Canvas
+    // layer, so buttons and the seek bar above it keep their own taps.
+    var canvasControlsHidden by remember { mutableStateOf(false) }
+    var canvasControlsHeightPx by remember { mutableStateOf(0f) }
+    LaunchedEffect(canvasVisible) { if (!canvasVisible) canvasControlsHidden = false }
+    val canvasControlsHiddenProgress by animateFloatAsState(
+        targetValue = if (canvasControlsHidden) 1f else 0f,
+        animationSpec = tween(320, easing = FastOutSlowInEasing),
+        label = "canvas-controls-hidden",
+    )
     // White type on a dark backdrop: full art's blend, or the Canvas' scrim.
     val darkBackdrop = fullArtDark || canvasVisible
     // The square art's pages and full art's line up (front, back, inside) when the back is known.
@@ -1102,13 +1118,26 @@ fun NowPlayingScreen(
             // The root Box above owns the swipe over the whole page; the video and scrim move and
             // fade together, so the title, progress and transport stay fixed.
             if (canvasVisible && canvasUrl != null) {
-                com.stash.feature.nowplaying.ui.CanvasVideoLayer(
-                    url = canvasUrl,
-                    playing = canvasPlaying,
-                    onFailed = { canvasFailedUrl = canvasUrl },
-                    modifier = Modifier.fillMaxSize(),
-                    contentModifier = canvasSwipe.content,
-                )
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        // Tap the Canvas to hide/show the player UI. The controls are siblings
+                        // above this layer, so their buttons and seek bar still win their own taps;
+                        // this only sees a tap on the clip or the empty backdrop.
+                        .pointerInput(Unit) {
+                            detectTapGestures {
+                                canvasControlsHidden = !canvasControlsHidden
+                            }
+                        },
+                ) {
+                    com.stash.feature.nowplaying.ui.CanvasVideoLayer(
+                        url = canvasUrl,
+                        playing = canvasPlaying,
+                        onFailed = { canvasFailedUrl = canvasUrl },
+                        modifier = Modifier.fillMaxSize(),
+                        contentModifier = canvasSwipe.content,
+                    )
+                }
             }
 
             // Full art, behind the controls; it grows out of the square art and back into it.
@@ -1197,7 +1226,20 @@ fun NowPlayingScreen(
                 }
             }
 
-            Column(modifier = Modifier.fillMaxSize().padding(bottom = navBarInset)) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(bottom = navBarInset)
+                    .onSizeChanged { canvasControlsHeightPx = it.height.toFloat() }
+                    // Canvas immersive: the whole player UI (top row, art/title, progress,
+                    // transport and lyrics bar) slides down together, leaving only the clip.
+                    // Tapping the clip brings it back up. The layout stays measured, so the
+                    // animation does not jump when the controls come back.
+                    .graphicsLayer {
+                        translationY = canvasControlsHeightPx * canvasControlsHiddenProgress
+                        alpha = 1f - 0.08f * canvasControlsHiddenProgress
+                    },
+            ) {
                 // -- Top row: dismiss, then cast, the pinned actions, ⋮ and (pinned) queue. It stays
                 // put while the art and the lyrics swap beneath it. --
                 Column(
