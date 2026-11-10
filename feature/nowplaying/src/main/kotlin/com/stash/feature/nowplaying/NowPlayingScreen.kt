@@ -1229,16 +1229,7 @@ fun NowPlayingScreen(
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(bottom = navBarInset)
-                    .onSizeChanged { canvasControlsHeightPx = it.height.toFloat() }
-                    // Canvas immersive: the whole player UI (top row, art/title, progress,
-                    // transport and lyrics bar) slides down together, leaving only the clip.
-                    // Tapping the clip brings it back up. The layout stays measured, so the
-                    // animation does not jump when the controls come back.
-                    .graphicsLayer {
-                        translationY = canvasControlsHeightPx * canvasControlsHiddenProgress
-                        alpha = 1f - 0.08f * canvasControlsHiddenProgress
-                    },
+                    .padding(bottom = navBarInset),
             ) {
                 // -- Top row: dismiss, then cast, the pinned actions, ⋮ and (pinned) queue. It stays
                 // put while the art and the lyrics swap beneath it. --
@@ -1310,7 +1301,19 @@ fun NowPlayingScreen(
                             boundsTransform = ModeBounds,
                         )
                         if (!showLyrics) {
-                            Column(modifier = Modifier.fillMaxSize()) {
+                            // Canvas immersive: the bottom half (track info, progress, transport,
+                            // Up Next and the lyrics bar) slides down out of the way, while the
+                            // top row — dismiss, cast, pins, ⋮ — stays put. The layout stays
+                            // measured, so coming back up does not jump.
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .onSizeChanged { canvasControlsHeightPx = it.height.toFloat() }
+                                    .graphicsLayer {
+                                        translationY = canvasControlsHeightPx * canvasControlsHiddenProgress
+                                        alpha = 1f - 0.08f * canvasControlsHiddenProgress
+                                    },
+                            ) {
                                 // #333 v2 — the slot system. No estimated heights, no thresholds:
                                 // the title/progress/controls stack is FIXED and anchors to the
                                 // bottom of the column (directly above the lyrics bar when it's
