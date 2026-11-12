@@ -57,6 +57,14 @@ data class EclipseAddon(
     /** Manifest setting key → its allowed values, when the manifest declared them. */
     val settingOptions: Map<String, List<String>> = emptyMap(),
 ) {
+    /**
+     * Our identity-first addon advertises this toggle. When it is on, a resolve
+     * miss must not fall back to `/search`: search is a text guess, and strict
+     * mode means the app skips that addon rather than play another version.
+     */
+    val strictIdentity: Boolean
+        get() = settings["strictIdentity"]?.equals("true", ignoreCase = true) == true ||
+            settings["strict"]?.equals("true", ignoreCase = true) == true
     /** The host to show in the UI, never the token-bearing full URL. */
     val displayHost: String
         get() = manifestUrl.toHttpUrlOrNull()?.host ?: manifestUrl

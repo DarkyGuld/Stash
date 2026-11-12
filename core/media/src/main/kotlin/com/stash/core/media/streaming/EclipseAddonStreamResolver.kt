@@ -136,7 +136,9 @@ class EclipseAddonStreamResolver private constructor(
                 resolveAndStream(addon, track, key, startedNs)?.let { return it }
 
                 // Only when the manifest advertised it: a resolve-only addon has no search.
-                if (addon.supportsSearch) {
+                // Strict identity addons never fall back to search: that fallback would
+                // turn a missing exact id into a title/version guess.
+                if (addon.supportsSearch && !addon.strictIdentity) {
                     // A search-only addon may need the cleaned credit variants; one that
                     // already paid for /resolve variants keeps the single full query.
                     val searches = if (addon.supportsResolve) listOf(query) else searchQueries(track)
@@ -815,7 +817,8 @@ class EclipseAddonStreamResolver private constructor(
         // Version suffixes and multi-artist credits break some catalogs' search;
         // the cleaned variants are only tried after the full query missed. The id
         // goes into the same track-identity cache entry as a full-query hit.
-        if (addon.supportsResolve) {
+        // Strict addons skip these: a variant call carries no exact id.
+        if (addon.supportsResolve && !addon.strictIdentity) {
             for ((title, artist) in EclipseAddonQuery.variants(track.title, track.artist).drop(1)) {
                 route("variant resolve") {
                     repository.resolve(

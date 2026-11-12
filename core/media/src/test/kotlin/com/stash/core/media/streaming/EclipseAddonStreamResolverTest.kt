@@ -261,6 +261,21 @@ class EclipseAddonStreamResolverTest {
     }
 
     @Test
+    fun `a strict identity addon never falls back to search after a resolve miss`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val strict = addon("strict", resources = listOf("stream", "resolve", "search"))
+            .copy(settings = mapOf("strictIdentity" to "true"))
+        coEvery { repository.enabledNow() } returns listOf(strict)
+        coEvery { repository.resolve(strict, any(), any(), any(), any()) } returns null
+        coEvery { repository.search(strict, any(), any()) } returns listOf(
+            EclipseAddonTrack(id = "s1", title = "Blinding Lights", artist = "The Weeknd", duration = 200),
+        )
+
+        assertThat(EclipseAddonStreamResolver(repository).resolve(track())).isNull()
+        coVerify(exactly = 0) { repository.search(strict, any(), any()) }
+    }
+
+    @Test
     fun `a resolve miss falls back to search only when the addon offers it`() = runTest {
         val repository: EclipseAddonRepository = mockk()
         val both = addon("both", resources = listOf("stream", "resolve", "search"))
