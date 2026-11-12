@@ -165,6 +165,20 @@ class EclipseAddonRepository @Inject constructor(
         artist: String?,
         durationMs: Long?,
         isrc: String?,
+    ): EclipseAddonTrack? = resolve(addon, title, artist, durationMs, isrc, null)
+
+    /**
+     * Same as the five-argument resolve, plus the exact Spotify URI when Stash
+     * has one. Our addon turns that into an ISRC before it reaches TIDAL, so the
+     * result is not a title/artist guess.
+     */
+    suspend fun resolve(
+        addon: EclipseAddon,
+        title: String,
+        artist: String?,
+        durationMs: Long?,
+        isrc: String?,
+        spotifyUri: String?,
     ): EclipseAddonTrack? =
         client.resolve(
             manifestUrl = addon.manifestUrl,
@@ -175,6 +189,7 @@ class EclipseAddonRepository @Inject constructor(
             settings = addon.settings,
             addonId = addon.id,
             quality = addon.qualityForResolve(),
+            spotifyUri = spotifyUri,
         )
 
     suspend fun resolveIsrc(addon: EclipseAddon, isrc: String): EclipseAddonTrack? =

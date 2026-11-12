@@ -274,6 +274,7 @@ class EclipseAddonClient @Inject constructor(
         settings: Map<String, String> = emptyMap(),
         addonId: String? = null,
         quality: String? = null,
+        spotifyUri: String? = null,
     ): EclipseAddonTrack? {
         val base = endpoint(manifestUrl, listOf("resolve"), settings).newBuilder()
             .setQueryParameter("title", title)
@@ -281,6 +282,7 @@ class EclipseAddonClient @Inject constructor(
         if (durationMs != null && durationMs > 0) base.setQueryParameter("durationMs", durationMs.toString())
         if (!isrc.isNullOrBlank()) base.setQueryParameter("isrc", isrc)
         if (!quality.isNullOrBlank()) base.setQueryParameter("quality", quality)
+        if (!spotifyUri.isNullOrBlank()) base.setQueryParameter("spotifyUri", spotifyUri)
         val body = getBody(base.build(), addonId, missCodes = MISS_CODES) ?: return null
         return parseBody(body) { parseResolvedTrack(it) }
     }

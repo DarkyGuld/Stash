@@ -336,6 +336,25 @@ class EclipseAddonClientTest {
     }
 
     @Test
+    fun `resolve sends the Spotify URI when Stash has one`() = kotlinx.coroutines.test.runTest {
+        server.enqueue(MockResponse().setBody("""{"item":{"id":"r2","title":"Desire"}}"""))
+
+        val item = client.resolve(
+            "https://addons.test/manifest.json",
+            "Desire - Speed Garage Remix",
+            "Hiko",
+            114_347,
+            null,
+            spotifyUri = "spotify:track:1mEkZKB2JvKjrit2d75c7v",
+        )
+
+        assertThat(item?.id).isEqualTo("r2")
+        val query = server.takeRequest().requestUrl!!
+        assertThat(query.queryParameter("spotifyUri")).isEqualTo("spotify:track:1mEkZKB2JvKjrit2d75c7v")
+        assertThat(query.queryParameter("isrc")).isNull()
+    }
+
+    @Test
     fun `resolve 403 is a rights refusal, not a catalog miss`() = kotlinx.coroutines.test.runTest {
         server.enqueue(MockResponse().setResponseCode(403).setBody("""{"detail":"Unavailable"}"""))
 
