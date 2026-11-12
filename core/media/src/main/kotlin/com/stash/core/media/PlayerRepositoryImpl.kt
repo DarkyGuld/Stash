@@ -158,6 +158,9 @@ class PlayerRepositoryImpl @Inject constructor(
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
+    /** One delayed same-item retry at a time; a newer retry supersedes the old one. */
+    private var streamRetryJob: Job? = null
+
     /** True while a Listen Together session owns the player; the transport gates (Next, Previous, play) read it. */
     private val inListenTogether: Boolean get() = listenTogether?.active?.value == true
 
@@ -4086,7 +4089,10 @@ class PlayerRepositoryImpl @Inject constructor(
                                 ?.getLong(EXTRA_TRACK_ID, 0L)
                                 ?.takeIf { it != 0L }
                                 ?.let { streamUrlCache.invalidate(it) }
-                            controller?.retryCurrentItem()
+                            // Give a slow/rate-limited source a moment before re-preparing.
+                            // The old immediate retry could burn both attempts before a 429
+                            // cooled down and then skip the song in under a second.
+                            scheduleCurrentItemRetry(current?.mediaId)
                         }
                         StreamErrorCascadeGuard.Verdict.Recover -> controller?.recoverOrStop()
                         is StreamErrorCascadeGuard.Verdict.Halt -> {
@@ -4214,6 +4220,26 @@ class PlayerRepositoryImpl @Inject constructor(
         }
         prepare()
         play()
+    }
+
+    /**
+     * Re-prepare the failing item after a short pause instead of immediately.
+     * Captures the item index/id so a user skip or a new queue item during the
+     * delay cannot make the retry hit the wrong song. The job is cancelled by a
+     * newer retry; a manual transport re-arms the cascade guard separately.
+     */
+    private fun scheduleCurrentItemRetry(mediaId: String?) {
+        val controller = controllerDeferred ?: return
+        val index = controller.currentMediaItemIndex
+        streamRetryJob?.cancel()
+        streamRetryJob = scope.launch {
+            delay(STREAM_RETRY_DELAY_MS)
+            val active = controllerDeferred ?: return@launch
+            if (active.currentMediaItemIndex != index) return@launch
+            if (mediaId != null && active.currentMediaItem?.mediaId != mediaId) return@launch
+            if (!active.playWhenReady) return@launch
+            active.retryCurrentItem()
+        }
     }
 
     /**
@@ -4630,6 +4656,9 @@ class PlayerRepositoryImpl @Inject constructor(
 
     companion object {
         private const val TAG = "StashPlayer"
+
+        /** Grace before re-preparing a streamed song after a transient error. */
+        private const val STREAM_RETRY_DELAY_MS = 1_200L
 
         /** The extras that describe the stream a slot plays, for Now Playing's quality line. */
         private val streamStampKeys = listOf(

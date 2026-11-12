@@ -19,31 +19,33 @@ class StreamErrorCascadeGuardTest {
     }
 
     @Test
-    fun secondErrorForSameItem_recoversBySkipping() {
+    fun secondErrorForSameItem_retriesAgainBeforeSkipping() {
         val guard = StreamErrorCascadeGuard(threshold = 3)
-        guard.onError("track-1") // RetrySameItem
+        guard.onError("track-1") // RetrySameItem (attempt 1)
+        assertThat(guard.onError("track-1")).isEqualTo(StreamErrorCascadeGuard.Verdict.RetrySameItem) // attempt 2
         assertThat(guard.onError("track-1")).isEqualTo(StreamErrorCascadeGuard.Verdict.Recover)
     }
 
     @Test
-    fun eachNewItemGetsItsOwnRetryBeforeCounting() {
+    fun eachNewItemGetsItsOwnRetriesBeforeCounting() {
         val guard = StreamErrorCascadeGuard(threshold = 3)
-        // A dead backend: every track gets one retry, then a skip. The skips are
-        // what accumulate toward the halt.
-        assertThat(guard.onError("a")).isEqualTo(StreamErrorCascadeGuard.Verdict.RetrySameItem)
+        // A dead backend: every track gets two retries, then a skip. The skips
+        // are what accumulate toward the halt.
+        repeat(2) { assertThat(guard.onError("a")).isEqualTo(StreamErrorCascadeGuard.Verdict.RetrySameItem) }
         assertThat(guard.onError("a")).isEqualTo(StreamErrorCascadeGuard.Verdict.Recover) // skip 1
-        assertThat(guard.onError("b")).isEqualTo(StreamErrorCascadeGuard.Verdict.RetrySameItem)
+        repeat(2) { assertThat(guard.onError("b")).isEqualTo(StreamErrorCascadeGuard.Verdict.RetrySameItem) }
         assertThat(guard.onError("b")).isEqualTo(StreamErrorCascadeGuard.Verdict.Recover) // skip 2
-        assertThat(guard.onError("c")).isEqualTo(StreamErrorCascadeGuard.Verdict.RetrySameItem)
+        repeat(2) { assertThat(guard.onError("c")).isEqualTo(StreamErrorCascadeGuard.Verdict.RetrySameItem) }
         assertThat(guard.onError("c")).isInstanceOf(StreamErrorCascadeGuard.Verdict.Halt::class.java) // skip 3 -> halt
     }
 
     @Test
     fun retriedItemThatKeepsFailing_doesNotLoopOnRetry() {
-        // The one-retry-per-item guarantee: a genuinely dead URL is retried ONCE,
+        // The bounded-retry guarantee: a genuinely dead URL gets two retries,
         // then every subsequent error skips/halts — never an infinite retry.
         val guard = StreamErrorCascadeGuard(threshold = 3)
         guard.onError("x") // RetrySameItem
+        assertThat(guard.onError("x")).isEqualTo(StreamErrorCascadeGuard.Verdict.RetrySameItem)
         assertThat(guard.onError("x")).isEqualTo(StreamErrorCascadeGuard.Verdict.Recover)
         assertThat(guard.onError("x")).isEqualTo(StreamErrorCascadeGuard.Verdict.Recover)
         assertThat(guard.onError("x")).isInstanceOf(StreamErrorCascadeGuard.Verdict.Halt::class.java)

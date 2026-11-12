@@ -23,8 +23,14 @@ package com.stash.core.media
  */
 class StreamErrorCascadeGuard(
     private val threshold: Int = 3,
+    /** Same-item re-prepares granted before the first skip. Two gives a slow
+     *  source a real chance to recover without turning a dead URL into a loop. */
+    private val maxRetriesPerItem: Int = 2,
 ) {
-    init { require(threshold >= 1) { "threshold must be >= 1, got $threshold" } }
+    init {
+        require(threshold >= 1) { "threshold must be >= 1, got $threshold" }
+        require(maxRetriesPerItem >= 1) { "maxRetriesPerItem must be >= 1, got $maxRetriesPerItem" }
+    }
 
     private var consecutiveErrors: Int = 0
 
@@ -34,7 +40,8 @@ class StreamErrorCascadeGuard(
      * again immediately must NOT re-retry (that is the infinite-retry trap), only
      * a deliberate [onUserTransport] rearms it.
      */
-    private var retriedItemKey: String? = null
+    private var retryItemKey: String? = null
+    private var retriesForItem: Int = 0
 
     /** Local-file skips since anything last played; see [onLocalSkip]. */
     private var consecutiveLocalSkips: Int = 0
@@ -54,9 +61,15 @@ class StreamErrorCascadeGuard(
      *   skips retry and counts immediately, preserving the pre-retry behaviour.
      */
     fun onError(itemKey: String?): Verdict {
-        if (itemKey != null && itemKey != retriedItemKey) {
-            retriedItemKey = itemKey
-            return Verdict.RetrySameItem
+        if (itemKey != null) {
+            if (itemKey != retryItemKey) {
+                retryItemKey = itemKey
+                retriesForItem = 0
+            }
+            if (retriesForItem < maxRetriesPerItem) {
+                retriesForItem += 1
+                return Verdict.RetrySameItem
+            }
         }
         consecutiveErrors += 1
         return if (consecutiveErrors >= threshold) Verdict.Halt(consecutiveErrors) else Verdict.Recover
@@ -82,12 +95,16 @@ class StreamErrorCascadeGuard(
     fun onPlaybackStarted() {
         consecutiveErrors = 0
         consecutiveLocalSkips = 0
+        // A track that reached playback has had its retry budget. If it errors
+        // immediately afterwards, skip rather than re-entering the retry loop.
+        retriesForItem = maxRetriesPerItem
     }
 
     /** User did something deliberate (next/prev/seek/play) — rearm everything. */
     fun onUserTransport() {
         consecutiveErrors = 0
         consecutiveLocalSkips = 0
-        retriedItemKey = null
+        retryItemKey = null
+        retriesForItem = 0
     }
 }
