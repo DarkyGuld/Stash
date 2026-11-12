@@ -236,6 +236,31 @@ class EclipseAddonStreamResolverTest {
     }
 
     @Test
+    fun `resolve sends the YouTube id for a row without an ISRC or Spotify URI`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val resolveOnly = addon("addon", resources = listOf("stream", "settings", "resolve"))
+        coEvery { repository.enabledNow() } returns listOf(resolveOnly)
+        coEvery {
+            repository.resolve(resolveOnly, any(), any(), any(), any(), any(), "Y1HUL-TALoE")
+        } returns EclipseAddonTrack(id = "r1", title = "Edge of Desire", isrc = "GBCPZ2524512")
+        coEvery { repository.stream(resolveOnly, "r1") } returns stream(quality = "lossless", format = "flac")
+
+        val edge = TrackEntity(
+            title = "Edge Of Desire (From Defected In The House Livestream)",
+            artist = "Jonas Blue, Malive",
+            durationMs = 204_000,
+            youtubeId = "Y1HUL-TALoE",
+            source = com.stash.core.model.MusicSource.YOUTUBE,
+        )
+        val result = EclipseAddonStreamResolver(repository).resolve(edge)
+
+        assertThat(result?.origin).isEqualTo("addon:addon")
+        coVerify(exactly = 1) {
+            repository.resolve(resolveOnly, any(), any(), any(), any(), any(), "Y1HUL-TALoE")
+        }
+    }
+
+    @Test
     fun `a resolve miss falls back to search only when the addon offers it`() = runTest {
         val repository: EclipseAddonRepository = mockk()
         val both = addon("both", resources = listOf("stream", "resolve", "search"))

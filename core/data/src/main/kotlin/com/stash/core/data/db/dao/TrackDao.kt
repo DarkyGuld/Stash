@@ -2441,6 +2441,26 @@ interface TrackDao {
     suspend fun updateSpotifyUri(trackId: Long, spotifyUri: String)
 
     /**
+     * Spotify URI backfill that no-ops when the row already has one or when
+     * ANOTHER row owns it (`tracks.spotify_uri` is UNIQUE). The sync uses this
+     * when a Spotify snapshot matched an existing YouTube row: the URI and its
+     * ISRC belong on that row, so a later addon resolve can go Spotify → ISRC
+     * → TIDAL instead of guessing by title. Returns 1 when applied, 0 when
+     * skipped.
+     */
+    @Query(
+        """
+        UPDATE tracks SET spotify_uri = :spotifyUri
+        WHERE id = :trackId
+          AND (spotify_uri IS NULL OR spotify_uri = '')
+          AND NOT EXISTS (
+              SELECT 1 FROM tracks WHERE spotify_uri = :spotifyUri AND id != :trackId
+          )
+        """
+    )
+    suspend fun updateSpotifyUriIfUnclaimed(trackId: Long, spotifyUri: String): Int
+
+    /**
      * Backfill duration_ms when the existing row has 0 (no duration yet —
      * usually because the row was inserted by `ensureTrackPersisted` from
      * a streaming-engine Track whose `durationMs` wasn't yet known at

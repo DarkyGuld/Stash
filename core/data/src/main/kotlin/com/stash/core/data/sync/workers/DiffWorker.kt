@@ -881,6 +881,29 @@ class DiffWorker @AssistedInject constructor(
                 }
             }
 
+            // Cross-source dedupe must keep the Spotify identity it matched
+            // on. A YouTube row that a Spotify playlist also contains stays
+            // source=YOUTUBE, but gains spotify_uri (and, when the snapshot has
+            // one, its ISRC). Stash 0.9.146+ then sends that URI to the addon,
+            // which resolves Spotify → ISRC → TIDAL exactly instead of guessing
+            // from a livestream title and its 204 s duration.
+            val snapshotSpotifyUri = snapshot.spotifyUri?.takeIf(String::isNotBlank)
+            if (snapshotSpotifyUri != null && batchTrack.entity.spotifyUri.isNullOrBlank()) {
+                val spotifyOwner = bySpotifyUri[snapshotSpotifyUri]
+                if (spotifyOwner == null || spotifyOwner === batchTrack) {
+                    val applied = trackDao.updateSpotifyUriIfUnclaimed(existingTrack.id, snapshotSpotifyUri)
+                    if (applied == 1) {
+                        batchTrack.entity = batchTrack.entity.copy(spotifyUri = snapshotSpotifyUri)
+                        bySpotifyUri[snapshotSpotifyUri] = batchTrack
+                    }
+                }
+            }
+            val snapshotIsrc = snapshot.isrc?.takeIf(String::isNotBlank)
+            if (snapshotIsrc != null && batchTrack.entity.isrc.isNullOrBlank()) {
+                trackDao.backfillIsrcIfMissing(existingTrack.id, snapshotIsrc)
+                batchTrack.entity = batchTrack.entity.copy(isrc = snapshotIsrc)
+            }
+
             val snapshotArt = snapshot.albumArtUrl
             if (!snapshotArt.isNullOrBlank() && snapshotArt != batchTrack.entity.albumArtUrl) {
                 trackDao.updateAlbumArtUrl(existingTrack.id, snapshotArt)

@@ -105,6 +105,23 @@ class DiffWorkerMergedAliasTest {
         assertEquals(3, db.playlistDao().getCrossRef(pid, kept)!!.position)
     }
 
+    @Test fun `a Spotify snapshot matched to a YouTube row keeps the Spotify URI and ISRC`() = runBlocking {
+        val kept = row("Edge of Desire", youtubeId = "Y1HUL-TALoE")
+        playlist(
+            MusicSource.SPOTIFY,
+            snapshot("Edge of Desire", spotifyUri = "spotify:track:edge1", position = 0)
+                .copy(isrc = "GBCPZ2524512"),
+        )
+
+        buildWorker().doWork()
+
+        val after = db.trackDao().getById(kept)!!
+        assertEquals("the YouTube row stands", 1, count("SELECT COUNT(*) FROM tracks"))
+        assertEquals("spotify:track:edge1", after.spotifyUri)
+        assertEquals("GBCPZ2524512", after.isrc)
+        assertEquals("Y1HUL-TALoE", after.youtubeId)
+    }
+
     // ── Fixtures ───────────────────────────────────────────────────────────
 
     private fun count(sql: String): Int = db.openHelper.readableDatabase.query(sql).use { it.moveToFirst(); it.getInt(0) }

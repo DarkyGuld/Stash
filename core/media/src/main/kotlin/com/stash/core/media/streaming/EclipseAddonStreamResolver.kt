@@ -741,10 +741,14 @@ class EclipseAddonStreamResolver private constructor(
     private fun identityKey(track: TrackEntity): String {
         val isrc = track.isrc?.trim()?.takeIf { it.isNotEmpty() }
         val spotifyUri = track.spotifyUri?.trim()?.takeIf { it.isNotEmpty() }
+        val youtubeId = track.youtubeId?.trim()?.takeIf { it.isNotEmpty() }
         return if (isrc != null) {
             "isrc:${isrc.lowercase()}"
         } else if (spotifyUri != null) {
             "spotify:${spotifyUri.lowercase()}"
+        } else if (youtubeId != null) {
+            // YouTube ids are case-sensitive, unlike the other two.
+            "youtube:$youtubeId"
         } else {
             "meta:" + EclipseAddonMatcher.normalize(
                 "${track.title}|${track.artist}|${track.durationMs}",
@@ -766,6 +770,7 @@ class EclipseAddonStreamResolver private constructor(
     private suspend fun resolveId(addon: EclipseAddon, track: TrackEntity): ResolveId {
         val isrc = track.isrc?.trim()?.takeIf { it.isNotEmpty() }
         val spotifyUri = track.spotifyUri?.trim()?.takeIf { it.isNotEmpty() }
+        val youtubeId = track.youtubeId?.trim()?.takeIf { it.isNotEmpty() }
         var definitive = true
 
         suspend fun route(name: String, call: suspend () -> String?): String? =
@@ -782,7 +787,7 @@ class EclipseAddonStreamResolver private constructor(
 
         if (addon.supportsResolve) {
             route("resolve") {
-                if (spotifyUri != null) {
+                if (spotifyUri != null || youtubeId != null) {
                     repository.resolve(
                         addon = addon,
                         title = track.title,
@@ -790,6 +795,7 @@ class EclipseAddonStreamResolver private constructor(
                         durationMs = track.durationMs.takeIf { it > 0 },
                         isrc = isrc,
                         spotifyUri = spotifyUri,
+                        youtubeId = youtubeId,
                     )?.id
                 } else {
                     repository.resolve(

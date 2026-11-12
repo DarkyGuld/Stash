@@ -355,6 +355,25 @@ class EclipseAddonClientTest {
     }
 
     @Test
+    fun `resolve sends the YouTube id when Stash has one`() = kotlinx.coroutines.test.runTest {
+        server.enqueue(MockResponse().setBody("""{"item":{"id":"r3","title":"Edge of Desire"}}"""))
+
+        val item = client.resolve(
+            "https://addons.test/manifest.json",
+            "Edge Of Desire (From Defected In The House Livestream)",
+            "Jonas Blue, Malive",
+            204_000,
+            null,
+            youtubeId = "Y1HUL-TALoE",
+        )
+
+        assertThat(item?.id).isEqualTo("r3")
+        val query = server.takeRequest().requestUrl!!
+        assertThat(query.queryParameter("youtubeId")).isEqualTo("Y1HUL-TALoE")
+        assertThat(query.queryParameter("spotifyUri")).isNull()
+    }
+
+    @Test
     fun `resolve 403 is a rights refusal, not a catalog miss`() = kotlinx.coroutines.test.runTest {
         server.enqueue(MockResponse().setResponseCode(403).setBody("""{"detail":"Unavailable"}"""))
 

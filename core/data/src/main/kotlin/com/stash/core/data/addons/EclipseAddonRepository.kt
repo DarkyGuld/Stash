@@ -179,6 +179,22 @@ class EclipseAddonRepository @Inject constructor(
         durationMs: Long?,
         isrc: String?,
         spotifyUri: String?,
+    ): EclipseAddonTrack? = resolve(addon, title, artist, durationMs, isrc, spotifyUri, null)
+
+    /**
+     * Same as the six-argument resolve, plus the exact YouTube video id when
+     * Stash has one. A YouTube video has no ISRC in YouTube's API, so the id is
+     * the only exact key a pure YouTube row can offer; the addon maps it from
+     * its identity index instead of guessing by title.
+     */
+    suspend fun resolve(
+        addon: EclipseAddon,
+        title: String,
+        artist: String?,
+        durationMs: Long?,
+        isrc: String?,
+        spotifyUri: String?,
+        youtubeId: String?,
     ): EclipseAddonTrack? =
         client.resolve(
             manifestUrl = addon.manifestUrl,
@@ -190,6 +206,7 @@ class EclipseAddonRepository @Inject constructor(
             addonId = addon.id,
             quality = addon.qualityForResolve(),
             spotifyUri = spotifyUri,
+            youtubeId = youtubeId,
         )
 
     suspend fun resolveIsrc(addon: EclipseAddon, isrc: String): EclipseAddonTrack? =
