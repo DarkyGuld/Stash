@@ -667,12 +667,13 @@ class EclipseAddonStreamResolver private constructor(
                 throw e
             } catch (e: EclipseAddonException.Preparing) {
                 try {
-                    waitPreparing(addon, e)
-                    return if (tier == addon.appleQuality) {
-                    repository.streamApple(addon, appleTrackId, isrc)
-                } else {
-                    repository.streamAppleAtTier(addon, appleTrackId, isrc, tier)
-                }
+                    return retryPreparing(addon) {
+                        if (tier == addon.appleQuality) {
+                            repository.streamApple(addon, appleTrackId, isrc)
+                        } else {
+                            repository.streamAppleAtTier(addon, appleTrackId, isrc, tier)
+                        }
+                    }
                 } catch (retry: CancellationException) {
                     throw retry
                 } catch (retry: Exception) {
@@ -853,18 +854,39 @@ class EclipseAddonStreamResolver private constructor(
      * resolve deadline still bounds the whole walk.
      */
     private suspend fun streamWithRetry(addon: EclipseAddon, trackId: String): EclipseAddonStream =
-        try {
-            repository.stream(addon, trackId)
-        } catch (e: EclipseAddonException.Preparing) {
-            waitPreparing(addon, e)
-            repository.stream(addon, trackId)
+        retryPreparing(addon) { repository.stream(addon, trackId) }
+
+    /**
+     * Runs one addon stream call, waiting out up to [MAX_PREPARING_RETRIES]
+     * "preparing" 503s. A TorBox-backed addon answers 503 while it installs the
+     * release; one short retry used to turn a normal cache miss into a skipped
+     * song. The registry's 45 s resolve deadline still bounds the whole walk.
+     */
+    private suspend fun <T> retryPreparing(
+        addon: EclipseAddon,
+        block: suspend () -> T,
+    ): T {
+        var retries = 0
+        while (true) {
+            try {
+                return block()
+            } catch (e: EclipseAddonException.Preparing) {
+                if (retries >= MAX_PREPARING_RETRIES) throw e
+                retries += 1
+                waitPreparing(addon, e, retries)
+            }
         }
+    }
 
     /** Waits out one "preparing" 503, honouring `Retry-After` up to [MAX_PREPARING_WAIT_SECONDS]. */
-    private suspend fun waitPreparing(addon: EclipseAddon, e: EclipseAddonException.Preparing) {
+    private suspend fun waitPreparing(
+        addon: EclipseAddon,
+        e: EclipseAddonException.Preparing,
+        attempt: Int = 1,
+    ) {
         val seconds = (e.retryAfterSeconds ?: DEFAULT_PREPARING_WAIT_SECONDS)
             .coerceIn(0, MAX_PREPARING_WAIT_SECONDS)
-        Log.i(TAG, "addon '${addon.name}' is preparing; retrying once in ${seconds}s")
+        Log.i(TAG, "addon '${addon.name}' is preparing; retry $attempt in ${seconds}s")
         if (seconds > 0) delay(seconds * 1_000L)
     }
 
@@ -1044,9 +1066,10 @@ class EclipseAddonStreamResolver private constructor(
         /** Three credit variants at most: full, cleaned title/primary artist, full title/primary artist. */
         private const val SEARCH_VARIANT_LIMIT = 3
 
-        /** One retry for a 503 "preparing", as long as the addon asks (up to 8 s). */
-        private const val DEFAULT_PREPARING_WAIT_SECONDS = 2
-        private const val MAX_PREPARING_WAIT_SECONDS = 8
+        /** Wait out a cache-backed addon's 503 "preparing" instead of skipping the song. */
+        private const val DEFAULT_PREPARING_WAIT_SECONDS = 5
+        private const val MAX_PREPARING_WAIT_SECONDS = 15
+        private const val MAX_PREPARING_RETRIES = 2
 
         /** Cloud's Tidal miss is long-lived: Apple still serves the track, and the lookup is ~0.8 s. */
         private const val CLOUD_TIDAL_MISS_TTL_MS = 6 * 60 * 60_000L

@@ -308,6 +308,22 @@ class EclipseAddonStreamResolverTest {
     }
 
     @Test
+    fun `a preparing addon gets two retries before the song is treated as a miss`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val addon = addon("aero", resources = listOf("stream", "resolve"))
+        coEvery { repository.enabledNow() } returns listOf(addon)
+        coEvery { repository.resolve(addon, any(), any(), any(), any()) } returns EclipseAddonTrack(id = "r1")
+        coEvery { repository.stream(addon, "r1") } throws EclipseAddonException.Preparing(0) andThenThrows
+            EclipseAddonException.Preparing(0) andThen
+            stream(quality = "lossless", format = "flac")
+
+        val result = EclipseAddonStreamResolver(repository).resolve(track())
+
+        assertThat(result?.origin).isEqualTo("addon:aero")
+        coVerify(exactly = 3) { repository.stream(addon, "r1") }
+    }
+
+    @Test
     fun `a 404 re-resolves the item once rather than retrying it blindly`() = runTest {
         val repository: EclipseAddonRepository = mockk()
         val addon = addon("cloud", resources = listOf("stream", "resolve"))
