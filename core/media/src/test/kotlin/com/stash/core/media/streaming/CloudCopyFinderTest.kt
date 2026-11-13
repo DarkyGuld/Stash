@@ -69,6 +69,7 @@ class CloudCopyFinderTest {
         coEvery { isForceQbdlxOnly() } returns false
         coEvery { isSkipQobuz() } returns false
         coEvery { isForceYouTubeFallback() } returns false
+        coEvery { isAddonsFirst() } returns false
     }
     private val track = TrackEntity(id = 7L, title = "Reckoner", artist = "Radiohead", album = "In Rainbows", durationMs = 290_000L)
 

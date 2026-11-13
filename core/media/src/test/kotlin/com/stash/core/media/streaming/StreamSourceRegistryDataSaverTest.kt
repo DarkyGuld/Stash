@@ -38,6 +38,7 @@ class StreamSourceRegistryDataSaverTest {
         coEvery { isForceQbdlxOnly() } returns false
         coEvery { isForceYouTubeFallback() } returns false
         coEvery { isSkipQobuz() } returns false
+        coEvery { isAddonsFirst() } returns false
     }
     private val losslessPrefs: LosslessSourcePreferences = mockk { coEvery { enabledNow() } returns true }
     private val cloudCopies: CloudCopyFinder = mockk {
