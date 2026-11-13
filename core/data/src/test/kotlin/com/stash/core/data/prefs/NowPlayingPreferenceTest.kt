@@ -106,25 +106,37 @@ class NowPlayingPreferenceTest {
             launch(kotlinx.coroutines.Dispatchers.IO) { preference.togglePin(NowPlayingAction.DOWNLOAD) }
         }
         org.junit.Assert.assertEquals(
-            setOf(NowPlayingAction.RADIO, NowPlayingAction.QUEUE, NowPlayingAction.SHARE, NowPlayingAction.DOWNLOAD),
+            setOf(
+                NowPlayingAction.RADIO,
+                NowPlayingAction.SPOTIFY_RADIO,
+                NowPlayingAction.QUEUE,
+                NowPlayingAction.SHARE,
+                NowPlayingAction.DOWNLOAD,
+            ),
             preference.pinnedActions.first(),
         )
     }
 
     @Test fun togglePin_capHoldsUnderConcurrentPins() = runTest {
-        // Every other action races for the three free places: exactly three win, the rest are refused.
+        // Every other action races for the free places: exactly as many win as fit, the rest are refused.
         val results = kotlinx.coroutines.coroutineScope {
             NowPlayingAction.entries.filter { it !in NowPlayingAction.DefaultPins }.map { action ->
                 async(kotlinx.coroutines.Dispatchers.IO) { preference.togglePin(action) }
             }.map { it.await() }
         }
-        org.junit.Assert.assertEquals(NowPlayingAction.MAX_PINS - 2, results.count { it })
+        org.junit.Assert.assertEquals(
+            NowPlayingAction.MAX_PINS - NowPlayingAction.DefaultPins.size,
+            results.count { it },
+        )
         org.junit.Assert.assertEquals(NowPlayingAction.MAX_PINS, preference.pinnedActions.first().size)
     }
 
     @Test fun togglePin_unpinsAndReportsTheRefusal() = runTest {
         assertTrue(preference.togglePin(NowPlayingAction.RADIO))
-        org.junit.Assert.assertEquals(setOf(NowPlayingAction.QUEUE), preference.pinnedActions.first())
+        org.junit.Assert.assertEquals(
+            setOf(NowPlayingAction.SPOTIFY_RADIO, NowPlayingAction.QUEUE),
+            preference.pinnedActions.first(),
+        )
         preference.setPinnedActions(NowPlayingAction.entries.take(NowPlayingAction.MAX_PINS).toSet())
         assertFalse(preference.togglePin(NowPlayingAction.FLAG_WRONG_MATCH))
     }
