@@ -101,6 +101,8 @@ class PlayerRepositoryListenTogetherTest {
         every { controller.currentMediaItem } returns item(99)
         every { controller.currentMediaItemIndex } returns 0
         every { controller.isPlaying } returns true
+        // The delayed same-item retry only re-prepares a playing item.
+        every { controller.playWhenReady } returns true
     }
 
     @Test fun `outside a session a refresh saves the queue, which is what the gate must stop`() {
@@ -274,7 +276,10 @@ class PlayerRepositoryListenTogetherTest {
         // Once the session is gone (quiet end, no restore) the same error is retried.
         together.setActive(false, restore = false)
         repo.playerListener.onPlayerError(error)
-        shadowOf(Looper.getMainLooper()).idle()
+        // The retry waits out a pause before it re-prepares (STREAM_RETRY_DELAY_MS),
+        // and it runs on the repository's own main scope: the Robolectric clock
+        // has to move before prepare() is expected.
+        shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(1_500))
         verify(atLeast = 1) { controller.prepare() }
     }
 

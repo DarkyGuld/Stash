@@ -70,6 +70,16 @@ class CloudCopyFinderTest {
         coEvery { isSkipQobuz() } returns false
         coEvery { isForceYouTubeFallback() } returns false
         coEvery { isAddonsFirst() } returns false
+        coEvery { isCloudFastestSource() } returns false
+        coEvery { isPrefetchSearchResults() } returns false
+        coEvery { isPrefetchWholeFile() } returns false
+        coEvery { isRestoreQueueAfterRadio() } returns false
+        // The per-source switches default to on.
+        coEvery { isQobuzEnabled() } returns true
+        coEvery { isTidalEnabled() } returns true
+        coEvery { isEclipseAddonsEnabled() } returns true
+        coEvery { isJiosaavnEnabled() } returns true
+        coEvery { isYoutubeEnabled() } returns true
     }
     private val track = TrackEntity(id = 7L, title = "Reckoner", artist = "Radiohead", album = "In Rainbows", durationMs = 290_000L)
 
