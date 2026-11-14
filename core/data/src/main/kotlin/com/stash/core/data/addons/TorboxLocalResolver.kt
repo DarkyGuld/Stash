@@ -5,7 +5,6 @@ import com.stash.core.data.db.dao.TorboxPointerDao
 import com.stash.core.data.db.entity.TorboxPointerEntity
 import javax.inject.Inject
 import javax.inject.Singleton
-import kotlinx.coroutines.delay
 
 /**
  * Plays a TorBox file from *this* phone's TorBox account.
@@ -74,24 +73,16 @@ class TorboxLocalResolver @Inject constructor(
             ),
         )
 
-        // A file that TorBox has in its own cache is downloadable at once; one
-        // it has to fetch is not, and the wait belongs to the player ("forbereder…").
-        for (attempt in 1..MAX_PUBLISH_ATTEMPTS) {
-            val url = client.requestdl(apiKey, torrentId, null, userIp)
-            if (url != null) return url
-            if (attempt < MAX_PUBLISH_ATTEMPTS) delay(PUBLISH_WAIT_MS)
-        }
-        return null
+        // One try. TorBox publishes a newly added file in its own time - for
+        // a file it has to fetch, that is minutes, not milliseconds. Waiting
+        // for it here would only delay the play: the server's own route can
+        // answer at once, and the pointer we just stored means the next play
+        // finds the file here without any wait at all.
+        return client.requestdl(apiKey, torrentId, null, userIp)
     }
 
     companion object {
         private const val TAG = "TorboxLocal"
         private val INFOHASH = Regex("^[0-9a-f]{40}$")
-
-        /** How many times to ask for a url that TorBox has not published yet. */
-        private const val MAX_PUBLISH_ATTEMPTS = 3
-
-        /** The gap between the attempts. Three of them fit in the player's wait. */
-        private const val PUBLISH_WAIT_MS = 1_500L
     }
 }
