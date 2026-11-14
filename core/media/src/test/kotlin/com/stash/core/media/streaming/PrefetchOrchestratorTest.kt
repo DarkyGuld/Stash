@@ -54,7 +54,7 @@ class PrefetchOrchestratorTest {
         )
         coEvery { trackDao.getById(5L) } returns track
         coEvery {
-            streamResolver.resolve(track, allowYouTube = true, allowYtDlp = true, speculative = true)
+            streamResolver.resolve(track, allowYouTube = false, allowYtDlp = true, speculative = true)
         } returns null
 
         orchestrator().onPlaybackProgress(
@@ -66,7 +66,7 @@ class PrefetchOrchestratorTest {
         advanceUntilIdle()
 
         coVerify(exactly = 1) {
-            streamResolver.resolve(track, allowYouTube = true, allowYtDlp = true, speculative = true)
+            streamResolver.resolve(track, allowYouTube = false, allowYtDlp = true, speculative = true)
         }
     }
 
@@ -96,7 +96,7 @@ class PrefetchOrchestratorTest {
         coEvery { trackDao.getById(5L) } returns track
         // The user disables the addon while the speculative resolve is in flight.
         coEvery {
-            streamResolver.resolve(track, allowYouTube = true, allowYtDlp = true, speculative = true)
+            streamResolver.resolve(track, allowYouTube = false, allowYtDlp = true, speculative = true)
         } coAnswers {
             generation.value = 1L
             addonUrl
@@ -139,7 +139,7 @@ class PrefetchOrchestratorTest {
             origin = "addon:Cloud",
         )
         coEvery {
-            streamResolver.resolve(track, allowYouTube = true, allowYtDlp = true, speculative = true)
+            streamResolver.resolve(track, allowYouTube = false, allowYtDlp = true, speculative = true)
         } returns addonUrl
         val firstChunk: EclipseFirstChunkPrefetcher = mockk(relaxed = true)
         val orchestrator = PrefetchOrchestrator(
@@ -159,7 +159,7 @@ class PrefetchOrchestratorTest {
         orchestrator.prefetchUrlsAhead(this, listOf(5L))
         advanceUntilIdle()
         coVerify(exactly = 1) {
-            streamResolver.resolve(track, allowYouTube = true, allowYtDlp = true, speculative = true)
+            streamResolver.resolve(track, allowYouTube = false, allowYtDlp = true, speculative = true)
         }
     }
 
@@ -177,7 +177,7 @@ class PrefetchOrchestratorTest {
             origin = "addon:Cloud",
         )
         coEvery {
-            streamResolver.resolve(any(), allowYouTube = true, allowYtDlp = true, speculative = true)
+            streamResolver.resolve(any(), allowYouTube = false, allowYtDlp = true, speculative = true)
         } returns url
         val apple: EclipseAddonStreamResolver = mockk(relaxed = true)
         val orchestrator = PrefetchOrchestrator(
@@ -193,7 +193,7 @@ class PrefetchOrchestratorTest {
         coVerify(exactly = 1) { apple.warmAppleIds(match { ids -> ids.map { it.id } == listOf(1L, 2L, 3L) }) }
         // Only the top two get their URL resolved.
         coVerify(exactly = 2) {
-            streamResolver.resolve(any(), allowYouTube = true, allowYtDlp = true, speculative = true)
+            streamResolver.resolve(any(), allowYouTube = false, allowYtDlp = true, speculative = true)
         }
     }
 
@@ -207,13 +207,13 @@ class PrefetchOrchestratorTest {
         val slow = StreamUrl(url = "https://cdn.test/slow.flac", expiresAtMs = Long.MAX_VALUE, origin = "addon:Cloud")
         val fast = StreamUrl(url = "https://cdn.test/fast.flac", expiresAtMs = Long.MAX_VALUE, origin = "addon:Cloud")
         coEvery {
-            streamResolver.resolve(match { it.id == 1L }, allowYouTube = true, allowYtDlp = true, speculative = true)
+            streamResolver.resolve(match { it.id == 1L }, allowYouTube = false, allowYtDlp = true, speculative = true)
         } coAnswers {
             delay(10_000)
             slow
         }
         coEvery {
-            streamResolver.resolve(match { it.id == 2L }, allowYouTube = true, allowYtDlp = true, speculative = true)
+            streamResolver.resolve(match { it.id == 2L }, allowYouTube = false, allowYtDlp = true, speculative = true)
         } returns fast
         val cache = StreamUrlCache()
         val orchestrator = PrefetchOrchestrator(
@@ -251,7 +251,7 @@ class PrefetchOrchestratorTest {
         advanceUntilIdle()
 
         coVerify(exactly = 0) {
-            streamResolver.resolve(any(), allowYouTube = true, allowYtDlp = true, speculative = true)
+            streamResolver.resolve(any(), allowYouTube = false, allowYtDlp = true, speculative = true)
         }
         // The Apple-id search itself is metadata-only and still runs.
         coVerify(exactly = 1) { apple.warmAppleIds(any()) }
@@ -274,7 +274,7 @@ class PrefetchOrchestratorTest {
             origin = "addon:Cloud",
         )
         coEvery {
-            streamResolver.resolve(track, allowYouTube = true, allowYtDlp = true, speculative = true)
+            streamResolver.resolve(track, allowYouTube = false, allowYtDlp = true, speculative = true)
         } returns url
 
         val unmeteredPolicy: StreamQualityPolicy = mockk {
@@ -321,13 +321,13 @@ class PrefetchOrchestratorTest {
         val url5 = StreamUrl(url = "https://cdn.test/5.flac", expiresAtMs = Long.MAX_VALUE, origin = "addon:Cloud")
         val url6 = StreamUrl(url = "https://cdn.test/6.flac", expiresAtMs = Long.MAX_VALUE, origin = "addon:Cloud")
         coEvery {
-            streamResolver.resolve(queueTrack, allowYouTube = true, allowYtDlp = true, speculative = true)
+            streamResolver.resolve(queueTrack, allowYouTube = false, allowYtDlp = true, speculative = true)
         } coAnswers {
             delay(1_000)
             url5
         }
         coEvery {
-            streamResolver.resolve(searchTrack, allowYouTube = true, allowYtDlp = true, speculative = true)
+            streamResolver.resolve(searchTrack, allowYouTube = false, allowYtDlp = true, speculative = true)
         } returns url6
         val cache = StreamUrlCache()
         val orchestrator = PrefetchOrchestrator(streamResolver, cache, dao)
@@ -361,7 +361,7 @@ class PrefetchOrchestratorTest {
         )
         coEvery { trackDao.getById(5L) } returns track
         coEvery {
-            streamResolver.resolve(track, allowYouTube = true, allowYtDlp = true, speculative = true)
+            streamResolver.resolve(track, allowYouTube = false, allowYtDlp = true, speculative = true)
         } returns addonUrl
 
         orchestrator().onPlaybackProgress(
@@ -397,7 +397,9 @@ class PrefetchOrchestratorTest {
             isStreamableCheckedAt = null,
         )
         coEvery { trackDao.getById(6L) } returns track
-        coEvery { streamResolver.resolve(track, speculative = true) } returns null
+        coEvery {
+            streamResolver.resolve(track, allowYouTube = false, speculative = true)
+        } returns null
 
         orchestrator().onPlaybackProgress(
             scope = this,
@@ -407,7 +409,7 @@ class PrefetchOrchestratorTest {
         )
         advanceUntilIdle()
 
-        coVerify(exactly = 1) { streamResolver.resolve(track, speculative = true) }
+        coVerify(exactly = 1) { streamResolver.resolve(track, allowYouTube = false, speculative = true) }
     }
 
     @Test
@@ -448,7 +450,7 @@ class PrefetchOrchestratorTest {
         )
         coEvery { trackDao.getById(5L) } returns track
         coEvery {
-            streamResolver.resolve(track, allowYouTube = true, allowYtDlp = true, speculative = true)
+            streamResolver.resolve(track, allowYouTube = false, allowYtDlp = true, speculative = true)
         } returns hls
         val orchestrator = PrefetchOrchestrator(
             streamResolver = streamResolver,

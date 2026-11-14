@@ -235,7 +235,7 @@ class EclipseAddonStreamResolver private constructor(
             } catch (e: Exception) {
                 if (e is EclipseAddonException.Preparing) {
                     // The addon is installing the file, not failing: it answered
-                    // with a 503 after the full six-second window. A fallback to
+                    // with a 503 after the full poll window. A fallback to
                     // another source must not become the fixed answer for this
                     // track - the file will be ready in a few minutes.
                     //
@@ -248,11 +248,24 @@ class EclipseAddonStreamResolver private constructor(
                         "addon '${addon.name}' is still preparing ${track.id} '${track.title}'; " +
                             "the file is minutes away",
                     )
+                } else if (isRateLimited(e)) {
+                    // The addon says the account is going too fast. That is the
+                    // one failure worth cooling down for: it protects the
+                    // account, and it is not about this one track.
+                    coolDown(addon, e, ADDON_RATE_LIMIT_COOLDOWN_MS)
                 } else if (isTransientFailure(e)) {
-                    // One line, no URL/token. A transient failure also buys a
-                    // cooldown so the next track does not pay the same four
-                    // timed-out calls.
-                    coolDown(addon, e)
+                    // A timeout or a 5xx is about ONE track - the slow one, or
+                    // the one the server stumbled over.
+                    //
+                    // It must NOT cool the addon down. The cooldown silenced
+                    // the whole queue after the slow track: every track behind
+                    // it was left to another source. Each track in the queue is
+                    // asked on its own, with the full "addons first" priority.
+                    Log.w(
+                        TAG,
+                        "addon '${addon.name}' failed for ${track.id} '${track.title}': " +
+                            "${failureSummary(e)} (this track only)",
+                    )
                 } else {
                     Log.w(TAG, "addon '${addon.name}' failed for ${track.id}: ${failureSummary(e)}")
                 }
@@ -1027,10 +1040,10 @@ class EclipseAddonStreamResolver private constructor(
      * song. The registry's 45 s resolve deadline still bounds the whole walk.
      *
      * The wait is [PREPARING_POLL_WAIT_MS] between the attempts, and the
-     * attempts stop once [PREPARING_POLL_TOTAL_MS] is spent: one and a half
-     * seconds. A file that is minutes away must not hold the player in
-     * silence - the chain moves on, and the quiet quality upgrade picks the
-     * file up while the song plays.
+     * attempts stop once [PREPARING_POLL_TOTAL_MS] is spent: six seconds. A
+     * file that is minutes away does not come in six seconds, but a file
+     * that is nearly there does - and the wait happens while the previous
+     * song plays, so it is preparation and not silence.
      */
     private suspend fun <T> retryPreparing(
         addon: EclipseAddon,
@@ -1219,6 +1232,17 @@ class EclipseAddonStreamResolver private constructor(
         targetRank: Int,
     ): StreamUrl? {
         val url = enabledCachedUrl(track, addons) ?: return null
+        // A cached file from ANOTHER source (YouTube) is not served while the
+        // addons are here: the addon may have the FLAC now, and the cached
+        // fallback would keep the track on YouTube for the rest of its life -
+        // the next tracks in the queue included.
+        if (!url.origin.orEmpty().startsWith("${ORIGIN}:") && addons.any { it.enabled }) {
+            Log.i(
+                TAG,
+                "the cached file for ${track.id} is from ${url.origin}: the addon is asked instead",
+            )
+            return null
+        }
         if (belowTargetTier(url, targetRank)) {
             // The cached file is below what the addons aim for. The addon may
             // have a better one now, so this one is not served - the addon is
@@ -1277,6 +1301,10 @@ class EclipseAddonStreamResolver private constructor(
     private fun failureSummary(e: Exception): String =
         (e as? EclipseAddonException.HttpFailure)?.let { "HTTP ${it.code}" } ?: e::class.java.simpleName
 
+    /** 429: the addon says the account is going too fast. */
+    private fun isRateLimited(e: Exception): Boolean =
+        e is EclipseAddonException.HttpFailure && e.code == 429
+
     /** 429, a timeout/unreachable call, or a 5xx: the addon is worth trying again later. */
     private fun isTransientFailure(e: Exception): Boolean =
         e is EclipseAddonException.Unreachable ||
@@ -1292,18 +1320,18 @@ class EclipseAddonStreamResolver private constructor(
         e is EclipseAddonException.HttpFailure && e.code in setOf(404, 410)
 
     /** One line in, one line out; never a URL or a token. */
-    private fun coolDown(addon: EclipseAddon, e: Exception) {
+    private fun coolDown(addon: EclipseAddon, e: Exception, durationMs: Long = ADDON_TRANSIENT_COOLDOWN_MS) {
         val now = System.currentTimeMillis()
         val until = coolingUntilMs[addon.id]
         // Already cooling: extend the window silently rather than log per route.
         if (until != null && now < until) {
-            coolingUntilMs[addon.id] = now + ADDON_COOLDOWN_MS
+            coolingUntilMs[addon.id] = now + durationMs
             return
         }
-        coolingUntilMs[addon.id] = now + ADDON_COOLDOWN_MS
+        coolingUntilMs[addon.id] = now + durationMs
         Log.i(
             TAG,
-            "addon '${addon.name}' cooling for ${ADDON_COOLDOWN_MS / 1_000}s after ${failureSummary(e)}",
+            "addon '${addon.name}' cooling for ${durationMs / 1_000}s after ${failureSummary(e)}",
         )
     }
 
@@ -1439,31 +1467,42 @@ class EclipseAddonStreamResolver private constructor(
         /**
          * How many times a "preparing" addon is asked again.
          *
-         * One retry, 1.5 s apart: the addon gets a second answer, and if the
-         * file is still not there the song goes to another source. Six
-         * seconds of silence in front of a track that is not going to play
-         * is worse than a fallback that plays now - and the quiet quality
-         * upgrade polls separately, so a file that is on its way is still
-         * picked up while the song plays.
+         * Four retries, 1.5 s apart: the addon gets five answers inside six
+         * seconds, and then the song goes to another source. The wait happens
+         * while the PREVIOUS song plays, so it is preparation and not silence.
          */
-        private const val MAX_PREPARING_RETRIES = 1
+        private const val MAX_PREPARING_RETRIES = 4
 
         /**
          * How long the addon gets to finish a file it is installing.
          *
          * The attempts are [PREPARING_POLL_WAIT_MS] apart and stop after
-         * [PREPARING_POLL_TOTAL_MS] in total: one and a half seconds, so the
-         * player is not left waiting in silence for a file that takes minutes
-         * to publish.
+         * [PREPARING_POLL_TOTAL_MS] in total: six seconds. Long enough for a
+         * file that is nearly there, and it happens while the previous song
+         * plays.
          */
         private const val PREPARING_POLL_WAIT_MS = 1_500L
-        private const val PREPARING_POLL_TOTAL_MS = 3_000L
+        private const val PREPARING_POLL_TOTAL_MS = 6_000L
 
         /** Cloud's Tidal miss is long-lived: Apple still serves the track, and the lookup is ~0.8 s. */
         private const val CLOUD_TIDAL_MISS_TTL_MS = 6 * 60 * 60_000L
 
-        /** How long a 429/timeout/5xx keeps an addon out of the walk. In memory only. */
-        private const val ADDON_COOLDOWN_MS = 60_000L
+        /**
+         * How long a rate limit keeps an addon out of the walk. In memory only.
+         *
+         * The account said stop: the addon is not asked again until the window
+         * closes.
+         */
+        private const val ADDON_RATE_LIMIT_COOLDOWN_MS = 60_000L
+
+        /**
+         * How long a timeout or a 5xx keeps an addon out of the walk.
+         *
+         * Short on purpose: the failure was about ONE track, and the queue
+         * behind it has nothing to do with it. A minute here meant that every
+         * track after the slow one was played from another source.
+         */
+        private const val ADDON_TRANSIENT_COOLDOWN_MS = 10_000L
 
         /** Fast mode's stricter duration tolerance: 10 s, not the matcher's 15 s. */
         private const val STRONG_DURATION_TOLERANCE_MS = 10_000L

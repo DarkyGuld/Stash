@@ -265,9 +265,17 @@ class StreamSourceRegistry internal constructor(
             // reasons that say nothing about the track: it deliberately stops before Tidal,
             // and a transient 429/timeout is not "every rung missed". Stamping here would let
             // the background look-ahead suppress the user's tap for the full TTL.
-            if (!speculative) {
+            //
+            // An addon that answered "preparing" is not a miss either: the file is
+            // minutes away, and the track must be asked again as soon as it is there.
+            // Stamping it here kept the track on another source for the whole TTL -
+            // the file was in the account the whole time.
+            val preparing = addons?.wasPreparing(track.id) == true
+            if (!speculative && !preparing) {
                 unavailableUntilMs[track.id] = System.currentTimeMillis() + UNAVAILABLE_TTL_MS
                 Log.i(TAG, "no source: every rung missed for ${track.id} '${track.title}'")
+            } else if (preparing) {
+                Log.i(TAG, "the addon is still preparing ${track.id} '${track.title}': it is asked again")
             }
         } else {
             unavailableUntilMs.remove(track.id)

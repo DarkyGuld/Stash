@@ -7,18 +7,18 @@ class EclipseAddonResolveCacheTest {
     private var now = 1_000_000_000_000L
 
     @Test
-    fun `a positive hit lives six hours, a negative miss five minutes`() {
+    fun `a positive hit lives six hours, a negative miss half a minute`() {
         val cache = EclipseAddonResolveCache(clock = { now })
 
         cache.put("hit", "item-1")
         cache.put("miss", null)
 
-        now += 5 * 60_000L - 1
+        now += 30_000L - 1
         assertThat(cache.get("hit")?.itemId).isEqualTo("item-1")
         assertThat(cache.get("miss")?.itemId).isNull()
         assertThat(cache.get("miss")).isNotNull()
 
-        now += 2 // the negative entry is now past five minutes
+        now += 2 // the negative entry is now past half a minute
         assertThat(cache.get("miss")).isNull()
         assertThat(cache.get("hit")).isNotNull()
 

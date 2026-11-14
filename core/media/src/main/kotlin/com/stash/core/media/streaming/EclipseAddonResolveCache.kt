@@ -5,14 +5,22 @@ package com.stash.core.media.streaming
  * metadata round trip that does not change between plays, while `/stream` signs a
  * fresh URL every time. Caching the id cuts the second round trip from every play.
  *
- * LRU, thread-safe, bounded, with TTLs: a hit lives 6 hours, a miss only 5 minutes
+ * LRU, thread-safe, bounded, with TTLs: a hit lives 6 hours, a miss half a minute
  * (the addon's catalog may gain the track). The key includes the addon and its
  * settings snapshot, so a quality change never reuses another quality's id.
  */
 internal class EclipseAddonResolveCache(
     private val maxEntries: Int = 256,
     private val positiveTtlMs: Long = 6 * 60 * 60_000L,
-    private val negativeTtlMs: Long = 5 * 60_000L,
+    /**
+     * How long a miss is remembered.
+     *
+     * Short: the miss is remembered so the same question is not asked again
+     * and again, but the add-on's catalog grows - the server may have the
+     * file a minute later - and a long memory kept the track on another
+     * source long after the FLAC was there.
+     */
+    private val negativeTtlMs: Long = 30_000L,
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
     /**

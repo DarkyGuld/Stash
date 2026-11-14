@@ -102,10 +102,27 @@ class PrefetchOrchestrator @Inject constructor(
                 if (streamUrlCache.get(id) != null) continue
                 val track = trackDao.getById(id) ?: continue
                 if (track.skipForUrlPrefetch()) continue
-                val resolved = streamResolver.resolve(track, speculative = true) ?: continue
+                // No YouTube in the pre-fetch. It is a preparation for the
+                // NEXT track, and the next track waits for the add-on when it
+                // starts - a YouTube url fetched here would be the url the
+                // track plays, and the add-on's file would never be asked
+                // for.
+                val resolved = streamResolver.resolve(
+                    track,
+                    allowYouTube = false,
+                    speculative = true,
+                ) ?: continue
                 // An addon was toggled/removed while resolving: leave the cache alone.
                 if (generationBefore != null && eclipseAddons?.addonGeneration?.value != generationBefore) {
                     return@launch
+                }
+                // A fallback from another source is not cached. It is a RESERVE:
+                // the add-on may have the file now, and a cached YouTube url
+                // would be served instead of asking - and the track would play
+                // from YouTube for the rest of its life.
+                if (resolved.isReserveFallback()) {
+                    Log.d(TAG, "Prefetched a fallback for upcoming track $id (${resolved.origin}); not cached")
+                    continue
                 }
                 streamUrlCache.put(id, resolved)
                 // Progressive addon file (Cloud's direct Qobuz FLAC): warm it into the
@@ -162,7 +179,11 @@ class PrefetchOrchestrator @Inject constructor(
                 if (streamUrlCache.get(id) != null) continue
                 val track = trackDao.getById(id) ?: continue
                 if (track.skipForUrlPrefetch()) continue
-                val resolved = streamResolver.resolve(track, speculative = true) ?: continue
+                val resolved = streamResolver.resolve(
+                    track,
+                    allowYouTube = false,
+                    speculative = true,
+                ) ?: continue
                 if (generationBefore != null && eclipseAddons?.addonGeneration?.value != generationBefore) {
                     return@launch
                 }
@@ -238,10 +259,18 @@ class PrefetchOrchestrator @Inject constructor(
                 // prefetch for the whole synced library.
                 if (!track.isStreamable && track.isStreamableCheckedAt != null) return@launch
 
-                // speculative: never makes the shared Tidal relay search for a look-ahead.
+                // speculative: never makes the shared Tidal relay search for a
+                // look-ahead. No YouTube either: the next track waits for the
+                // add-on when it starts, and a YouTube url fetched here would
+                // be the url it plays - the add-on's file would never be asked
+                // for.
                 val generationBefore = eclipseAddons?.addonGeneration?.value
                 val startedNs = System.nanoTime()
-                val resolved = streamResolver.resolve(track, speculative = true)
+                val resolved = streamResolver.resolve(
+                    track,
+                    allowYouTube = false,
+                    speculative = true,
+                )
                 val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000
                 if (resolved != null) {
                     // An addon toggled/removed/settings-changed while this resolve was
@@ -250,9 +279,14 @@ class PrefetchOrchestrator @Inject constructor(
                     // after that clear would undo it, so drop it.
                     if (generationBefore != null && eclipseAddons?.addonGeneration?.value != generationBefore) {
                         Log.d(TAG, "Prefetch for track $nextTrackId discarded: addons changed during resolve ($elapsedMs ms)")
-                    } else {
+                    } else if (!resolved.isReserveFallback()) {
                         streamUrlCache.put(nextTrackId, resolved)
                         Log.d(TAG, "Prefetched stream URL for track $nextTrackId in $elapsedMs ms")
+                    } else {
+                        // A fallback from another source is a RESERVE, not the
+                        // answer: the add-on may have the file now, and a cached
+                        // fallback would keep the track on it for good.
+                        Log.d(TAG, "Prefetched a fallback for track $nextTrackId (${resolved.origin}); not cached")
                     }
                 } else {
                     Log.w(TAG, "Prefetch resolve returned null for track $nextTrackId in $elapsedMs ms")
@@ -302,3 +336,14 @@ class PrefetchOrchestrator @Inject constructor(
         const val PREFETCH_THRESHOLD = 0.60
     }
 }
+
+/**
+ * True for a url from a lossy fallback - the sources that are only there to
+ * keep the music going.
+ *
+ * Such a url is not cached: the add-on may have the file now, and a cached
+ * fallback would keep the track on it for good - the tracks behind it in the
+ * queue included.
+ */
+private fun StreamUrl.isReserveFallback(): Boolean =
+    origin == "youtube" || origin == "jiosaavn"

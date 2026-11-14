@@ -52,6 +52,6 @@ class PrefetchOrchestratorDataSaverTest {
         orchestrator(dataSaver = false).onPlaybackProgress(this, nextTrackId = 5L, positionMs = 70_000L, durationMs = 100_000L)
         advanceUntilIdle()
 
-        coVerify(exactly = 1) { streamResolver.resolve(track, allowYouTube = true, allowYtDlp = true, speculative = true) }
+        coVerify(exactly = 1) { streamResolver.resolve(track, allowYouTube = false, allowYtDlp = true, speculative = true) }
     }
 }

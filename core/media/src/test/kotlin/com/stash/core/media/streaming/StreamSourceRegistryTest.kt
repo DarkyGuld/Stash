@@ -909,6 +909,7 @@ class StreamSourceRegistryTest {
         coEvery { youtube.resolve(any(), any()) } returns null
         val addon: EclipseAddonStreamResolver = mockk {
             coEvery { resolve(any(), any()) } returns stubStreamUrl("addon")
+            every { wasPreparing(any()) } returns false
         }
 
         val result = registryWithAddon(addon).resolve(stubTrack())

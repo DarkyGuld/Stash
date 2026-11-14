@@ -353,31 +353,35 @@ class EclipseAddonStreamResolverTest {
     }
 
     @Test
-    fun `a preparing addon gets one retry before the song is treated as a miss`() = runTest {
+    fun `a preparing addon gets four retries before the song is treated as a miss`() = runTest {
         val repository: EclipseAddonRepository = mockk()
         val addon = addon("aero", resources = listOf("stream", "resolve"))
         coEvery { repository.enabledNow() } returns listOf(addon)
         coEvery { repository.resolve(addon, any(), any(), any(), any()) } returns EclipseAddonTrack(id = "r1")
-        coEvery { repository.stream(addon, "r1") } throws EclipseAddonException.Preparing(0) andThen
+        coEvery { repository.stream(addon, "r1") } throws EclipseAddonException.Preparing(0) andThenThrows
+            EclipseAddonException.Preparing(0) andThenThrows
+            EclipseAddonException.Preparing(0) andThenThrows
+            EclipseAddonException.Preparing(0) andThen
             stream(quality = "lossless", format = "flac")
 
         val result = EclipseAddonStreamResolver(repository).resolve(track())
 
         assertThat(result?.origin).isEqualTo("addon:aero")
-        // The first answer and the one retry.
-        coVerify(exactly = 2) { repository.stream(addon, "r1") }
+        // The first answer and the four retries.
+        coVerify(exactly = 5) { repository.stream(addon, "r1") }
     }
 
     /**
-     * The poll window is one and a half seconds: the player is not left
-     * waiting in silence for a file that takes minutes to publish.
+     * The poll window is six seconds, every 1.5 s inside it: the player is
+     * not left waiting in silence for a file that takes minutes to publish,
+     * and a file that is nearly there still makes it.
      *
      * An addon that answers "preparing" for the whole window is not asked a
-     * third time: the song goes to another source, and the quiet quality
+     * sixth time: the song goes to another source, and the quiet quality
      * upgrade picks the file up while it plays.
      */
     @Test
-    fun `a preparing addon is polled once, for one and a half seconds`() = runTest {
+    fun `a preparing addon is polled every second and a half for six seconds`() = runTest {
         val repository: EclipseAddonRepository = mockk()
         val addon = addon("aero", resources = listOf("stream", "resolve"))
         coEvery { repository.enabledNow() } returns listOf(addon)
@@ -388,9 +392,9 @@ class EclipseAddonStreamResolverTest {
         val result = EclipseAddonStreamResolver(repository).resolve(track())
 
         assertThat(result).isNull()
-        // One wait of 1.5 s, then the answer that ends the wait.
-        assertThat(currentTime - started).isEqualTo(1_500L)
-        coVerify(exactly = 2) { repository.stream(addon, "r1") }
+        // Four waits of 1.5 s, then the answer that ends the wait.
+        assertThat(currentTime - started).isEqualTo(6_000L)
+        coVerify(exactly = 5) { repository.stream(addon, "r1") }
     }
 
     /**
@@ -434,8 +438,8 @@ class EclipseAddonStreamResolverTest {
         var calls = 0
         coEvery { repository.stream(addon, "r1") } answers {
             calls++
-            // The first answer and the one retry: the whole poll window.
-            if (calls <= 2) throw EclipseAddonException.Preparing(null)
+            // The whole poll window: the first answer and the four retries.
+            if (calls <= 5) throw EclipseAddonException.Preparing(null)
             stream(quality = "lossless", format = "flac")
         }
 
