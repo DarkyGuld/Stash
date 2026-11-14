@@ -1027,9 +1027,10 @@ class EclipseAddonStreamResolver private constructor(
      * song. The registry's 45 s resolve deadline still bounds the whole walk.
      *
      * The wait is [PREPARING_POLL_WAIT_MS] between the attempts, and the
-     * attempts stop once [PREPARING_POLL_TOTAL_MS] is spent: six seconds is
-     * long enough for a file that is nearly ready, and short enough that a
-     * song which never arrives does not hold the player.
+     * attempts stop once [PREPARING_POLL_TOTAL_MS] is spent: one and a half
+     * seconds. A file that is minutes away must not hold the player in
+     * silence - the chain moves on, and the quiet quality upgrade picks the
+     * file up while the song plays.
      */
     private suspend fun <T> retryPreparing(
         addon: EclipseAddon,
@@ -1438,22 +1439,25 @@ class EclipseAddonStreamResolver private constructor(
         /**
          * How many times a "preparing" addon is asked again.
          *
-         * Four retries, 1.5 s apart, is the six-second window the player can
-         * afford: the addon gets five answers inside it, and the fifth answer
-         * is the one that lets the song go to another source.
+         * One retry, 1.5 s apart: the addon gets a second answer, and if the
+         * file is still not there the song goes to another source. Six
+         * seconds of silence in front of a track that is not going to play
+         * is worse than a fallback that plays now - and the quiet quality
+         * upgrade polls separately, so a file that is on its way is still
+         * picked up while the song plays.
          */
-        private const val MAX_PREPARING_RETRIES = 4
+        private const val MAX_PREPARING_RETRIES = 1
 
         /**
          * How long the addon gets to finish a file it is installing.
          *
          * The attempts are [PREPARING_POLL_WAIT_MS] apart and stop after
-         * [PREPARING_POLL_TOTAL_MS] in total. Six seconds is long enough for a
-         * file that is nearly ready, and short enough that a song which never
-         * arrives does not hold the player.
+         * [PREPARING_POLL_TOTAL_MS] in total: one and a half seconds, so the
+         * player is not left waiting in silence for a file that takes minutes
+         * to publish.
          */
         private const val PREPARING_POLL_WAIT_MS = 1_500L
-        private const val PREPARING_POLL_TOTAL_MS = 6_000L
+        private const val PREPARING_POLL_TOTAL_MS = 3_000L
 
         /** Cloud's Tidal miss is long-lived: Apple still serves the track, and the lookup is ~0.8 s. */
         private const val CLOUD_TIDAL_MISS_TTL_MS = 6 * 60 * 60_000L

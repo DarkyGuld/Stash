@@ -221,7 +221,9 @@ class PlayerRepositoryImpl @Inject constructor(
                             stream.codec?.let { putString(EXTRA_STREAM_CODEC, it) }
                             stream.bitsPerSample?.let { putInt(EXTRA_STREAM_BIT_DEPTH, it) }
                             stream.sampleRateHz?.let { putInt(EXTRA_STREAM_SAMPLE_RATE, it) }
-                            stream.bitrateKbps?.let { putInt(EXTRA_STREAM_BITRATE, it) }
+                            // Zero, not the old file's bitrate: the badge has
+                            // to describe ONE file.
+                            putInt(EXTRA_STREAM_BITRATE, stream.bitrateKbps ?: 0)
                             stream.origin?.let { putString(EXTRA_STREAM_ORIGIN, it) }
                         })
                         .build(),
@@ -4600,7 +4602,11 @@ class PlayerRepositoryImpl @Inject constructor(
             fileFormat = stream.codec ?: track.fileFormat,
             bitsPerSample = stream.bitsPerSample ?: track.bitsPerSample,
             sampleRateHz = stream.sampleRateHz ?: track.sampleRateHz,
-            qualityKbps = stream.bitrateKbps ?: track.qualityKbps,
+            // The bitrate follows the codec, both from the live stream. A
+            // bitrate left over from an older file would put "FLAC · 320
+            // kbps" on the screen: the codec of the new file and the bitrate
+            // of the old one, side by side, describing nothing.
+            qualityKbps = stream.bitrateKbps ?: 0,
             streamOrigin = stream.origin ?: track.streamOrigin,
             soundCloudPreview = if (stream.origin == "soundcloud") stream.isPreview else track.soundCloudPreview,
             isDownloaded = if (stream.origin == "soundcloud") false else track.isDownloaded,
