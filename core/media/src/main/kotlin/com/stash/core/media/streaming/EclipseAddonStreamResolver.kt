@@ -62,6 +62,14 @@ class EclipseAddonStreamResolver private constructor(
     private val deadAppleIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
     /**
+     * The tracks whose addon answered "preparing": it is installing the file.
+     *
+     * The player uses this to know that a fallback to another source was only
+     * standing in - the file itself is minutes away.
+     */
+    private val preparingTracks = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
+
+    /**
      * Addons whose last call failed transiently (429, timeout/unreachable, 5xx):
      * no request is made to them until this instant. In memory only — a relay or
      * rights blip must not persist as a dead addon across restarts.
@@ -102,6 +110,14 @@ class EclipseAddonStreamResolver private constructor(
 
     suspend fun resolve(track: TrackEntity, speculative: Boolean = false): StreamUrl? =
         resolveInternal(track, speculative, radio = false)
+
+    /**
+     * Was this track's addon installing its file when we last asked?
+     *
+     * True means a fallback to another source was only standing in, and must
+     * not become the fixed answer for the track.
+     */
+    fun wasPreparing(trackId: Long): Boolean = preparingTracks.contains(trackId)
 
     /**
      * Radio playback: Eclipse Cloud is tried before every non-Cloud addon (the
@@ -170,9 +186,25 @@ class EclipseAddonStreamResolver private constructor(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                // One line, no URL/token. A transient failure also buys a cooldown so
-                // the next track does not pay the same four timed-out calls.
-                if (isTransientFailure(e)) {
+                if (e is EclipseAddonException.Preparing) {
+                    // The addon is installing the file, not failing: it answered
+                    // with a 503 after the full six-second window. A fallback to
+                    // another source must not become the fixed answer for this
+                    // track - the file will be ready in a few minutes.
+                    //
+                    // The addon is not cooled down either. The cooldown is for
+                    // a broken addon, and silencing it here would push the next
+                    // songs to YouTube while it is doing exactly what it should.
+                    preparingTracks.add(track.id)
+                    Log.i(
+                        TAG,
+                        "addon '${addon.name}' is still preparing ${track.id} '${track.title}'; " +
+                            "the file is minutes away",
+                    )
+                } else if (isTransientFailure(e)) {
+                    // One line, no URL/token. A transient failure also buys a
+                    // cooldown so the next track does not pay the same four
+                    // timed-out calls.
                     coolDown(addon, e)
                 } else {
                     Log.w(TAG, "addon '${addon.name}' failed for ${track.id}: ${failureSummary(e)}")
@@ -479,10 +511,16 @@ class EclipseAddonStreamResolver private constructor(
         return resolved.id
     }
 
-    /** A stream answer saying "that id is no longer usable": re-resolve once. */
+    /**
+     * A stream answer saying "that id is no longer usable": re-resolve once.
+     *
+     * A "preparing" answer is NOT one of them: the item exists and its id is
+     * good, the file is just not downloadable yet. Re-resolving would cost
+     * another round trip and open a second poll window - the song would wait
+     * twice as long for the same file.
+     */
     private fun invalidatesResolve(e: Exception): Boolean =
-        e is EclipseAddonException.Preparing ||
-            (e is EclipseAddonException.HttpFailure && e.code in setOf(403, 404, 410))
+        e is EclipseAddonException.HttpFailure && e.code in setOf(403, 404, 410)
 
     /**
      * Cloud's Apple Music fallback: Tidal had no item (or its id died), so search
@@ -922,22 +960,32 @@ class EclipseAddonStreamResolver private constructor(
      * "preparing" 503s. A TorBox-backed addon answers 503 while it installs the
      * release; one short retry used to turn a normal cache miss into a skipped
      * song. The registry's 45 s resolve deadline still bounds the whole walk.
+     *
+     * The wait is [PREPARING_POLL_WAIT_MS] between the attempts, and the
+     * attempts stop once [PREPARING_POLL_TOTAL_MS] is spent: six seconds is
+     * long enough for a file that is nearly ready, and short enough that a
+     * song which never arrives does not hold the player.
      */
     private suspend fun <T> retryPreparing(
         addon: EclipseAddon,
         block: suspend () -> T,
     ): T {
         var retries = 0
+        // The time spent waiting, counted from the waits themselves: the clock
+        // has to be the one the test scheduler drives, so the window is the
+        // same in a test as on the phone.
+        var waitedMs = 0L
         try {
             while (true) {
                 try {
                     return block()
                 } catch (e: EclipseAddonException.Preparing) {
                     if (retries >= MAX_PREPARING_RETRIES) throw e
+                    if (waitedMs + PREPARING_POLL_WAIT_MS > PREPARING_POLL_TOTAL_MS) throw e
                     retries += 1
                     // The player shows "forbereder…" while this is true.
                     preparingState?.setPreparing(true)
-                    waitPreparing(addon, e, retries)
+                    waitedMs += waitPreparing(addon, e, retries)
                 }
             }
         } finally {
@@ -998,16 +1046,26 @@ class EclipseAddonStreamResolver private constructor(
         return have < wanted
     }
 
-    /** Waits out one "preparing" 503, honouring `Retry-After` up to [MAX_PREPARING_WAIT_SECONDS]. */
+    /**
+     * Waits out one "preparing" 503 and returns how long it waited.
+     *
+     * The cadence is [PREPARING_POLL_WAIT_MS]: the poll happens every 1.5 s,
+     * until [PREPARING_POLL_TOTAL_MS] is spent. The server's `Retry-After` may
+     * shorten the wait, never lengthen it - a longer wait would blow the six
+     * seconds the player can afford.
+     */
     private suspend fun waitPreparing(
         addon: EclipseAddon,
         e: EclipseAddonException.Preparing,
         attempt: Int = 1,
-    ) {
-        val seconds = (e.retryAfterSeconds ?: DEFAULT_PREPARING_WAIT_SECONDS)
-            .coerceIn(0, MAX_PREPARING_WAIT_SECONDS)
-        Log.i(TAG, "addon '${addon.name}' is preparing; retry $attempt in ${seconds}s")
-        if (seconds > 0) delay(seconds * 1_000L)
+    ): Long {
+        val retryAfterMs = e.retryAfterSeconds
+            ?.let { it.coerceIn(0, MAX_PREPARING_WAIT_SECONDS) * 1_000L }
+            ?: PREPARING_POLL_WAIT_MS
+        val waitMs = retryAfterMs.coerceAtMost(PREPARING_POLL_WAIT_MS)
+        Log.i(TAG, "addon '${addon.name}' is preparing; retry $attempt in ${waitMs}ms")
+        if (waitMs > 0) delay(waitMs)
+        return waitMs
     }
 
     private suspend fun served(
@@ -1024,6 +1082,8 @@ class EclipseAddonStreamResolver private constructor(
         // The listener-facing service label ("via <addon name>"): the base origin is
         // the prefix, the name follows it (StreamService.displayName).
         val labelled = url.copy(origin = originFor(addon.name))
+        // The addon served it: the file is ready, and the flag may go.
+        preparingTracks.remove(track.id)
         // Both layers: the player's memory cache and the disk copy that survives restart.
         urlCache?.put(track.id, labelled)
         streamUrlStore?.put(addon.id, settingsKey(addon), identityKey(track), labelled)
@@ -1202,9 +1262,27 @@ class EclipseAddonStreamResolver private constructor(
         private const val SEARCH_VARIANT_LIMIT = 3
 
         /** Wait out a cache-backed addon's 503 "preparing" instead of skipping the song. */
-        private const val DEFAULT_PREPARING_WAIT_SECONDS = 5
         private const val MAX_PREPARING_WAIT_SECONDS = 15
-        private const val MAX_PREPARING_RETRIES = 2
+
+        /**
+         * How many times a "preparing" addon is asked again.
+         *
+         * Four retries, 1.5 s apart, is the six-second window the player can
+         * afford: the addon gets five answers inside it, and the fifth answer
+         * is the one that lets the song go to another source.
+         */
+        private const val MAX_PREPARING_RETRIES = 4
+
+        /**
+         * How long the addon gets to finish a file it is installing.
+         *
+         * The attempts are [PREPARING_POLL_WAIT_MS] apart and stop after
+         * [PREPARING_POLL_TOTAL_MS] in total. Six seconds is long enough for a
+         * file that is nearly ready, and short enough that a song which never
+         * arrives does not hold the player.
+         */
+        private const val PREPARING_POLL_WAIT_MS = 1_500L
+        private const val PREPARING_POLL_TOTAL_MS = 6_000L
 
         /** Cloud's Tidal miss is long-lived: Apple still serves the track, and the lookup is ~0.8 s. */
         private const val CLOUD_TIDAL_MISS_TTL_MS = 6 * 60 * 60_000L

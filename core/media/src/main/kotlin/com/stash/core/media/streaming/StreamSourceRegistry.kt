@@ -531,8 +531,15 @@ class StreamSourceRegistry internal constructor(
         // consults JioSaavn first (its rank is unchanged), then the fast lane, and
         // only then the yt-dlp-capable rung. Foreground resolves only: the
         // speculative background fill keeps its cheap sequential chain.
+        //
+        // "Play from Eclipse addons first" turns the hedge off. The user asked
+        // for the addon to lead, and a parallel YouTube lane can answer before
+        // the addon does - the addon is then never heard from, even when it
+        // would have had the file. Sequential means the addon gets its full
+        // chance, and YouTube is only the fallback.
         val hedged = allowYouTube && allowYtDlp && youtubeOn && resolvers.size > 1 &&
-            resolvers.last().first == "youtube" && resolvers.none { it.first == TIDAL_DEFERRED }
+            resolvers.last().first == "youtube" && resolvers.none { it.first == TIDAL_DEFERRED } &&
+            !addonsFirst
 
         // For the diagnostics bundle's "Recent resolves": the rung that served, set at each
         // exit below. Still null when the walk ends means every rung missed.
@@ -579,9 +586,17 @@ class StreamSourceRegistry internal constructor(
                         servedBy = name
                         jioLane?.cancel()
                         fastLane?.cancel()
-                        return@coroutineScope result
-                    }
-                }
+                        return@coroutineScope if (name == "youtube" && wasPreparing(track.id)) {
+                            // The addon is installing the file and YouTube stood in
+                            // for it. That url must not become the fixed answer: the
+                            // file will be ready in a few minutes, and the next play
+                            // has to find it instead of the stand-in.
+                            Log.i(TAG, "youtube stands in for ${track.id} while the addon installs the file")
+                            result.copy(expiresAtMs = System.currentTimeMillis() + STAND_IN_TTL_MS)
+                        } else {
+                            result
+                        }
+                    }                }
                 jioLane?.await()?.let {
                     Log.i(TAG, "jiosaavn served ${track.id} '${track.title}' (hedged)")
                     servedBy = "jiosaavn"
@@ -616,6 +631,15 @@ class StreamSourceRegistry internal constructor(
     private fun msSince(startedNs: Long): Long = (System.nanoTime() - startedNs) / 1_000_000
 
     /**
+     * Was the addon installing this track's file when it was last asked?
+     *
+     * A hint, never a fact: the play must not fail because the hint could
+     * not be read. It only decides how long a stand-in url may be kept.
+     */
+    private fun wasPreparing(trackId: Long): Boolean =
+        addons?.let { runCatching { it.wasPreparing(trackId) }.getOrDefault(false) } == true
+
+    /**
      * Runs one rung. Preemption (the user tapped another track) cancels this job
      * and the CancellationException MUST propagate, or resolve() would return
      * null and the caller fire a bogus "Couldn't find this track". Any other
@@ -643,5 +667,12 @@ class StreamSourceRegistry internal constructor(
 
         /** How long a definitive all-source miss suppresses the chain for the same track. */
         private const val UNAVAILABLE_TTL_MS = 10 * 60_000L
+
+        /**
+         * How long a YouTube url that only stood in for an installing addon
+         * may be kept. Long enough for the play, short enough that the next
+         * one asks again - and finds the finished file.
+         */
+        private const val STAND_IN_TTL_MS = 60_000L
     }
 }

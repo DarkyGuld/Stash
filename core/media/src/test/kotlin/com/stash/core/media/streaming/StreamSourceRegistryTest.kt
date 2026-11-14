@@ -480,6 +480,78 @@ class StreamSourceRegistryTest {
         assertThat(result!!.origin).isEqualTo("youtube")
     }
 
+    /**
+     * "Play from Eclipse addons first" means the addon leads, and YouTube is
+     * only the fallback.
+     *
+     * The parallel YouTube lane (the P3 hedge) is switched off for this
+     * setting: it can answer before the addon does, and then the addon is
+     * never heard from - even when it would have had the file.
+     */
+    @Test
+    fun `addons first never starts the youtube fast lane beside the addon`() = runTest {
+        coEvery { streamingPreference.isAddonsFirst() } returns true
+        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
+        coEvery { qbdlx.resolve(any()) } returns null
+        coEvery { jiosaavn.resolve(any()) } returns null
+        coEvery { youtube.resolve(any(), any()) } returns stubStreamUrl("youtube")
+        val addon: EclipseAddonStreamResolver = mockk { coEvery { resolve(any()) } returns null }
+
+        val result = registryWithAddon(addon).resolve(stubTrack())
+
+        assertThat(result!!.origin).isEqualTo("youtube")
+        // The fast lane (one InnerTube round trip, never yt-dlp) never starts.
+        coVerify(exactly = 0) { youtube.resolve(any(), allowYtDlp = false) }
+        // And YouTube is asked only after the addon had its chance.
+        coVerifyOrder {
+            addon.resolve(any())
+            youtube.resolve(any(), allowYtDlp = true)
+        }
+    }
+
+    /**
+     * A YouTube url that only stood in for an installing addon must not become
+     * the fixed answer for the track: the addon is minutes away from having
+     * the real file, and the next play has to find it.
+     */
+    @Test
+    fun `a youtube stand-in for an installing addon is not kept as the fixed answer`() = runTest {
+        coEvery { streamingPreference.isAddonsFirst() } returns true
+        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
+        coEvery { qbdlx.resolve(any()) } returns null
+        coEvery { jiosaavn.resolve(any()) } returns null
+        coEvery { youtube.resolve(any(), any()) } returns stubStreamUrl("youtube")
+        val addon: EclipseAddonStreamResolver = mockk {
+            coEvery { resolve(any()) } returns null
+            every { wasPreparing(any()) } returns true
+        }
+
+        val result = registryWithAddon(addon).resolve(stubTrack())
+
+        assertThat(result!!.origin).isEqualTo("youtube")
+        // The url may serve this play, but only for a minute.
+        assertThat(result.expiresAtMs).isLessThan(Long.MAX_VALUE)
+        assertThat(result.expiresAtMs).isAtMost(System.currentTimeMillis() + 60_000L)
+    }
+
+    /** A YouTube url that answered for good keeps its own lifetime. */
+    @Test
+    fun `a youtube answer for a track the addon does not have keeps its own lifetime`() = runTest {
+        coEvery { streamingPreference.isAddonsFirst() } returns true
+        coEvery { streamingPreference.isForceYouTubeFallback() } returns false
+        coEvery { qbdlx.resolve(any()) } returns null
+        coEvery { jiosaavn.resolve(any()) } returns null
+        coEvery { youtube.resolve(any(), any()) } returns stubStreamUrl("youtube")
+        val addon: EclipseAddonStreamResolver = mockk {
+            coEvery { resolve(any()) } returns null
+            every { wasPreparing(any()) } returns false
+        }
+
+        val result = registryWithAddon(addon).resolve(stubTrack())
+
+        assertThat(result!!.expiresAtMs).isEqualTo(Long.MAX_VALUE)
+    }
+
     // ── Per-source switches ─────────────────────────────────────────────────
 
     @Test

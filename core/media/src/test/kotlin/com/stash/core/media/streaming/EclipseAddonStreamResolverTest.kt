@@ -13,6 +13,7 @@ import io.mockk.coEvery
 import io.mockk.every
 import io.mockk.coVerify
 import io.mockk.mockk
+import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runTest
 import org.junit.Test
 
@@ -352,19 +353,104 @@ class EclipseAddonStreamResolverTest {
     }
 
     @Test
-    fun `a preparing addon gets two retries before the song is treated as a miss`() = runTest {
+    fun `a preparing addon gets four retries before the song is treated as a miss`() = runTest {
         val repository: EclipseAddonRepository = mockk()
         val addon = addon("aero", resources = listOf("stream", "resolve"))
         coEvery { repository.enabledNow() } returns listOf(addon)
         coEvery { repository.resolve(addon, any(), any(), any(), any()) } returns EclipseAddonTrack(id = "r1")
         coEvery { repository.stream(addon, "r1") } throws EclipseAddonException.Preparing(0) andThenThrows
+            EclipseAddonException.Preparing(0) andThenThrows
+            EclipseAddonException.Preparing(0) andThenThrows
             EclipseAddonException.Preparing(0) andThen
             stream(quality = "lossless", format = "flac")
 
         val result = EclipseAddonStreamResolver(repository).resolve(track())
 
         assertThat(result?.origin).isEqualTo("addon:aero")
-        coVerify(exactly = 3) { repository.stream(addon, "r1") }
+        coVerify(exactly = 5) { repository.stream(addon, "r1") }
+    }
+
+    /**
+     * The poll window is the six seconds the player can afford, and the poll
+     * happens every 1.5 s inside it.
+     *
+     * An addon that answers "preparing" for the whole window is not asked a
+     * fifth time: the song goes to another source and the file is picked up
+     * on a later play.
+     */
+    @Test
+    fun `a preparing addon is polled every second and a half for six seconds`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val addon = addon("aero", resources = listOf("stream", "resolve"))
+        coEvery { repository.enabledNow() } returns listOf(addon)
+        coEvery { repository.resolve(addon, any(), any(), any(), any()) } returns EclipseAddonTrack(id = "r1")
+        coEvery { repository.stream(addon, "r1") } throws EclipseAddonException.Preparing(null)
+
+        val started = currentTime
+        val result = EclipseAddonStreamResolver(repository).resolve(track())
+
+        assertThat(result).isNull()
+        // Four waits of 1.5 s, then the answer that ends the wait.
+        assertThat(currentTime - started).isEqualTo(6_000L)
+        coVerify(exactly = 5) { repository.stream(addon, "r1") }
+    }
+
+    /**
+     * A 503 "preparing" is the addon working, not the addon broken.
+     *
+     * Cooling it down would silence it for a minute - and the next songs
+     * would go to YouTube while it was installing exactly the file they
+     * need.
+     */
+    @Test
+    fun `a preparing addon is asked again for the next song`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val addon = addon("aero", resources = listOf("stream", "resolve"))
+        coEvery { repository.enabledNow() } returns listOf(addon)
+        coEvery { repository.resolve(addon, any(), any(), any(), any()) } returns
+            EclipseAddonTrack(id = "r1") andThen EclipseAddonTrack(id = "r2")
+        coEvery { repository.stream(addon, "r1") } throws EclipseAddonException.Preparing(null)
+        coEvery { repository.stream(addon, "r2") } returns stream()
+
+        val resolver = EclipseAddonStreamResolver(repository)
+        val first = resolver.resolve(track().copy(id = 1L))
+        // Another song: its own resolve, its own item id.
+        val second = resolver.resolve(track().copy(id = 2L, title = "Save Your Tears"))
+
+        assertThat(first).isNull()
+        // The addon was not silenced: it answered the next song.
+        assertThat(second).isNotNull()
+        coVerify(exactly = 1) { repository.stream(addon, "r2") }
+    }
+
+    /**
+     * The player must know that a fallback to another source was only standing
+     * in: the addon is installing the file, and it is minutes away.
+     */
+    @Test
+    fun `wasPreparing is set while the addon installs the file and cleared when it serves`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val addon = addon("aero", resources = listOf("stream", "resolve"))
+        coEvery { repository.enabledNow() } returns listOf(addon)
+        coEvery { repository.resolve(addon, any(), any(), any(), any()) } returns EclipseAddonTrack(id = "r1")
+        var calls = 0
+        coEvery { repository.stream(addon, "r1") } answers {
+            calls++
+            if (calls <= 5) throw EclipseAddonException.Preparing(null)
+            stream(quality = "lossless", format = "flac")
+        }
+
+        val resolver = EclipseAddonStreamResolver(repository)
+        val song = track().copy(id = 7L)
+
+        assertThat(resolver.wasPreparing(song.id)).isFalse()
+        // The whole window goes by without the file.
+        assertThat(resolver.resolve(song)).isNull()
+        assertThat(resolver.wasPreparing(song.id)).isTrue()
+
+        // Now it has the file: the flag may go, and the song plays from it.
+        assertThat(resolver.resolve(song)).isNotNull()
+        assertThat(resolver.wasPreparing(song.id)).isFalse()
     }
 
     @Test
