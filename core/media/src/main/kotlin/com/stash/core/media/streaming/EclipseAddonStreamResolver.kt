@@ -457,7 +457,14 @@ class EclipseAddonStreamResolver private constructor(
         val cached = resolveCache.get(key)
         if (cached != null) {
             val id = cached.itemId
-            if (id != null || !bypassNegative) return id
+            // A cached answer can be older than the truth: the addon may have
+            // fetched a better file since (the server fetches the tier the
+            // client asked for in the background). A cached id that names a
+            // worse tier than the addon's quality setting asks for is asked
+            // again - otherwise a track that was upgraded an hour ago keeps
+            // playing the old file for the whole cache lifetime.
+            if (id != null && !belowPreferredTier(addon, id)) return id
+            if (id == null && !bypassNegative) return null
             // A user play re-checks a cached Tidal miss; only a new miss is recorded.
             resolveCache.invalidate(key)
         }
@@ -974,6 +981,23 @@ class EclipseAddonStreamResolver private constructor(
         )
     }
 
+    /**
+     * Does this id name a tier below the addon's quality setting?
+     *
+     * The ids a TorBox-backed addon gives look like "nb:<hash>:<tier>", where
+     * the tier is the same word the quality setting uses ("hires",
+     * "lossless", "high", "low"). "max" asks for no particular tier, so
+     * nothing is below it.
+     */
+    private fun belowPreferredTier(addon: EclipseAddon, id: String): Boolean {
+        val preferred = addon.settings["quality"]?.trim()?.lowercase() ?: return false
+        if (preferred.isEmpty() || preferred == "max" || preferred == "auto" || preferred == "best") return false
+        val wanted = TIER_RANK[preferred] ?: return false
+        val tier = id.substringAfterLast(':', "").lowercase()
+        val have = TIER_RANK[tier] ?: return false
+        return have < wanted
+    }
+
     /** Waits out one "preparing" 503, honouring `Retry-After` up to [MAX_PREPARING_WAIT_SECONDS]. */
     private suspend fun waitPreparing(
         addon: EclipseAddon,
@@ -1161,6 +1185,18 @@ class EclipseAddonStreamResolver private constructor(
 
         private const val TAG = "EclipseAddonStreamResolver"
         private const val SEARCH_LIMIT = 25
+
+        /**
+         * The quality tiers, best first. The words are the ones the addon's
+         * quality setting uses, so a setting and an id can be compared.
+         */
+        private val TIER_RANK = mapOf(
+            "atmos" to 5,
+            "hires" to 4,
+            "lossless" to 3,
+            "high" to 2,
+            "low" to 1,
+        )
 
         /** Three credit variants at most: full, cleaned title/primary artist, full title/primary artist. */
         private const val SEARCH_VARIANT_LIMIT = 3

@@ -19,14 +19,18 @@ import org.junit.Test
 class EclipseAddonStreamResolverTest {
     private val now = 1_762_000_000_000L
 
-    private fun addon(id: String = "nebula", resources: List<String> = listOf("search", "stream")) =
-        EclipseAddon(
-            id = id,
-            name = id,
-            version = "1",
-            manifestUrl = "https://addons.test/$id/manifest.json",
-            resources = resources,
-        )
+    private fun addon(
+        id: String = "nebula",
+        resources: List<String> = listOf("search", "stream"),
+        settings: Map<String, String> = emptyMap(),
+    ) = EclipseAddon(
+        id = id,
+        name = id,
+        version = "1",
+        manifestUrl = "https://addons.test/$id/manifest.json",
+        resources = resources,
+        settings = settings,
+    )
 
     private fun stream(
         url: String = "https://cdn.test/123.flac",
@@ -480,6 +484,44 @@ class EclipseAddonStreamResolverTest {
 
         coVerify(exactly = 1) { repository.resolve(addon, any(), any(), any(), any()) }
         coVerify(exactly = 2) { repository.stream(addon, "r1") }
+    }
+
+    @Test
+    fun `a cached id below the addon's quality setting is looked up again`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        // The addon asks for CD quality.
+        val addon = resolveOnly().copy(settings = mapOf("quality" to "lossless"))
+        coEvery { repository.enabledNow() } returns listOf(addon)
+        // The first answer names an AAC tier - the file the addon had then.
+        coEvery { repository.resolve(addon, any(), any(), any(), any()) } returns
+            EclipseAddonTrack(id = "nb:abc:high")
+        coEvery { repository.stream(addon, any()) } returns stream()
+        val resolver = cachedResolver(repository)
+
+        resolver.resolve(track())
+        // The addon has since fetched the CD file. The cached id names the
+        // worse tier, so it must not be trusted for six hours.
+        coEvery { repository.resolve(addon, any(), any(), any(), any()) } returns
+            EclipseAddonTrack(id = "nb:abc:lossless")
+        resolver.resolve(track())
+
+        coVerify(exactly = 2) { repository.resolve(addon, any(), any(), any(), any()) }
+    }
+
+    @Test
+    fun `a cached id is trusted when the setting asks for no particular tier`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val addon = resolveOnly().copy(settings = mapOf("quality" to "max"))
+        coEvery { repository.enabledNow() } returns listOf(addon)
+        coEvery { repository.resolve(addon, any(), any(), any(), any()) } returns
+            EclipseAddonTrack(id = "nb:abc:high")
+        coEvery { repository.stream(addon, any()) } returns stream()
+        val resolver = cachedResolver(repository)
+
+        resolver.resolve(track())
+        resolver.resolve(track())
+
+        coVerify(exactly = 1) { repository.resolve(addon, any(), any(), any(), any()) }
     }
 
     @Test
