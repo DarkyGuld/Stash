@@ -7,6 +7,7 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 import com.stash.core.data.db.converter.Converters
 import com.stash.core.data.db.dao.ArtistGenreDao
+import com.stash.core.data.db.dao.TorboxPointerDao
 import com.stash.core.data.db.dao.ArtistImageDao
 import com.stash.core.data.db.dao.ArtistProfileCacheDao
 import com.stash.core.data.db.dao.DiscoveryQueueDao
@@ -31,6 +32,7 @@ import com.stash.core.data.db.dao.TrackSkipEventDao
 import com.stash.core.data.db.dao.TrackTagDao
 import com.stash.core.data.db.dao.WebLibraryExportDao
 import com.stash.core.data.db.entity.ArtistGenreEntity
+import com.stash.core.data.db.entity.TorboxPointerEntity
 import com.stash.core.data.db.entity.ArtistImageEntity
 import com.stash.core.data.db.entity.ArtistProfileCacheEntity
 import com.stash.core.data.db.entity.DiscoveryQueueEntity
@@ -127,14 +129,17 @@ import kotlinx.serialization.json.Json
         com.stash.core.data.db.entity.TrackAliasEntity::class,
         com.stash.core.data.db.entity.TrackMergeLogEntity::class,
         com.stash.core.data.db.entity.DuplicateDismissalEntity::class,
+        TorboxPointerEntity::class,
     ],
-    version = 78,
+    version = 79,
     exportSchema = true,
 )
 @TypeConverters(Converters::class)
 abstract class StashDatabase : RoomDatabase() {
 
     abstract fun trackDao(): TrackDao
+
+    abstract fun torboxPointerDao(): TorboxPointerDao
 
     abstract fun cloudDao(): com.stash.core.data.db.dao.CloudDao
 
@@ -2004,6 +2009,24 @@ abstract class StashDatabase : RoomDatabase() {
          * columns at v77, and a phone that ran it is already at 77 with them. That 77 never ran
          * #838's `tracks_fts` rebuild ([MIGRATION_76_77]), so such a phone gets it here instead.
          */
+        /**
+         * The phone's own TorBox pointers. New table, so nothing to carry over:
+         * a pointer is a cache, and the phone rebuilds it by asking TorBox.
+         */
+        val MIGRATION_78_79 = object : Migration(78, 79) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `torbox_pointers` (`infohash` TEXT NOT NULL, " +
+                        "`torrent_id` TEXT NOT NULL, `file_id` TEXT, `file_name` TEXT, " +
+                        "`updated_at` INTEGER NOT NULL, PRIMARY KEY(`infohash`))",
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_torbox_pointers_updated_at` " +
+                        "ON `torbox_pointers` (`updated_at`)",
+                )
+            }
+        }
+
         val MIGRATION_77_78 = object : Migration(77, 78) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 // Frozen here, not shared with the entity: a later rename must not change what 78 adds.
@@ -2182,6 +2205,7 @@ abstract class StashDatabase : RoomDatabase() {
                 MIGRATION_75_76,
                 MIGRATION_76_77,
                 MIGRATION_77_78,
+                MIGRATION_78_79,
             )
         }
     }

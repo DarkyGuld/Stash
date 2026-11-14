@@ -103,6 +103,9 @@ data class EclipseAddonManifest(
             min = (this["min"] as? JsonPrimitive)?.contentOrNull?.toDoubleOrNull(),
             max = (this["max"] as? JsonPrimitive)?.contentOrNull?.toDoubleOrNull(),
             step = (this["step"] as? JsonPrimitive)?.contentOrNull?.toDoubleOrNull(),
+            // A local setting stays on this phone: it is never sent to the server.
+            local = (this["local"] as? JsonPrimitive)?.contentOrNull?.trim()
+                ?.equals("true", ignoreCase = true) == true,
         )
     }
 
@@ -136,6 +139,14 @@ data class EclipseAddonTrack(
     val isrc: String? = null,
     val format: String? = null,
     @SerialName("streamURL") val streamUrl: String? = null,
+    /**
+     * The global file: what it is, in every TorBox account in the world.
+     *
+     * The infohash is the same everywhere, so a phone with its own TorBox key
+     * can add the file to its own account and play it - without the server
+     * knowing anything about that account.
+     */
+    val torbox: EclipseTorboxFile? = null,
 ) {
     /** [duration] in milliseconds, whichever unit the addon used (seconds, or already ms). */
     val durationMs: Long
@@ -145,6 +156,22 @@ data class EclipseAddonTrack(
             else -> duration
         }
 }
+
+/**
+ * A TorBox file, named globally.
+ *
+ * The infohash is TorBox's own hash of the torrent: the same file has the
+ * same hash in every account, which is what makes the server's catalogue
+ * usable by more than one person. The torrent id - which torrent in one
+ * account holds the file - is not here: that belongs to the user, and it
+ * lives on their phone.
+ */
+@Serializable
+data class EclipseTorboxFile(
+    val infohash: String = "",
+    val file: String? = null,
+    val quality: String? = null,
+)
 
 /** One song hit from Apple's public iTunes Search API (Cloud's Apple Music route needs its trackId). */
 @Serializable
@@ -239,10 +266,19 @@ class EclipseAddonClient @Inject constructor(
 
     private val mintMutex = Mutex()
 
-    suspend fun fetchManifest(manifestUrl: String): EclipseAddonManifest =
-        getJson(manifestUrlOrThrow(manifestUrl)) { body ->
+    suspend fun fetchManifest(manifestUrl: String): EclipseAddonManifest {
+        val manifest = getJson(manifestUrlOrThrow(manifestUrl)) { body ->
             json.decodeFromString<EclipseAddonManifest>(body)
         }
+        // Which of this addon's settings stay on this phone. A TorBox API key
+        // is a secret for this user's account: it must not travel to a server
+        // that serves other people, nor into a log line.
+        localSettingKeys[manifestUrl] = manifest.settingDefinitions
+            .filter { it.local }
+            .map { it.key }
+            .toSet()
+        return manifest
+    }
 
     /** Searches one addon. Accepts `{"tracks":[…]}` or a bare array. */
     suspend fun search(
@@ -752,6 +788,14 @@ class EclipseAddonClient @Inject constructor(
     private data class AccessToken(val token: String, val expiresAtMs: Long)
 
     companion object {
+        /**
+         * Which settings stay on this phone, per manifest.
+         *
+         * A TorBox API key is a secret for this user's account: it must not
+         * travel to a server that serves other people, nor into a log line.
+         */
+        private val localSettingKeys = java.util.concurrent.ConcurrentHashMap<String, Set<String>>()
+
         const val USER_AGENT: String = "Stash/0.9.123"
 
         /**
@@ -864,7 +908,12 @@ class EclipseAddonClient @Inject constructor(
             manifest.queryParameterNames.forEach { name ->
                 manifest.queryParameterValues(name).forEach { builder.addQueryParameter(name, it) }
             }
+            // A local setting (a TorBox API key) stays on this phone: it is a
+            // secret for this user's account and must not travel to a server
+            // that serves other people, nor into a log line.
+            val localKeys = localSettingKeys[manifestUrl] ?: emptySet()
             settings.forEach { (key, value) ->
+                if (key in localKeys) return@forEach
                 if (key !in existing && value.isNotEmpty()) builder.addQueryParameter(key, value)
             }
             return builder.build()

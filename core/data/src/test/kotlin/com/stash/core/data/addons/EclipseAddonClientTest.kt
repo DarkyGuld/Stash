@@ -69,6 +69,48 @@ class EclipseAddonClientTest {
     }
 
     @Test
+    fun `a local setting stays on this phone and is never sent to the server`() =
+        kotlinx.coroutines.test.runTest {
+            server.enqueue(
+                MockResponse().setBody(
+                    """{"id":"a","name":"A","version":"1","resources":["resolve","stream"],
+                       "settings":[{"key":"torboxApiKey","type":"text","label":"TorBox API key",
+                       "local":true},{"key":"quality","type":"select","default":"max"}]}""",
+                ),
+            )
+            client.fetchManifest("https://addons.test/tok123/manifest.json?token=abc")
+
+            server.enqueue(
+                MockResponse().setBody(
+                    """{"item":{"id":"nb:1","title":"Song","artist":"Artist","duration":200,
+                       "torbox":{"infohash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","file":"Song.flac",
+                       "quality":"HiFi CD"}}}""",
+                ),
+            )
+            val track = client.resolve(
+                manifestUrl = "https://addons.test/tok123/manifest.json?token=abc",
+                title = "Song",
+                artist = "Artist",
+                durationMs = 200_000,
+                isrc = null,
+                settings = mapOf("torboxApiKey" to "the-secret-key", "quality" to "max"),
+            )
+
+            // The answer carries the global file: the infohash is the same in
+            // every TorBox account in the world.
+            assertThat(track?.torbox?.infohash).isEqualTo("b".repeat(40))
+            assertThat(track?.torbox?.file).isEqualTo("Song.flac")
+
+            // And the key never travelled. The first request was the manifest.
+            server.takeRequest()
+            val path = server.takeRequest().path ?: ""
+            assertThat(path).doesNotContain("torboxApiKey")
+            assertThat(path).doesNotContain("the-secret-key")
+            // The other settings still do.
+            assertThat(path).contains("quality=max")
+        }
+
+    @Test
     fun `a base URL gets manifest json appended, keeping the token path and query`() = kotlinx.coroutines.test.runTest {
         server.enqueue(MockResponse().setBody("""{"id":"a","name":"A","version":"1","resources":["search","stream"]}"""))
 

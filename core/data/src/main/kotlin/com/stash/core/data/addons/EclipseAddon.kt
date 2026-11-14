@@ -25,6 +25,14 @@ data class EclipseAddonSetting(
     val min: Double? = null,
     val max: Double? = null,
     val step: Double? = null,
+    /**
+     * The setting stays on this phone.
+     *
+     * A TorBox API key is a secret for *this user's* account: it must never
+     * travel to a server that serves other people, and it must not end up in
+     * a log line. The app keeps it and uses it itself.
+     */
+    val local: Boolean = false,
 )
 
 /**
@@ -62,6 +70,16 @@ data class EclipseAddon(
      * miss must not fall back to `/search`: search is a text guess, and strict
      * mode means the app skips that addon rather than play another version.
      */
+    /**
+     * This user's own TorBox API key, if they set one.
+     *
+     * The key is a local setting: it stays on this phone and is never sent
+     * to the server. With it the phone can add a file to its own TorBox
+     * account and play it - the server's account is then only the fallback.
+     */
+    val torboxApiKey: String?
+        get() = settings["torboxApiKey"]?.trim()?.takeIf { it.isNotEmpty() }
+
     val strictIdentity: Boolean
         get() = settings["strictIdentity"]?.equals("true", ignoreCase = true) == true ||
             settings["strict"]?.equals("true", ignoreCase = true) == true

@@ -15,7 +15,16 @@ internal class EclipseAddonResolveCache(
     private val negativeTtlMs: Long = 5 * 60_000L,
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
-    internal data class Entry(val itemId: String?, val expiresAtMs: Long)
+    /**
+     * The id the addon gave us, and - for a TorBox-backed addon - the file it
+     * named. The infohash is the same in every TorBox account, so the phone
+     * can add the file to its own account and play it.
+     */
+    internal data class Entry(
+        val itemId: String?,
+        val expiresAtMs: Long,
+        val torbox: com.stash.core.data.addons.EclipseTorboxFile? = null,
+    )
 
     private val entries = object : LinkedHashMap<String, Entry>(16, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Entry>): Boolean =
@@ -35,9 +44,14 @@ internal class EclipseAddonResolveCache(
 
     /** [itemId] null caches a miss (short TTL); a real id caches a hit (long TTL). */
     @Synchronized
-    fun put(key: String, itemId: String?, ttlMs: Long? = null) {
+    fun put(
+        key: String,
+        itemId: String?,
+        ttlMs: Long? = null,
+        torbox: com.stash.core.data.addons.EclipseTorboxFile? = null,
+    ) {
         val ttl = ttlMs ?: if (itemId == null) negativeTtlMs else positiveTtlMs
-        entries[key] = Entry(itemId, clock() + ttl)
+        entries[key] = Entry(itemId, clock() + ttl, torbox)
     }
 
     /** Caches a miss with an explicit TTL (Cloud's Tidal miss is long: Apple still serves it). */

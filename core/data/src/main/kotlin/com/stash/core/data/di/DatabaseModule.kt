@@ -48,6 +48,11 @@ object DatabaseModule {
     @Provides
     fun provideTrackDao(db: StashDatabase): TrackDao = db.trackDao()
 
+    /** This phone's own TorBox pointers: which torrent in this account holds a file. */
+    @Provides
+    fun provideTorboxPointerDao(db: StashDatabase): com.stash.core.data.db.dao.TorboxPointerDao =
+        db.torboxPointerDao()
+
     @Provides
     fun provideCloudDao(db: StashDatabase): com.stash.core.data.db.dao.CloudDao = db.cloudDao()
 

@@ -55,6 +55,8 @@ class EclipseAddonStreamResolver private constructor(
     private val account: EclipseAccountManager?,
     /** "The addon is preparing this song", for the player's hint. Null in hand-built tests. */
     private val preparingState: AddonPreparingState?,
+    /** This phone's own TorBox account. Null in hand-built tests. */
+    private val torboxLocal: com.stash.core.data.addons.TorboxLocalResolver?,
 ) {
     /** Apple ids that 404'd at every tier this session: never request them again. */
     private val deadAppleIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
@@ -80,6 +82,7 @@ class EclipseAddonStreamResolver private constructor(
         isrcEnricher: EclipseIsrcEnricher,
         account: EclipseAccountManager,
         preparingState: AddonPreparingState,
+        torboxLocal: com.stash.core.data.addons.TorboxLocalResolver,
     ) : this(
         repository,
         EclipseAddonResolveCache(),
@@ -90,11 +93,12 @@ class EclipseAddonStreamResolver private constructor(
         isrcEnricher,
         account,
         preparingState,
+        torboxLocal,
     )
 
     /** Hand-built tests: Tidal-first, as the default switch does. */
     internal constructor(repository: EclipseAddonRepository) :
-        this(repository, EclipseAddonResolveCache(), { false }, null, null, null, null, null, null)
+        this(repository, EclipseAddonResolveCache(), { false }, null, null, null, null, null, null, null)
 
     suspend fun resolve(track: TrackEntity, speculative: Boolean = false): StreamUrl? =
         resolveInternal(track, speculative, radio = false)
@@ -416,6 +420,13 @@ class EclipseAddonStreamResolver private constructor(
     ): StreamUrl? {
         val itemId = cachedResolveId(addon, track, key) ?: return null
 
+        // This phone's own TorBox account first. The addon named the file,
+        // and the infohash is the same in every account in the world - so the
+        // phone can add it to its own account and play it, without the
+        // server's account serving it and without the server ever learning
+        // anything about this account.
+        localTorboxStream(addon, track, key)?.let { return served(addon, track, it, startedNs) }
+
         return try {
             mapStream(streamWithRetry(addon, itemId))?.let { served(addon, track, it, startedNs) }
         } catch (e: CancellationException) {
@@ -452,7 +463,7 @@ class EclipseAddonStreamResolver private constructor(
         }
         val resolved = resolveId(addon, track)
         when {
-            resolved.id != null -> resolveCache.put(key, resolved.id)
+            resolved.id != null -> resolveCache.put(key, resolved.id, torbox = resolved.torbox)
             // Only a definitive 404 / empty catalog answer is a negative. A 403,
             // 429 or timeout must be asked again on the next play.
             missTtlMs != null && resolved.definitive -> resolveCache.putMiss(key, missTtlMs)
@@ -763,7 +774,17 @@ class EclipseAddonStreamResolver private constructor(
     }
 
     /** A resolve attempt: an id, or null with whether the addon gave a definitive "not here". */
-    private data class ResolveId(val id: String?, val definitive: Boolean)
+    /**
+     * The id the addon gave us, and - when the addon named a global TorBox
+     * file - what that file is. The infohash is the same in every TorBox
+     * account, so a phone with its own key can add the file to its own
+     * account and play it without the server knowing anything about it.
+     */
+    private data class ResolveId(
+        val id: String?,
+        val definitive: Boolean,
+        val torbox: com.stash.core.data.addons.EclipseTorboxFile? = null,
+    )
 
     /**
      * `/resolve`, then `/resolve-isrc`, then the cleaned-query variants. A
@@ -792,8 +813,12 @@ class EclipseAddonStreamResolver private constructor(
             }
 
         if (addon.supportsResolve) {
+            // The whole answer, not just the id: a TorBox-backed addon also
+            // names the file, and the infohash is what lets this phone add it
+            // to its own TorBox account.
+            var resolved: com.stash.core.data.addons.EclipseAddonTrack? = null
             route("resolve") {
-                if (spotifyUri != null || youtubeId != null) {
+                resolved = if (spotifyUri != null || youtubeId != null) {
                     repository.resolve(
                         addon = addon,
                         title = track.title,
@@ -802,7 +827,7 @@ class EclipseAddonStreamResolver private constructor(
                         isrc = isrc,
                         spotifyUri = spotifyUri,
                         youtubeId = youtubeId,
-                    )?.id
+                    )
                 } else {
                     repository.resolve(
                         addon = addon,
@@ -810,9 +835,10 @@ class EclipseAddonStreamResolver private constructor(
                         artist = track.artist,
                         durationMs = track.durationMs.takeIf { it > 0 },
                         isrc = isrc,
-                    )?.id
+                    )
                 }
-            }?.let { return ResolveId(it, definitive = true) }
+                resolved?.id
+            }?.let { return ResolveId(it, definitive = true, torbox = resolved?.torbox) }
         }
         if ((addon.supportsIsrc || addon.isEclipseCloud) && isrc != null) {
             route("resolve-isrc") { repository.resolveIsrc(addon, isrc)?.id }
@@ -912,6 +938,40 @@ class EclipseAddonStreamResolver private constructor(
             // player moves on to another source.
             preparingState?.setPreparing(false)
         }
+    }
+
+    /**
+     * The stream from this phone's own TorBox account, or null.
+     *
+     * The addon's answer named the file (the global infohash and the file
+     * name). This phone keeps its own pointer to it - which torrent in
+     * *this* account holds it - and asks TorBox for the url. A file the
+     * account does not have yet is added first: TorBox has it in its own
+     * cache when it is a release others play too, and that is quick.
+     *
+     * Null when there is no key, no file, or TorBox will not serve it. The
+     * caller's own route (the server's stream) is the fallback.
+     */
+    private suspend fun localTorboxStream(
+        addon: EclipseAddon,
+        track: TrackEntity,
+        key: String,
+    ): StreamUrl? {
+        val resolver = torboxLocal ?: return null
+        val apiKey = addon.torboxApiKey?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        val file = resolveCache.get(key)?.torbox ?: return null
+        if (file.infohash.isBlank()) return null
+
+        val url = resolver.resolve(file, track.title, apiKey) ?: return null
+        val lossless = file.quality?.contains("CD") == true || file.quality?.contains("Res") == true
+        return mapStream(
+            com.stash.core.data.addons.EclipseAddonStream(
+                url = url,
+                format = if (lossless) "flac" else "m4a",
+                codec = if (lossless) "flac" else "aac",
+                quality = file.quality,
+            ),
+        )
     }
 
     /** Waits out one "preparing" 503, honouring `Retry-After` up to [MAX_PREPARING_WAIT_SECONDS]. */
@@ -1092,10 +1152,11 @@ class EclipseAddonStreamResolver private constructor(
             isrcEnricher: EclipseIsrcEnricher? = null,
             account: EclipseAccountManager? = null,
             preparingState: AddonPreparingState? = null,
+            torboxLocal: com.stash.core.data.addons.TorboxLocalResolver? = null,
         ): EclipseAddonStreamResolver =
             EclipseAddonStreamResolver(
                 repository, cache, cloudFastestSource, appleLookup, urlCache, streamUrlStore, isrcEnricher, account,
-                preparingState,
+                preparingState, torboxLocal,
             )
 
         private const val TAG = "EclipseAddonStreamResolver"
