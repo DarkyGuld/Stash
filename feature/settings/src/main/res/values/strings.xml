@@ -508,6 +508,8 @@
     <string name="settings_addon_copy_url_cancel">Cancel</string>
     <string name="settings_addon_move_up">Move up</string>
     <string name="settings_addon_move_down">Move down</string>
+    <string name="settings_addon_drag">Hold and drag to reorder</string>
+    <string name="settings_addon_reload_manifest">Reload manifest</string>
     <string name="settings_addon_enabled">Enabled</string>
     <string name="settings_addon_disabled">Off</string>
     <string name="settings_addon_settings">Addon settings</string>

@@ -91,6 +91,7 @@ private const val ADDON_URL_INVALID = "That isn't a valid https addon URL."
 private const val ADDON_UNREACHABLE = "Couldn't reach that addon. Check the URL and try again."
 private const val ADDON_INVALID_MANIFEST = "That link isn't a music addon (it needs search and stream)."
 private const val ADDON_DUPLICATE = "That addon is already installed."
+private const val ADDON_NOT_INSTALLED = "That addon isn't installed any more."
 private const val ADDON_GENERIC = "Couldn't add that addon."
 private const val ECLIPSE_TOKEN_TEST_FAILED =
     "Couldn't use that Eclipse account token. Check it hasn't expired and try again."
@@ -335,6 +336,35 @@ class SettingsViewModel @Inject constructor(
         viewModelScope.launch { eclipseAddonRepository.move(id, delta) }
     }
 
+    /**
+     * The addon is dropped where it was let go: the drag-and-drop's move.
+     */
+    fun onMoveAddonTo(id: String, index: Int) {
+        viewModelScope.launch { eclipseAddonRepository.moveTo(id, index) }
+    }
+
+    /**
+     * Fetches the addon's manifest again, so a new version's settings show up
+     * without the addon having to be removed and added again.
+     */
+    fun onReloadAddonManifest(id: String) {
+        if (_addonBusy.value) return
+        viewModelScope.launch {
+            _addonBusy.value = true
+            try {
+                val result = eclipseAddonRepository.reloadManifest(id)
+                val failure = result.exceptionOrNull()
+                if (failure == null) {
+                    // A new manifest can change what the chain serves.
+                    streamUrlCache.clear()
+                }
+                _addonError.value = if (failure == null) null else addonErrorMessage(failure)
+            } finally {
+                _addonBusy.value = false
+            }
+        }
+    }
+
     /** One of an addon's manifest settings changed in the UI; persistence validates it. */
     fun onAddonSettingChanged(id: String, key: String, value: String) {
         viewModelScope.launch {
@@ -570,6 +600,7 @@ class SettingsViewModel @Inject constructor(
             AddAddonError.Unreachable -> ADDON_UNREACHABLE
             AddAddonError.InvalidManifest -> ADDON_INVALID_MANIFEST
             AddAddonError.Duplicate -> ADDON_DUPLICATE
+            AddAddonError.NotInstalled -> ADDON_NOT_INSTALLED
             null -> ADDON_GENERIC
         }
 

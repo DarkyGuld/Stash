@@ -22,18 +22,21 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.DragHandle
 import androidx.compose.material.icons.rounded.ArrowDropDown
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.KeyboardArrowUp
+import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -62,6 +65,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.stringResource
@@ -81,7 +85,12 @@ import com.stash.core.data.addons.EclipseAddon
 import com.stash.core.data.addons.EclipseAddonSetting
 import com.stash.core.data.prefs.StreamSourceToggle
 import com.stash.core.ui.components.GlassCard
+import com.stash.core.ui.components.ReorderableColumnState
 import com.stash.core.ui.components.StashSwitch
+import com.stash.core.ui.components.rememberReorderableColumnState
+import com.stash.core.ui.components.reorderHandle
+import com.stash.core.ui.components.reorderableColumn
+import com.stash.core.ui.components.reorderableRow
 import com.stash.core.ui.theme.StashTheme
 import com.stash.feature.settings.components.LosslessRoutingStatus
 import com.stash.feature.settings.components.SettingsScaffold
@@ -148,7 +157,14 @@ fun SettingsLosslessSourcesScreen(
         return
     }
 
-    SettingsScaffold(title = stringResource(R.string.settings_lossless_sources_title), onBack = onBack, modifier = modifier) {
+    // The page's own scroll, so holding a dragged addon near the top or bottom can scroll it.
+    val scrollState = rememberScrollState()
+    SettingsScaffold(
+        title = stringResource(R.string.settings_lossless_sources_title),
+        onBack = onBack,
+        modifier = modifier,
+        scrollState = scrollState,
+    ) {
         GlassCard {
             Column(modifier = Modifier.fillMaxWidth()) {
                 // ROUTING block — one row per configured lossless path,
@@ -289,6 +305,7 @@ fun SettingsLosslessSourcesScreen(
         GlassCard {
             EclipseAddonsSection(
                 addons = addons,
+                scrollState = scrollState,
                 busy = addonBusy,
                 error = addonError,
                 addonsFirst = addonsFirst,
@@ -305,6 +322,8 @@ fun SettingsLosslessSourcesScreen(
                 onRemove = viewModel::onRemoveAddon,
                 onToggle = viewModel::onToggleAddon,
                 onMove = viewModel::onMoveAddon,
+                onMoveTo = viewModel::onMoveAddonTo,
+                onReloadManifest = viewModel::onReloadAddonManifest,
                 onErrorShown = viewModel::onAddonErrorShown,
                 onAddonsFirstChanged = viewModel::onAddonsFirstChanged,
                 onCloudFastestSourceChanged = viewModel::onCloudFastestSourceChanged,
@@ -688,6 +707,7 @@ private fun SourceToggleRow(
 @Composable
 private fun EclipseAddonsSection(
     addons: List<EclipseAddon>,
+    scrollState: ScrollState,
     busy: Boolean,
     error: String?,
     addonsFirst: Boolean,
@@ -704,6 +724,8 @@ private fun EclipseAddonsSection(
     onRemove: (String) -> Unit,
     onToggle: (String, Boolean) -> Unit,
     onMove: (String, Int) -> Unit,
+    onMoveTo: (String, Int) -> Unit,
+    onReloadManifest: (String) -> Unit,
     onErrorShown: () -> Unit,
     onAddonsFirstChanged: (Boolean) -> Unit,
     onCloudFastestSourceChanged: (Boolean) -> Unit,
@@ -975,27 +997,43 @@ private fun EclipseAddonsSection(
             )
         } else {
             val dividerColor = StashTheme.extendedColors.glassBorder
-            addons.forEachIndexed { index, addon ->
-                if (index > 0) {
-                    HorizontalDivider(color = dividerColor, thickness = 1.dp)
+            // Dragged by the handle, the queue's way: hold it and the row rides
+            // the finger. The drop is ONE move - the addon goes where it was
+            // let go, and the order is saved there.
+            val reorder = rememberReorderableColumnState(
+                keys = addons.map { it.id },
+                scrollState = scrollState,
+                onMove = { id, to -> onMoveTo(id, to) },
+            )
+            Column(modifier = Modifier.fillMaxWidth().reorderableColumn(reorder)) {
+                reorder.rows.forEachIndexed { index, id ->
+                    val addon = addons.firstOrNull { it.id == id } ?: return@forEachIndexed
+                    key(id) {
+                        EclipseAddonRow(
+                            addon = addon,
+                            held = reorder.isDragging(id),
+                            showDivider = index > 0,
+                            dividerColor = dividerColor,
+                            canMoveUp = index > 0,
+                            canMoveDown = index < reorder.rows.lastIndex,
+                            onToggle = { onToggle(addon.id, it) },
+                            onMoveUp = { onMove(addon.id, -1) },
+                            onMoveDown = { onMove(addon.id, 1) },
+                            onCopyUrl = {
+                                if (copyNeedsWarning(addon)) {
+                                    copyConfirmAddonId = addon.id
+                                } else {
+                                    copyAddonUrl(addon)
+                                }
+                            },
+                            onReloadManifest = { onReloadManifest(addon.id) },
+                            onRemove = { onRemove(addon.id) },
+                            onOpenSettings = { settingsAddonId = addon.id },
+                            reorderState = reorder,
+                            handleModifier = Modifier.reorderHandle(reorder, id, longPress = true),
+                        )
+                    }
                 }
-                EclipseAddonRow(
-                    addon = addon,
-                    canMoveUp = index > 0,
-                    canMoveDown = index < addons.lastIndex,
-                    onToggle = { onToggle(addon.id, it) },
-                    onMoveUp = { onMove(addon.id, -1) },
-                    onMoveDown = { onMove(addon.id, 1) },
-                    onCopyUrl = {
-                        if (copyNeedsWarning(addon)) {
-                            copyConfirmAddonId = addon.id
-                        } else {
-                            copyAddonUrl(addon)
-                        }
-                    },
-                    onRemove = { onRemove(addon.id) },
-                    onOpenSettings = { settingsAddonId = addon.id },
-                )
             }
         }
     }
@@ -1319,14 +1357,24 @@ private fun EclipseAccountBlock(
 @Composable
 private fun EclipseAddonRow(
     addon: EclipseAddon,
+    /** True while the row is held by the finger. */
+    held: Boolean,
+    /** The hairline above the row; it moves with the row, so it is drawn inside it. */
+    showDivider: Boolean,
+    dividerColor: Color,
     canMoveUp: Boolean,
     canMoveDown: Boolean,
     onToggle: (Boolean) -> Unit,
     onMoveUp: () -> Unit,
     onMoveDown: () -> Unit,
     onCopyUrl: () -> Unit,
+    onReloadManifest: () -> Unit,
     onRemove: () -> Unit,
     onOpenSettings: () -> Unit,
+    /** The list's drag state: the row slides out of the held row's way. */
+    reorderState: ReorderableColumnState<String>,
+    /** The drag handle: makes the row follow the finger. */
+    handleModifier: Modifier,
 ) {
     val enabledLabel = stringResource(R.string.settings_addon_enabled)
     // Two lines: the name + host own the width, and the actions sit on their
@@ -1335,8 +1383,12 @@ private fun EclipseAddonRow(
     Column(
         modifier = Modifier
             .fillMaxWidth()
+            .reorderableRow(reorderState, addon.id)
             .padding(vertical = 6.dp),
     ) {
+        if (showDivider) {
+            HorizontalDivider(color = dividerColor, thickness = 1.dp)
+        }
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(modifier = Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1382,6 +1434,23 @@ private fun EclipseAddonRow(
             horizontalArrangement = Arrangement.End,
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            // The drag handle: hold it and the row rides the finger. Long press,
+            // because the row's own buttons are right next to it.
+            Box(
+                modifier = Modifier.size(40.dp).then(handleModifier),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = Icons.Default.DragHandle,
+                    contentDescription = stringResource(R.string.settings_addon_drag),
+                    tint = if (held) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                    },
+                    modifier = Modifier.size(20.dp),
+                )
+            }
             if (addon.settingDefs.isNotEmpty()) {
                 IconButton(
                     onClick = onOpenSettings,
@@ -1423,6 +1492,16 @@ private fun EclipseAddonRow(
                 Icon(
                     imageVector = Icons.Rounded.ContentCopy,
                     contentDescription = stringResource(R.string.settings_addon_copy_url),
+                    modifier = Modifier.size(20.dp),
+                )
+            }
+            IconButton(
+                onClick = onReloadManifest,
+                modifier = Modifier.size(40.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.Refresh,
+                    contentDescription = stringResource(R.string.settings_addon_reload_manifest),
                     modifier = Modifier.size(20.dp),
                 )
             }

@@ -58,8 +58,12 @@ class EclipseAddonPreferences internal constructor(
 
     /**
      * Inserts [addon], or replaces the entry with the same [EclipseAddon.id]. A
-     * new entry goes last ([EclipseAddon.order] = max + 1) and gets [EclipseAddon.addedAtMs]
-     * when the caller left it at 0.
+     * new entry goes FIRST ([EclipseAddon.order] = min - 1) and gets
+     * [EclipseAddon.addedAtMs] when the caller left it at 0.
+     *
+     * A new addon leads: the list is the order the chain tries the addons in,
+     * and the one the user just added is the one they want heard first.
+     * A replace never reorders - the addon keeps the place it was given.
      */
     suspend fun put(addon: EclipseAddon) {
         store.edit { prefs ->
@@ -69,13 +73,13 @@ class EclipseAddonPreferences internal constructor(
                 // Keep the position already chosen for it; a replace never reorders.
                 current[index] = addon.copy(order = current[index].order)
             } else {
-                val order = (current.maxOfOrNull { it.order } ?: -1) + 1
+                val order = (current.minOfOrNull { it.order } ?: 0) - 1
                 current += addon.copy(
                     order = order,
                     addedAtMs = addon.addedAtMs.takeIf { it > 0 } ?: System.currentTimeMillis(),
                 )
             }
-            prefs[addonsKey] = json.encodeToString(current.sortedBy { it.order })
+            prefs[addonsKey] = json.encodeToString(current.sortedBy { it.order }.renumbered())
         }
     }
 
@@ -142,6 +146,25 @@ class EclipseAddonPreferences internal constructor(
             val from = current.indexOfFirst { it.id == id }
             if (from < 0) return@edit
             val to = (from + delta).coerceIn(0, current.lastIndex)
+            if (to == from) return@edit
+            val moved = current.removeAt(from)
+            current.add(to, moved)
+            prefs[addonsKey] = json.encodeToString(current.renumbered())
+        }
+    }
+
+    /**
+     * Moves the addon [id] to [toIndex] in the list, and renumbers it 0..n-1.
+     *
+     * The drag-and-drop's move: the row is dropped where it was let go, not
+     * one place up or down from where it was.
+     */
+    suspend fun moveTo(id: String, toIndex: Int) {
+        store.edit { prefs ->
+            val current = prefs[addonsKey].decodeAddons().toMutableList()
+            val from = current.indexOfFirst { it.id == id }
+            if (from < 0) return@edit
+            val to = toIndex.coerceIn(0, current.lastIndex)
             if (to == from) return@edit
             val moved = current.removeAt(from)
             current.add(to, moved)

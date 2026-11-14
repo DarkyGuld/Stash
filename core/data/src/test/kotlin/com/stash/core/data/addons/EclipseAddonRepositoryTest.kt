@@ -370,15 +370,17 @@ class EclipseAddonRepositoryTest {
         repository.add("https://addons.test/b/manifest.json")
         repository.add("https://addons.test/c/manifest.json")
 
-        assertThat(stored().map { it.id }).containsExactly("a", "b", "c").inOrder()
+        // The newest addon leads: the list is the order the chain tries them in,
+        // and the one just added is the one the user wants heard first.
+        assertThat(stored().map { it.id }).containsExactly("c", "b", "a").inOrder()
         assertThat(stored().map { it.order }).containsExactly(0, 1, 2).inOrder()
 
-        repository.move("c", -1)
-        assertThat(stored().map { it.id }).containsExactly("a", "c", "b").inOrder()
-        assertThat(stored().map { it.order }).containsExactly(0, 1, 2).inOrder()
-
-        repository.move("a", 1)
+        repository.move("a", -1)
         assertThat(stored().map { it.id }).containsExactly("c", "a", "b").inOrder()
+        assertThat(stored().map { it.order }).containsExactly(0, 1, 2).inOrder()
+
+        repository.move("c", 1)
+        assertThat(stored().map { it.id }).containsExactly("a", "c", "b").inOrder()
 
         repository.setEnabled("a", false)
         assertThat(repository.enabledNow().map { it.id }).containsExactly("c", "b").inOrder()
@@ -386,5 +388,103 @@ class EclipseAddonRepositoryTest {
         repository.remove("c")
         assertThat(stored().map { it.id }).containsExactly("a", "b").inOrder()
         assertThat(stored().map { it.order }).containsExactly(0, 1).inOrder()
+    }
+
+    @Test
+    fun `a new addon goes on top of the list`() = runTest {
+        server.enqueue(manifest("a", "A"))
+        server.enqueue(manifest("b", "B"))
+        repository.add("https://addons.test/a/manifest.json")
+        repository.add("https://addons.test/b/manifest.json")
+
+        assertThat(stored().map { it.id }).containsExactly("b", "a").inOrder()
+        assertThat(stored().map { it.order }).containsExactly(0, 1).inOrder()
+    }
+
+    @Test
+    fun `a dragged addon goes where it was dropped`() = runTest {
+        server.enqueue(manifest("a", "A"))
+        server.enqueue(manifest("b", "B"))
+        server.enqueue(manifest("c", "C"))
+        repository.add("https://addons.test/a/manifest.json")
+        repository.add("https://addons.test/b/manifest.json")
+        repository.add("https://addons.test/c/manifest.json")
+        // The list now reads c, b, a.
+
+        repository.moveTo("a", 0)
+
+        assertThat(stored().map { it.id }).containsExactly("a", "c", "b").inOrder()
+        assertThat(stored().map { it.order }).containsExactly(0, 1, 2).inOrder()
+    }
+
+    @Test
+    fun `a reload brings in the addon's new settings and keeps its place`() = runTest {
+        server.enqueue(manifest("a", "A"))
+        server.enqueue(manifest("b", "B"))
+        repository.add("https://addons.test/a/manifest.json")
+        repository.add("https://addons.test/b/manifest.json")
+        // The list reads b, a.
+        // The manifest now declares a setting it did not declare before.
+        server.enqueue(
+            MockResponse().setBody(
+                """{"id":"a","name":"A","version":"2.0","resources":["search","stream"],
+                   "settings":[{"key":"quality","type":"select","default":"lossless",
+                                "options":[{"value":"lossless"},{"value":"hires"}]}]}""",
+            ),
+        )
+
+        val result = repository.reloadManifest("a")
+
+        assertThat(result.isSuccess).isTrue()
+        val reloaded = result.getOrThrow()
+        assertThat(reloaded.version).isEqualTo("2.0")
+        assertThat(reloaded.settingDefs.map { it.key }).containsExactly("quality")
+        assertThat(reloaded.settings["quality"]).isEqualTo("lossless")
+        // The place it had is its own: a reload is not an install.
+        assertThat(stored().map { it.id }).containsExactly("b", "a").inOrder()
+        assertThat(stored().map { it.order }).containsExactly(0, 1).inOrder()
+    }
+
+    @Test
+    fun `a reload keeps the user's own setting values`() = runTest {
+        server.enqueue(manifest("a", "A"))
+        repository.add("https://addons.test/a/manifest.json")
+        val withSettings = MockResponse().setBody(
+            """{"id":"a","name":"A","version":"1.0","resources":["search","stream"],
+               "settings":[{"key":"quality","type":"select","default":"lossless",
+                            "options":[{"value":"lossless"},{"value":"hires"}]}]}""",
+        )
+        server.enqueue(withSettings)
+        repository.reloadManifest("a")
+        repository.setSetting("a", "quality", "hires")
+
+        // The manifest comes back with the same setting, and the user's choice
+        // is still theirs.
+        server.enqueue(withSettings)
+        val reloaded = repository.reloadManifest("a").getOrThrow()
+
+        assertThat(reloaded.settings["quality"]).isEqualTo("hires")
+    }
+
+    @Test
+    fun `a reload of an addon that is not installed fails`() = runTest {
+        val result = repository.reloadManifest("nope")
+
+        assertThat((result.exceptionOrNull() as AddAddonException).error)
+            .isEqualTo(AddAddonError.NotInstalled)
+    }
+
+    @Test
+    fun `a reload of an addon that cannot be reached fails without changing anything`() = runTest {
+        server.enqueue(manifest("a", "A"))
+        repository.add("https://addons.test/a/manifest.json")
+        server.enqueue(MockResponse().setResponseCode(500))
+
+        val result = repository.reloadManifest("a")
+
+        assertThat((result.exceptionOrNull() as AddAddonException).error)
+            .isEqualTo(AddAddonError.Unreachable)
+        assertThat(stored().map { it.id }).containsExactly("a")
+        assertThat(stored().first().version).isEqualTo("1.0")
     }
 }

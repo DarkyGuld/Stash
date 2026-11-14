@@ -6,6 +6,7 @@ import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.gestures.ScrollableState
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -373,16 +374,36 @@ fun <K : Any> Modifier.reorderableRow(state: ReorderableColumnState<K>, key: K):
 /**
  * The drag handle of [key]'s row. Starts on touch, no long press, as the queue's does: during a long-press wait a sideways
  * twitch went elsewhere. A stolen pointer drops the row where it sits instead of snapping the drag back.
+ *
+ * With [longPress] the row follows the finger only after a long press: for a
+ * list whose rows carry their own buttons (a toggle, a delete), a drag that
+ * starts on the first touch is one accidental swipe away from moving the row.
  */
-fun <K : Any> Modifier.reorderHandle(state: ReorderableColumnState<K>, key: K): Modifier =
+fun <K : Any> Modifier.reorderHandle(
+    state: ReorderableColumnState<K>,
+    key: K,
+    longPress: Boolean = false,
+): Modifier =
     pointerInput(state, key) {
-        detectDragGestures(
-            onDragStart = { state.startDrag(key) },
-            onDrag = { change, amount ->
-                change.consume()
-                state.dragBy(amount.y)
-            },
-            onDragEnd = state::endDrag,
-            onDragCancel = state::endDrag,
-        )
+        if (longPress) {
+            detectDragGesturesAfterLongPress(
+                onDragStart = { state.startDrag(key) },
+                onDrag = { change, amount ->
+                    change.consume()
+                    state.dragBy(amount.y)
+                },
+                onDragEnd = state::endDrag,
+                onDragCancel = state::endDrag,
+            )
+        } else {
+            detectDragGestures(
+                onDragStart = { state.startDrag(key) },
+                onDrag = { change, amount ->
+                    change.consume()
+                    state.dragBy(amount.y)
+                },
+                onDragEnd = state::endDrag,
+                onDragCancel = state::endDrag,
+            )
+        }
     }

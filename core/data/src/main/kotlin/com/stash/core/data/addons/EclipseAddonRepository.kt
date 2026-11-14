@@ -27,6 +27,9 @@ sealed class AddAddonError {
 
     /** An addon with the same id or manifest URL is already installed. */
     data object Duplicate : AddAddonError()
+
+    /** The addon is not installed (nothing to reload). */
+    data object NotInstalled : AddAddonError()
 }
 
 /** [Result] failure carrying a typed [AddAddonError]. */
@@ -130,6 +133,59 @@ class EclipseAddonRepository @Inject constructor(
         addonsChanged()
     }
 
+    /**
+     * Fetches the addon's manifest again and updates what it declares.
+     *
+     * A reload brings in new settings without the user having to remove the
+     * addon and add it again - which would also lose its place in the list.
+     * So the place, the enabled state and the user's own setting values stay:
+     * only what the manifest declares is taken from the manifest. A setting
+     * the manifest no longer declares is dropped; a new one gets the
+     * manifest's default.
+     */
+    suspend fun reloadManifest(id: String): Result<EclipseAddon> {
+        val addon = prefs.addonsNow().firstOrNull { it.id == id }
+            ?: return failure(AddAddonError.NotInstalled)
+        val manifest = try {
+            client.fetchManifest(addon.manifestUrl)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: EclipseAddonException.InvalidResponse) {
+            return failure(AddAddonError.InvalidManifest)
+        } catch (e: EclipseAddonException) {
+            return failure(AddAddonError.Unreachable)
+        } catch (e: Exception) {
+            return failure(AddAddonError.Unreachable)
+        }
+        if (manifest.id.isBlank() || manifest.name.isBlank() || !manifest.supportsStash()) {
+            return failure(AddAddonError.InvalidManifest)
+        }
+        val updated = addon.copy(
+            name = manifest.name.trim(),
+            version = manifest.version.trim(),
+            resources = manifest.resources.map { it.lowercase() }.distinct(),
+            settingDefs = manifest.settingDefinitions,
+            settingOptions = manifest.settingOptions,
+            settings = mergedSettings(addon, manifest),
+        )
+        // The same id: the addon keeps its place in the list.
+        prefs.put(updated)
+        addonsChanged()
+        return Result.success(prefs.addonsNow().firstOrNull { it.id == id } ?: updated)
+    }
+
+    /**
+     * The settings after a manifest reload: the user's own values where the
+     * manifest still allows them, the manifest's defaults for the rest.
+     */
+    private fun mergedSettings(addon: EclipseAddon, manifest: EclipseAddonManifest): Map<String, String> {
+        val kept = addon.settings.filter { (key, value) ->
+            val def = manifest.settingDefinitions.firstOrNull { it.key == key } ?: return@filter false
+            def.allows(value)
+        }
+        return initialSettings(manifest) + kept
+    }
+
     suspend fun setEnabled(id: String, enabled: Boolean) {
         prefs.setEnabled(id, enabled)
         addonsChanged()
@@ -137,6 +193,14 @@ class EclipseAddonRepository @Inject constructor(
 
     suspend fun move(id: String, delta: Int) {
         prefs.move(id, delta)
+        addonsChanged()
+    }
+
+    /**
+     * Moves the addon [id] to [toIndex] in the list: the drag-and-drop's move.
+     */
+    suspend fun moveTo(id: String, toIndex: Int) {
+        prefs.moveTo(id, toIndex)
         addonsChanged()
     }
 
