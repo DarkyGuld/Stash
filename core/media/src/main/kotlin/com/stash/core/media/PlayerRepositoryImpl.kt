@@ -24,6 +24,10 @@ import com.stash.core.data.repository.MusicRepository
 import com.stash.core.media.diagnostics.PlaybackDiagnosticsLog
 import com.stash.core.media.service.StashPlaybackService
 import com.stash.core.media.streaming.ConnectivityMonitor
+import com.stash.core.media.streaming.EclipseAddonStreamResolver
+import com.stash.core.media.streaming.EclipseFirstChunkPrefetcher
+import com.stash.core.media.streaming.QualityUpgradePlayer
+import com.stash.core.media.streaming.QualityUpgradeWatcher
 import com.stash.core.media.streaming.StreamSourceRegistry
 import com.stash.core.media.streaming.StreamUrl
 import com.stash.core.media.streaming.StreamUrlCache
@@ -128,6 +132,12 @@ class PlayerRepositoryImpl @Inject constructor(
     // The ISRCs for the songs ahead, in one Spotify call when the queue is set.
     // Null in hand-built tests (no Spotify lookups then).
     private val isrcPrefetcher: com.stash.core.data.addons.SpotifyIsrcQueuePrefetcher? = null,
+    // The addon's resolver: the quiet quality upgrade asks it what it has now.
+    // Null in hand-built tests (no addon, no upgrade).
+    private val addonResolver: EclipseAddonStreamResolver? = null,
+    // The first-chunk prefetcher: the upgrade writes the better file's bytes
+    // into the player's own cache before it swaps. Null in hand-built tests.
+    private val firstChunkPrefetcher: EclipseFirstChunkPrefetcher? = null,
 ) : PlayerRepository {
 
     /**
@@ -161,8 +171,124 @@ class PlayerRepositoryImpl @Inject constructor(
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
+    /**
+     * The player's side of the quiet quality upgrade: where the song is, and
+     * how to swap the file under it without interrupting the song.
+     *
+     * The swap replaces the playing item in place - the queue keeps its shape
+     * and its order - and carries on at the position the song had reached.
+     */
+    private val qualityUpgradePlayer = object : QualityUpgradePlayer {
+        override fun currentTrackId(): Long? {
+            val controller = controllerDeferred ?: return null
+            val id = controller.currentMediaItem?.mediaMetadata?.extras?.getLong(EXTRA_TRACK_ID, 0L) ?: 0L
+            return id.takeIf { it != 0L }
+        }
+
+        override fun currentPositionMs(): Long = controllerDeferred?.currentPosition ?: 0L
+
+        override fun currentDurationMs(): Long = controllerDeferred?.duration ?: 0L
+
+        override fun currentStream(): StreamUrl? {
+            val trackId = currentTrackId() ?: return null
+            return streamUrlCache.get(trackId)
+        }
+
+        override fun swapTo(stream: StreamUrl, positionMs: Long) {
+            val controller = controllerDeferred ?: return
+            val index = controller.currentMediaItemIndex
+            if (index < 0) return
+            val item = controller.getMediaItemAt(index)
+            val extras = item.mediaMetadata.extras
+            val trackId = extras?.getLong(EXTRA_TRACK_ID, 0L) ?: 0L
+            // The badge reads the cache, and the player's media-source factory
+            // reads it to pick the cached source for the new file. Both need it
+            // BEFORE the item is replaced.
+            if (trackId != 0L) streamUrlCache.put(trackId, stream)
+            // A placeholder item resolves itself when it opens; it keeps its
+            // address and picks the new file up from the cache.
+            val uri = item.localConfiguration?.uri
+            val newUri = if (uri?.scheme == com.stash.core.media.streaming.STASH_RESOLVE_SCHEME) {
+                uri
+            } else {
+                Uri.parse(stream.url)
+            }
+            val upgraded = item.buildUpon()
+                .setUri(newUri)
+                .setMediaMetadata(
+                    item.mediaMetadata.buildUpon()
+                        .setExtras(Bundle(extras).apply {
+                            stream.codec?.let { putString(EXTRA_STREAM_CODEC, it) }
+                            stream.bitsPerSample?.let { putInt(EXTRA_STREAM_BIT_DEPTH, it) }
+                            stream.sampleRateHz?.let { putInt(EXTRA_STREAM_SAMPLE_RATE, it) }
+                            stream.bitrateKbps?.let { putInt(EXTRA_STREAM_BITRATE, it) }
+                            stream.origin?.let { putString(EXTRA_STREAM_ORIGIN, it) }
+                        })
+                        .build(),
+                )
+                .build()
+            replaceMediaItemKeepingShuffle(controller, index, upgraded)
+            // The new file starts at the position the old one had reached.
+            controller.seekTo(positionMs)
+            Log.i(TAG, "swapped track $trackId to the better file at ${positionMs}ms")
+        }
+    }
+
+    /**
+     * Watch a song that started below the goal, and swap in the better file
+     * when the addon has it.
+     *
+     * Only when there is room to improve: the addon aims at a tier, and a song
+     * already at that tier has nothing to gain from four more lookups.
+     */
+    private fun maybeWatchQuality(trackId: Long, stream: StreamUrl?) {
+        if (trackId == 0L || stream == null) return
+        // Judged already for this song: the watch is done, and a second one
+        // would only ask the same question again.
+        if (trackId == qualityJudgedTrackId) return
+        if (qualityWatches.containsKey(trackId)) return
+        val resolver = addonResolver ?: return
+        val prefetcher = firstChunkPrefetcher ?: return
+        qualityJudgedTrackId = trackId
+
+        val job = scope.launch {
+            val target = resolver.targetTier()
+            val wanted = target?.let { EclipseAddonStreamResolver.TIER_RANK[it] }
+            val current = stream.qualityTier?.trim()?.lowercase()
+                ?.let { EclipseAddonStreamResolver.TIER_RANK[it] }
+            if (wanted == null ||
+                (current != null && current >= wanted) ||
+                // No tier named and no lossless codec: the file is as good as
+                // the source gets, and there is nothing to wait for.
+                (current == null && stream.codec.equals("flac", ignoreCase = true))
+            ) {
+                qualityWatches.remove(trackId)
+                return@launch
+            }
+            Log.i(TAG, "watching track $trackId for a better file (now: ${stream.qualityTier ?: stream.codec})")
+            QualityUpgradeWatcher(
+                scope = scope,
+                player = qualityUpgradePlayer,
+                resolveFresh = { id ->
+                    trackDao.getById(id)?.let { resolver.resolveFresh(it) }
+                },
+                warmAround = { id, candidate, position, duration ->
+                    prefetcher.warmAround(id, candidate, position, duration)
+                },
+                onFinished = { id -> qualityWatches.remove(id) },
+            ).watch(trackId)
+        }
+        qualityWatches[trackId] = job
+    }
+
     /** One delayed same-item retry at a time; a newer retry supersedes the old one. */
     private var streamRetryJob: Job? = null
+
+    /** The tracks whose quality is being watched; one watch per track. */
+    private val qualityWatches = mutableMapOf<Long, Job>()
+
+    /** The track whose quality was judged; reset when another song starts. */
+    private var qualityJudgedTrackId: Long = 0L
 
     /** True while a Listen Together session owns the player; the transport gates (Next, Previous, play) read it. */
     private val inListenTogether: Boolean get() = listenTogether?.active?.value == true
@@ -3581,6 +3707,11 @@ class PlayerRepositoryImpl @Inject constructor(
             track.albumArtPath ?: currentArt
         }
 
+        // The song may have started on a reserve quality: the addon was still
+        // installing the file, or the chain fell through to a lossy fallback.
+        // A quiet watcher looks for the better file and swaps it in mid-song.
+        maybeWatchQuality(track.id, stream)
+
         return StreamRoutingResult.Item(
             MediaItem.Builder()
                 .setMediaId(track.id.toString())
@@ -3792,6 +3923,8 @@ class PlayerRepositoryImpl @Inject constructor(
 
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
             val controller = controllerDeferred ?: return
+            // Another song: its quality has to be judged on its own.
+            qualityJudgedTrackId = 0L
             // The radio song the user kept playing just ended and the station
             // advanced. The next song is the previous queue, not this one.
             if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO &&
@@ -4482,6 +4615,12 @@ class PlayerRepositoryImpl @Inject constructor(
         noteCurrentItem(controller, reason = null)
 
         val currentItem = controller.currentMediaItem
+        // A queue play learns what it got HERE: the song's file is resolved
+        // when the player opens it, and this is the first moment the file is
+        // known. A song that started below the goal gets a quiet watch.
+        currentItem?.mediaMetadata?.extras?.getLong(EXTRA_TRACK_ID, 0L)?.takeIf { it != 0L }?.let { id ->
+            maybeWatchQuality(id, streamUrlCache.get(id))
+        }
         // Badge from the live resolve, not from extras that may not have stuck.
         val track = currentItem?.toTrack()?.let { withLiveStreamQuality(it, currentItem) }
         // Timeline snapshot rebuilt only when the timeline actually changes

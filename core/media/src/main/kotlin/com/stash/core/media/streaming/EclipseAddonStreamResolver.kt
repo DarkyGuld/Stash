@@ -112,6 +112,39 @@ class EclipseAddonStreamResolver private constructor(
         resolveInternal(track, speculative, radio = false)
 
     /**
+     * The stream for this track, asked FRESH.
+     *
+     * The caches are bypassed on purpose: the point is to see what the addon
+     * has NOW, not what it had when the song started. The item id is fetched
+     * again too, because the file the addon serves is named by it - a better
+     * file is a better id, and the old id would keep naming the old file.
+     */
+    suspend fun resolveFresh(track: TrackEntity): StreamUrl? =
+        resolveInternal(track, speculative = false, radio = false, fresh = true)
+
+    /**
+     * The tier the enabled addons aim for: the best target among their quality
+     * settings. Null when no addon names a tier.
+     *
+     * It is the goal, not a promise: a track the addon has never heard of
+     * stays below it, and that is what the background upgrade is for.
+     */
+    suspend fun targetTier(): String? {
+        var best: String? = null
+        var bestRank = 0
+        for (addon in enabledAddons()) {
+            val wanted = addon.settings["quality"]?.trim()?.lowercase() ?: continue
+            if (wanted.isEmpty() || wanted == "max" || wanted == "auto" || wanted == "best") continue
+            val rank = TIER_RANK[wanted] ?: continue
+            if (rank > bestRank) {
+                bestRank = rank
+                best = wanted
+            }
+        }
+        return best
+    }
+
+    /**
      * Was this track's addon installing its file when we last asked?
      *
      * True means a fallback to another source was only standing in, and must
@@ -131,6 +164,8 @@ class EclipseAddonStreamResolver private constructor(
         track: TrackEntity,
         speculative: Boolean,
         radio: Boolean,
+        /** True for a fresh answer: the caches are bypassed. */
+        fresh: Boolean = false,
     ): StreamUrl? {
         val query = "${track.artist} ${track.title}".trim()
         if (query.isEmpty()) return null
@@ -140,14 +175,14 @@ class EclipseAddonStreamResolver private constructor(
         val addons = enabledAddons().let { list ->
             if (radio) list.sortedByDescending { it.isEclipseCloud } else list
         }
-        memoryCachedUrl(track, addons)?.let { return it }
+        if (!fresh) memoryCachedUrl(track, addons)?.let { return it }
         for (addon in addons) {
             // A transient failure just bought this addon a minute of silence.
             if (isCooling(addon)) continue
             try {
                 // Disk below memory: a resolved URL that outlived the process, while
                 // still valid and still from an enabled addon in this walk.
-                persistentUrl(addon, track)?.let { return it }
+                if (!fresh) persistentUrl(addon, track)?.let { return it }
                 if (addon.isEclipseCloud) {
                     // Cloud: Tidal and the Apple catalog are looked up together, so a
                     // Tidal miss does not pay the iTunes search latency.
@@ -157,7 +192,7 @@ class EclipseAddonStreamResolver private constructor(
 
                 // The item id is cached per addon + settings; a hit skips /resolve entirely.
                 val key = resolveCacheKey(addon, track)
-                resolveAndStream(addon, track, key, startedNs)?.let { return it }
+                resolveAndStream(addon, track, key, startedNs, fresh)?.let { return it }
 
                 // Only when the manifest advertised it: a resolve-only addon has no search.
                 // Strict identity addons never fall back to search: that fallback would
@@ -180,7 +215,7 @@ class EclipseAddonStreamResolver private constructor(
                             continue
                         }
                         val url = mapStream(streamWithRetry(addon, match.id)) ?: continue
-                        return served(addon, track, url, startedNs)
+                        return served(addon, track, url, startedNs, match.id)
                     }
                 }
             } catch (e: CancellationException) {
@@ -408,7 +443,7 @@ class EclipseAddonStreamResolver private constructor(
                 Log.d(TAG, "apple fast-path rejected ${hits.size} hit(s); falling back to best() -> $appleId")
             }
             val url = mapStream(streamAppleWithRetry(addon, appleId, isrcProvider))
-                ?.let { served(addon, track, it, startedNs) }
+                ?.let { served(addon, track, it, startedNs, appleId) }
                 ?: return null
             CloudRace(url) { rememberAppleId(addon, track, appleId) }
         } catch (e: CancellationException) {
@@ -432,7 +467,7 @@ class EclipseAddonStreamResolver private constructor(
         startedNs: Long,
     ): StreamUrl? =
         try {
-            mapStream(streamWithRetry(addon, itemId))?.let { served(addon, track, it, startedNs) }
+            mapStream(streamWithRetry(addon, itemId))?.let { served(addon, track, it, startedNs, itemId) }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -449,8 +484,10 @@ class EclipseAddonStreamResolver private constructor(
         track: TrackEntity,
         key: String,
         startedNs: Long,
+        /** True for a fresh answer: the id cache is bypassed. */
+        fresh: Boolean = false,
     ): StreamUrl? {
-        val itemId = cachedResolveId(addon, track, key) ?: return null
+        val itemId = cachedResolveId(addon, track, key, fresh = fresh) ?: return null
 
         // This phone's own TorBox account first. The addon named the file,
         // and the infohash is the same in every account in the world - so the
@@ -460,21 +497,21 @@ class EclipseAddonStreamResolver private constructor(
         localTorboxStream(addon, track, key)?.let { return served(addon, track, it, startedNs) }
 
         return try {
-            mapStream(streamWithRetry(addon, itemId))?.let { served(addon, track, it, startedNs) }
+            mapStream(streamWithRetry(addon, itemId))?.let { served(addon, track, it, startedNs, itemId) }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             if (!invalidatesResolve(e)) throw e
             resolveCache.invalidate(key)
             streamUrlStore?.remove(addon.id, settingsKey(addon), identityKey(track))
-            val fresh = resolveId(addon, track)
-            val freshId = fresh.id ?: run {
+            val again = resolveId(addon, track)
+            val freshId = again.id ?: run {
                 // A rights refusal or transient failure is not a catalog miss.
-                if (fresh.definitive) resolveCache.put(key, null)
+                if (again.definitive) resolveCache.put(key, null)
                 return null
             }
             resolveCache.put(key, freshId)
-            mapStream(streamWithRetry(addon, freshId))?.let { served(addon, track, it, startedNs) }
+            mapStream(streamWithRetry(addon, freshId))?.let { served(addon, track, it, startedNs, freshId) }
         }
     }
 
@@ -485,7 +522,21 @@ class EclipseAddonStreamResolver private constructor(
         key: String,
         missTtlMs: Long? = null,
         bypassNegative: Boolean = false,
+        /** True for a fresh answer: the cache is asked for nothing. */
+        fresh: Boolean = false,
     ): String? {
+        if (fresh) {
+            // The addon is asked again: the file it serves is named by the id,
+            // and a better file is a better id. The answer replaces the cached
+            // one, so the next play starts on it too.
+            val resolved = resolveId(addon, track)
+            when {
+                resolved.id != null -> resolveCache.put(key, resolved.id, torbox = resolved.torbox)
+                missTtlMs != null && resolved.definitive -> resolveCache.putMiss(key, missTtlMs)
+                missTtlMs == null && resolved.definitive -> resolveCache.put(key, null)
+            }
+            return resolved.id
+        }
         val cached = resolveCache.get(key)
         if (cached != null) {
             val id = cached.itemId
@@ -628,7 +679,7 @@ class EclipseAddonStreamResolver private constructor(
         }
         return try {
             mapStream(streamAppleWithRetry(addon, appleId, isrcProvider))
-                ?.let { served(addon, track, it, startedNs) }
+                ?.let { served(addon, track, it, startedNs, appleId) }
                 ?.also { rememberAppleId(addon, track, appleId) }
         } catch (e: CancellationException) {
             throw e
@@ -1014,7 +1065,8 @@ class EclipseAddonStreamResolver private constructor(
     ): StreamUrl? {
         val resolver = torboxLocal ?: return null
         val apiKey = addon.torboxApiKey?.trim()?.takeIf { it.isNotEmpty() } ?: return null
-        val file = resolveCache.get(key)?.torbox ?: return null
+        val entry = resolveCache.get(key) ?: return null
+        val file = entry.torbox ?: return null
         if (file.infohash.isBlank()) return null
 
         val url = resolver.resolve(file, track.title, apiKey) ?: return null
@@ -1026,7 +1078,7 @@ class EclipseAddonStreamResolver private constructor(
                 codec = if (lossless) "flac" else "aac",
                 quality = file.quality,
             ),
-        )
+        )?.copy(qualityTier = tierOf(entry.itemId))
     }
 
     /**
@@ -1073,6 +1125,8 @@ class EclipseAddonStreamResolver private constructor(
         track: TrackEntity,
         url: StreamUrl,
         startedNs: Long,
+        /** The item id the answer came in; it names the tier, when it names one. */
+        itemId: String? = null,
     ): StreamUrl {
         // Never log the URL: it carries the addon's signed token.
         val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000
@@ -1081,7 +1135,7 @@ class EclipseAddonStreamResolver private constructor(
         clearCooling(addon)
         // The listener-facing service label ("via <addon name>"): the base origin is
         // the prefix, the name follows it (StreamService.displayName).
-        val labelled = url.copy(origin = originFor(addon.name))
+        val labelled = url.copy(origin = originFor(addon.name), qualityTier = tierOf(itemId))
         // The addon served it: the file is ready, and the flag may go.
         preparingTracks.remove(track.id)
         // Both layers: the player's memory cache and the disk copy that survives restart.
@@ -1089,6 +1143,19 @@ class EclipseAddonStreamResolver private constructor(
         streamUrlStore?.put(addon.id, settingsKey(addon), identityKey(track), labelled)
         Log.i(TAG, "addon '${addon.name}' served ${track.id} '${track.title}' in $elapsedMs ms")
         return labelled
+    }
+
+    /**
+     * The tier an item id names.
+     *
+     * The ids a TorBox-backed addon gives look like "nb:<hash>:<tier>", where
+     * the tier is the same word the quality setting uses. Other ids (an Apple
+     * catalog id) name no tier, and that is fine: they are not lossless tiers.
+     */
+    private fun tierOf(itemId: String?): String? {
+        if (itemId.isNullOrBlank()) return null
+        val tier = itemId.substringAfterLast(':', "").lowercase()
+        return tier.takeIf { it in TIER_RANK }
     }
 
     /** The player's in-memory entry, but only when its addon is still enabled. */
@@ -1250,7 +1317,7 @@ class EclipseAddonStreamResolver private constructor(
          * The quality tiers, best first. The words are the ones the addon's
          * quality setting uses, so a setting and an id can be compared.
          */
-        private val TIER_RANK = mapOf(
+        internal val TIER_RANK = mapOf(
             "atmos" to 5,
             "hires" to 4,
             "lossless" to 3,

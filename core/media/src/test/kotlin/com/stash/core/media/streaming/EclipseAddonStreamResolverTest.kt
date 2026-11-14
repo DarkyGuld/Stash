@@ -1483,5 +1483,72 @@ class EclipseAddonStreamResolverTest {
         coVerify(exactly = 1) { repository.streamApple(any(), "6812560833", "FAKEISRC") }
     }
 
+    // ── the fresh answer and the target tier ───────────────────────────────
+
+    /**
+     * The quiet quality upgrade asks what the addon has NOW.
+     *
+     * The caches are bypassed: the file the addon serves is named by the item
+     * id, so a better file is a better id - and the cached id would keep
+     * naming the old file.
+     */
+    @Test
+    fun `a fresh resolve asks the addon again`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val addon = addon("nullbeat", resources = listOf("stream", "resolve"))
+        coEvery { repository.enabledNow() } returns listOf(addon)
+        coEvery { repository.resolve(addon, any(), any(), any(), any()) } returns
+            EclipseAddonTrack(id = "nb:0123456789abcdef0123456789abcdef:lossless")
+        coEvery { repository.stream(addon, "nb:0123456789abcdef0123456789abcdef:lossless") } returns
+            stream(quality = "HiFi CD", format = "flac", codec = "flac")
+
+        val resolver = EclipseAddonStreamResolver(repository)
+        val first = resolver.resolve(track())
+        val second = resolver.resolveFresh(track())
+
+        assertThat(first).isNotNull()
+        assertThat(second).isNotNull()
+        // Twice: the fresh answer does not trust the cached id.
+        coVerify(exactly = 2) { repository.resolve(addon, any(), any(), any(), any()) }
+    }
+
+    /** The tier the file came in is the truth about which release it is. */
+    @Test
+    fun `the served stream names the tier its item id names`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val addon = addon("nullbeat", resources = listOf("stream", "resolve"))
+        coEvery { repository.enabledNow() } returns listOf(addon)
+        coEvery { repository.resolve(addon, any(), any(), any(), any()) } returns
+            EclipseAddonTrack(id = "nb:0123456789abcdef0123456789abcdef:high")
+        coEvery { repository.stream(addon, "nb:0123456789abcdef0123456789abcdef:high") } returns
+            stream(quality = "320kbps", format = "m4a", codec = "aac")
+
+        val result = EclipseAddonStreamResolver(repository).resolve(track())
+
+        assertThat(result?.qualityTier).isEqualTo("high")
+        assertThat(result?.codec).isEqualTo("aac")
+    }
+
+    /** The goal: the best tier the enabled addons ask for. */
+    @Test
+    fun `the target tier is the best one the addons ask for`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val lossy = addon("a", resources = listOf("stream", "resolve"), settings = mapOf("quality" to "high"))
+        val lossless = addon("b", resources = listOf("stream", "resolve"), settings = mapOf("quality" to "lossless"))
+        coEvery { repository.enabledNow() } returns listOf(lossy, lossless)
+
+        assertThat(EclipseAddonStreamResolver(repository).targetTier()).isEqualTo("lossless")
+    }
+
+    /** "max" asks for no particular tier: there is no goal to name. */
+    @Test
+    fun `a max setting names no target tier`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val addon = addon("a", resources = listOf("stream", "resolve"), settings = mapOf("quality" to "max"))
+        coEvery { repository.enabledNow() } returns listOf(addon)
+
+        assertThat(EclipseAddonStreamResolver(repository).targetTier()).isNull()
+    }
+
     private fun track() = TrackEntity(title = "Blinding Lights", artist = "The Weeknd", durationMs = 200_000)
 }

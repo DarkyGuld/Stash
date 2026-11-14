@@ -61,6 +61,14 @@ data class StreamUrl(
     val isDash: Boolean = false,
     val isHls: Boolean = false,
     val isPreview: Boolean = false,
+    /**
+     * The quality tier the source named for this file ("hires", "lossless",
+     * "high", "low") — the same word the addon's quality setting uses.
+     *
+     * It is the truth when it is there: it says which release the file IS,
+     * not merely that it is lossless. Null for the sources that name no tier.
+     */
+    val qualityTier: String? = null,
 )
 
 /**
