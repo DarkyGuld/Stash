@@ -230,6 +230,10 @@ class PlayerRepositoryImpl @Inject constructor(
             replaceMediaItemKeepingShuffle(controller, index, upgraded)
             // The new file starts at the position the old one had reached.
             controller.seekTo(positionMs)
+            // The badge reads the live stream, so it has to be published now:
+            // the state refresh that would carry it comes with the next
+            // player event, and that can be a quarter of a second away.
+            updateState(controller)
             Log.i(TAG, "swapped track $trackId to the better file at ${positionMs}ms")
         }
     }

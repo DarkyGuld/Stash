@@ -594,13 +594,112 @@ class EclipseAddonStreamResolverTest {
         coVerify(exactly = 2) { repository.resolve(addon, any(), any(), any(), any()) }
     }
 
+    /**
+     * "max" asks for the best, so a cached id that names anything below the
+     * top tier is a reserve: the addon is asked again, because it may have
+     * the FLAC now.
+     */
     @Test
-    fun `a cached id is trusted when the setting asks for no particular tier`() = runTest {
+    fun `a cached id below the best tier is asked again, even with a max setting`() = runTest {
         val repository: EclipseAddonRepository = mockk()
         val addon = resolveOnly().copy(settings = mapOf("quality" to "max"))
         coEvery { repository.enabledNow() } returns listOf(addon)
         coEvery { repository.resolve(addon, any(), any(), any(), any()) } returns
             EclipseAddonTrack(id = "nb:abc:high")
+        coEvery { repository.stream(addon, any()) } returns stream()
+        val resolver = cachedResolver(repository)
+
+        resolver.resolve(track())
+        resolver.resolve(track())
+
+        coVerify(exactly = 2) { repository.resolve(addon, any(), any(), any(), any()) }
+    }
+
+    /**
+     * A cached FILE below the target is a reserve too.
+     *
+     * The player's memory cache holds the AAC file the addon served an hour
+     * ago. The addon has the FLAC now, and the cached file must not be
+     * served: the addon is asked again, and the FLAC comes back.
+     */
+    @Test
+    fun `a cached file below the target is not served from the cache`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val addon = resolveOnly().copy(settings = mapOf("quality" to "max"))
+        coEvery { repository.enabledNow() } returns listOf(addon)
+        coEvery { repository.resolve(addon, any(), any(), any(), any()) } returns
+            EclipseAddonTrack(id = "nb:abc:lossless")
+        coEvery { repository.stream(addon, "nb:abc:lossless") } returns
+            stream(quality = "HiFi CD", format = "flac", codec = "flac")
+        val urlCache = StreamUrlCache()
+        // The old file: AAC 320, from an hour ago.
+        urlCache.put(
+            track().id,
+            StreamUrl(
+                url = "https://cdn.test/old.m4a",
+                expiresAtMs = Long.MAX_VALUE,
+                codec = "aac",
+                bitrateKbps = 320,
+                origin = "addon:cloud",
+                qualityTier = "high",
+            ),
+        )
+        val resolver = EclipseAddonStreamResolver.forTest(
+            repository,
+            EclipseAddonResolveCache(),
+            urlCache = urlCache,
+        )
+
+        val result = resolver.resolve(track())
+
+        // The FLAC, not the cached AAC.
+        assertThat(result?.codec).isEqualTo("flac")
+        assertThat(result?.qualityTier).isEqualTo("lossless")
+        // And the addon was asked: the cache did not answer.
+        coVerify(exactly = 1) { repository.resolve(addon, any(), any(), any(), any()) }
+    }
+
+    /** A cached file at the target is served: the addon has nothing better. */
+    @Test
+    fun `a cached file at the target is served from the cache`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val addon = resolveOnly().copy(settings = mapOf("quality" to "max"))
+        coEvery { repository.enabledNow() } returns listOf(addon)
+        coEvery { repository.resolve(addon, any(), any(), any(), any()) } returns
+            EclipseAddonTrack(id = "nb:abc:hires")
+        coEvery { repository.stream(addon, "nb:abc:hires") } returns stream()
+        val urlCache = StreamUrlCache()
+        urlCache.put(
+            track().id,
+            StreamUrl(
+                url = "https://cdn.test/hires.flac",
+                expiresAtMs = Long.MAX_VALUE,
+                codec = "flac",
+                origin = "addon:cloud",
+                qualityTier = "hires",
+            ),
+        )
+        val resolver = EclipseAddonStreamResolver.forTest(
+            repository,
+            EclipseAddonResolveCache(),
+            urlCache = urlCache,
+        )
+
+        val result = resolver.resolve(track())
+
+        assertThat(result?.url).isEqualTo("https://cdn.test/hires.flac")
+        // The addon was not asked: the cache had the file.
+        coVerify(exactly = 0) { repository.resolve(addon, any(), any(), any(), any()) }
+    }
+
+    /** A cached id at the target is trusted: the addon has nothing better. */
+    @Test
+    fun `a cached id at the target is trusted`() = runTest {
+        val repository: EclipseAddonRepository = mockk()
+        val addon = resolveOnly().copy(settings = mapOf("quality" to "max"))
+        coEvery { repository.enabledNow() } returns listOf(addon)
+        coEvery { repository.resolve(addon, any(), any(), any(), any()) } returns
+            EclipseAddonTrack(id = "nb:abc:hires")
         coEvery { repository.stream(addon, any()) } returns stream()
         val resolver = cachedResolver(repository)
 

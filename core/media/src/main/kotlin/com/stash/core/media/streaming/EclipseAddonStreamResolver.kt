@@ -184,14 +184,17 @@ class EclipseAddonStreamResolver private constructor(
         val addons = enabledAddons().let { list ->
             if (radio) list.sortedByDescending { it.isEclipseCloud } else list
         }
-        if (!fresh) memoryCachedUrl(track, addons)?.let { return it }
+        // What the addons aim for. A file below it is a reserve: it is never
+        // served from the cache, because the addon may have a better one now.
+        val targetRank = targetTierRank(addons)
+        if (!fresh) memoryCachedUrl(track, addons, targetRank)?.let { return it }
         for (addon in addons) {
             // A transient failure just bought this addon a minute of silence.
             if (isCooling(addon)) continue
             try {
                 // Disk below memory: a resolved URL that outlived the process, while
                 // still valid and still from an enabled addon in this walk.
-                if (!fresh) persistentUrl(addon, track)?.let { return it }
+                if (!fresh) persistentUrl(addon, track, targetRank)?.let { return it }
                 if (addon.isEclipseCloud) {
                     // Cloud: Tidal and the Apple catalog are looked up together, so a
                     // Tidal miss does not pay the iTunes search latency.
@@ -255,7 +258,9 @@ class EclipseAddonStreamResolver private constructor(
                 }
             }
         }
-        return null
+        // The addon could not answer. A file it served before is better than
+        // no file at all - as long as its addon is still enabled.
+        return enabledCachedUrl(track, addons)
     }
 
     /**
@@ -1099,12 +1104,48 @@ class EclipseAddonStreamResolver private constructor(
      * nothing is below it.
      */
     private fun belowPreferredTier(addon: EclipseAddon, id: String): Boolean {
-        val preferred = addon.settings["quality"]?.trim()?.lowercase() ?: return false
-        if (preferred.isEmpty() || preferred == "max" || preferred == "auto" || preferred == "best") return false
-        val wanted = TIER_RANK[preferred] ?: return false
+        val wanted = targetTierRank(addon)
+        if (wanted <= 0) return false
         val tier = id.substringAfterLast(':', "").lowercase()
         val have = TIER_RANK[tier] ?: return false
         return have < wanted
+    }
+
+    /**
+     * The tier an addon's quality setting aims for, as a rank.
+     *
+     * A named tier is the target. "max" names no tier of its own - it asks
+     * for the best - so the target is the best tier there is: anything below
+     * it is a reserve, and the addon may well have a better file now.
+     *
+     * Zero when the addon names no tier at all: then nothing is below it.
+     */
+    private fun targetTierRank(addon: EclipseAddon): Int {
+        val preferred = addon.settings["quality"]?.trim()?.lowercase() ?: return 0
+        if (preferred.isEmpty()) return 0
+        if (preferred == "max" || preferred == "auto" || preferred == "best") {
+            return TIER_RANK[BEST_TIER] ?: 0
+        }
+        return TIER_RANK[preferred] ?: 0
+    }
+
+    /**
+     * The best target among the enabled addons, as a rank.
+     */
+    private fun targetTierRank(addons: List<EclipseAddon>): Int =
+        addons.filter { it.enabled }.maxOfOrNull { targetTierRank(it) } ?: 0
+
+    /**
+     * Is this cached file a reserve - below what the addons aim for?
+     *
+     * Such a file must never be served from the cache: the addon may have a
+     * better one now, and the cached one would keep the track in AAC for
+     * ever. The addon is asked again instead.
+     */
+    private fun belowTargetTier(url: StreamUrl, targetRank: Int): Boolean {
+        if (targetRank <= 0) return false
+        val have = TIER_RANK[url.qualityTier?.trim()?.lowercase()] ?: return false
+        return have < targetRank
     }
 
     /**
@@ -1167,8 +1208,38 @@ class EclipseAddonStreamResolver private constructor(
         return tier.takeIf { it in TIER_RANK }
     }
 
-    /** The player's in-memory entry, but only when its addon is still enabled. */
-    private fun memoryCachedUrl(track: TrackEntity, addons: List<EclipseAddon>): StreamUrl? {
+    /**
+     * The player's in-memory entry, but only when its addon is still enabled
+     * and the file is not a reserve.
+     */
+    private fun memoryCachedUrl(
+        track: TrackEntity,
+        addons: List<EclipseAddon>,
+        targetRank: Int,
+    ): StreamUrl? {
+        val url = enabledCachedUrl(track, addons) ?: return null
+        if (belowTargetTier(url, targetRank)) {
+            // The cached file is below what the addons aim for. The addon may
+            // have a better one now, so this one is not served - the addon is
+            // asked again below.
+            Log.i(
+                TAG,
+                "the cached file for ${track.id} is ${url.qualityTier ?: url.codec}: " +
+                    "below the target, so the addon is asked again",
+            )
+            urlCache?.invalidate(track.id)
+            return null
+        }
+        return url
+    }
+
+    /**
+     * The cached file of an addon that is still enabled - a reserve too.
+     *
+     * It is the fallback when the addon cannot answer at all: a stale file is
+     * better than no file, as long as the addon is still enabled.
+     */
+    private fun enabledCachedUrl(track: TrackEntity, addons: List<EclipseAddon>): StreamUrl? {
         val url = urlCache?.get(track.id) ?: return null
         val origin = url.origin ?: return url
         if (!origin.startsWith("${ORIGIN}:")) return url
@@ -1176,10 +1247,26 @@ class EclipseAddonStreamResolver private constructor(
         return url.takeIf { cached -> addons.any { it.enabled && it.name == name } }
     }
 
-    /** A still-valid URL from the disk store, promoted to the player's memory cache. */
-    private suspend fun persistentUrl(addon: EclipseAddon, track: TrackEntity): StreamUrl? {
+    /**
+     * A still-valid URL from the disk store, promoted to the player's memory
+     * cache - unless it is a reserve.
+     */
+    private suspend fun persistentUrl(
+        addon: EclipseAddon,
+        track: TrackEntity,
+        targetRank: Int,
+    ): StreamUrl? {
         val store = streamUrlStore ?: return null
         val url = store.get(addon.id, settingsKey(addon), identityKey(track)) ?: return null
+        if (belowTargetTier(url, targetRank)) {
+            Log.i(
+                TAG,
+                "the disk file for ${track.id} is ${url.qualityTier ?: url.codec}: below the target, " +
+                    "so the addon is asked again",
+            )
+            store.remove(addon.id, settingsKey(addon), identityKey(track))
+            return null
+        }
         Log.i(TAG, "addon '${addon.name}' stream URL for ${track.id} from disk cache")
         urlCache?.put(track.id, url)
         return url
