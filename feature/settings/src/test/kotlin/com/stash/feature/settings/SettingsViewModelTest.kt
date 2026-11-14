@@ -179,12 +179,24 @@ class SettingsViewModelTest {
     @Test fun `clearing the stream cache clears every layer and refreshes the size`() = runTest {
         val vm = newVm()
         vm.refreshStreamCacheSize()
+        // The size is read on the IO dispatcher, so the test waits for the
+        // answer in real time: a virtual delay would jump straight past the
+        // read and the assertion would race it.
+        awaitStreamCacheBytes(vm, 3_500L)
         assertThat(vm.streamCacheBytes.value).isEqualTo(3_500L)
 
         vm.onClearStreamCache()
         advanceUntilIdle()
 
         coVerify(exactly = 1) { streamCacheMaintenance.clearAll() }
+    }
+
+    /** Waits, in real time, for the stream cache size to land. */
+    private fun awaitStreamCacheBytes(vm: SettingsViewModel, expected: Long) {
+        val deadline = System.currentTimeMillis() + 5_000
+        while (vm.streamCacheBytes.value != expected && System.currentTimeMillis() < deadline) {
+            Thread.sleep(10)
+        }
     }
 
     @Test fun `changing the cache size persists it and retunes the live evictor`() = runTest {
