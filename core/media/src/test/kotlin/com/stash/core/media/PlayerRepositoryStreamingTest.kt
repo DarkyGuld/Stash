@@ -500,4 +500,60 @@ class PlayerRepositoryStreamingTest {
         isDownloaded = false,
         isStreamable = true,
     )
+
+    /**
+     * The badge follows the file the player is on.
+     *
+     * The quiet quality upgrade swaps the file mid-song: the item's extras
+     * still carry the codec of the file that was replaced (they do not
+     * survive the session round trip), so the badge has to read the live
+     * stream - the cache - and not the leftovers.
+     */
+    @Test
+    fun `the badge follows the live stream even when the item still carries the old codec`() {
+        val trackId = 1L
+        every { streamUrlCache.get(trackId) } returns StreamUrl(
+            url = "https://cdn.test/cd.flac",
+            expiresAtMs = Long.MAX_VALUE,
+            codec = "flac",
+            origin = "addon:NullBeat Cache",
+        )
+        val item = androidx.media3.common.MediaItem.Builder()
+            .setMediaId(trackId.toString())
+            .setMediaMetadata(
+                androidx.media3.common.MediaMetadata.Builder()
+                    .setExtras(
+                        android.os.Bundle().apply {
+                            putLong(
+                                com.stash.core.media.service.StashPlaybackService.Companion.EXTRA_TRACK_ID,
+                                trackId,
+                            )
+                            putString(
+                                com.stash.core.media.service.StashPlaybackService.Companion.EXTRA_STREAM_CODEC,
+                                "aac",
+                            )
+                            putString(
+                                com.stash.core.media.service.StashPlaybackService.Companion.EXTRA_STREAM_ORIGIN,
+                                "addon:NullBeat Cache",
+                            )
+                        },
+                    )
+                    .build(),
+            )
+            .build()
+        val track = com.stash.core.model.Track(
+            id = trackId,
+            title = "This Girl",
+            artist = "Kungs",
+            album = "",
+            fileFormat = "aac",
+            qualityKbps = 320,
+            streamOrigin = "addon:NullBeat Cache",
+        )
+
+        val badge = repo.withLiveStreamQuality(track, item)
+
+        assertThat(badge.fileFormat).isEqualTo("flac")
+        assertThat(badge.streamOrigin).isEqualTo("addon:NullBeat Cache")
+    }
 }

@@ -1540,14 +1540,20 @@ class EclipseAddonStreamResolverTest {
         assertThat(EclipseAddonStreamResolver(repository).targetTier()).isEqualTo("lossless")
     }
 
-    /** "max" asks for no particular tier: there is no goal to name. */
+    /**
+     * "max" asks for the best there is, so it names a tier: the best one.
+     *
+     * A track that plays in AAC 320 has the FLAC to gain, and the watcher
+     * has to know that it is worth looking for it.
+     */
     @Test
-    fun `a max setting names no target tier`() = runTest {
+    fun `a max setting names the best tier as the target`() = runTest {
         val repository: EclipseAddonRepository = mockk()
         val addon = addon("a", resources = listOf("stream", "resolve"), settings = mapOf("quality" to "max"))
         coEvery { repository.enabledNow() } returns listOf(addon)
 
-        assertThat(EclipseAddonStreamResolver(repository).targetTier()).isNull()
+        assertThat(EclipseAddonStreamResolver(repository).targetTier())
+            .isEqualTo(EclipseAddonStreamResolver.BEST_TIER)
     }
 
     private fun track() = TrackEntity(title = "Blinding Lights", artist = "The Weeknd", durationMs = 200_000)

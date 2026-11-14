@@ -4579,14 +4579,18 @@ class PlayerRepositoryImpl @Inject constructor(
      * round-trip sticks. Cheap: one LRU lookup per state refresh, and it
      * short-circuits the moment the extras DO carry an origin.
      */
-    private fun withLiveStreamQuality(track: Track, item: MediaItem?): Track {
+    internal fun withLiveStreamQuality(track: Track, item: MediaItem?): Track {
         if (item?.localConfiguration?.uri?.scheme in listOf("file", "content")) return track
-        if (track.streamOrigin != null && track.streamOrigin != "soundcloud") return track
         val trackId = item?.mediaMetadata?.extras?.getLong(EXTRA_TRACK_ID, 0L) ?: 0L
         if (trackId == 0L) return track
         // A downloaded row has no cache entry and must keep Room's truth — its
         // codec comes from the file on disk, which is more authoritative than
         // anything a resolver reported.
+        //
+        // The cache is the LIVE stream, and it wins over the extras: a file
+        // that was swapped mid-song (the quiet quality upgrade) leaves the
+        // old codec behind in the extras, and the badge has to follow the
+        // file the player is on.
         val stream = streamUrlCache.get(trackId) ?: return track
         return track.copy(
             fileFormat = stream.codec ?: track.fileFormat,
@@ -4619,7 +4623,9 @@ class PlayerRepositoryImpl @Inject constructor(
         // when the player opens it, and this is the first moment the file is
         // known. A song that started below the goal gets a quiet watch.
         currentItem?.mediaMetadata?.extras?.getLong(EXTRA_TRACK_ID, 0L)?.takeIf { it != 0L }?.let { id ->
-            maybeWatchQuality(id, streamUrlCache.get(id))
+            // Only when the song changed: the state refreshes many times a
+            // second, and the judgement happens once per song.
+            if (id != qualityJudgedTrackId) maybeWatchQuality(id, streamUrlCache.get(id))
         }
         // Badge from the live resolve, not from extras that may not have stuck.
         val track = currentItem?.toTrack()?.let { withLiveStreamQuality(it, currentItem) }

@@ -126,6 +126,10 @@ class EclipseAddonStreamResolver private constructor(
      * The tier the enabled addons aim for: the best target among their quality
      * settings. Null when no addon names a tier.
      *
+     * "max" names no tier of its own - it asks for the best - so the target
+     * is the best tier there is. A track that plays in AAC 320 has the FLAC
+     * to gain, and the watcher has to know that it is worth looking.
+     *
      * It is the goal, not a promise: a track the addon has never heard of
      * stays below it, and that is what the background upgrade is for.
      */
@@ -134,11 +138,16 @@ class EclipseAddonStreamResolver private constructor(
         var bestRank = 0
         for (addon in enabledAddons()) {
             val wanted = addon.settings["quality"]?.trim()?.lowercase() ?: continue
-            if (wanted.isEmpty() || wanted == "max" || wanted == "auto" || wanted == "best") continue
-            val rank = TIER_RANK[wanted] ?: continue
+            val tier = if (wanted.isEmpty() || wanted == "max" || wanted == "auto" || wanted == "best") {
+                BEST_TIER
+            } else {
+                if (TIER_RANK[wanted] == null) continue
+                wanted
+            }
+            val rank = TIER_RANK[tier] ?: continue
             if (rank > bestRank) {
                 bestRank = rank
-                best = wanted
+                best = tier
             }
         }
         return best
@@ -1324,6 +1333,14 @@ class EclipseAddonStreamResolver private constructor(
             "high" to 2,
             "low" to 1,
         )
+
+        /**
+         * The best tier there is.
+         *
+         * What a "max" quality setting asks for: the top of the ladder,
+         * Dolby Atmos aside (that one is a setting of its own).
+         */
+        internal const val BEST_TIER = "hires"
 
         /** Three credit variants at most: full, cleaned title/primary artist, full title/primary artist. */
         private const val SEARCH_VARIANT_LIMIT = 3
