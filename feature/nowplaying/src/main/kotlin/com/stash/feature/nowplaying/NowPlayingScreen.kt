@@ -1223,6 +1223,19 @@ fun NowPlayingScreen(
                         onReact = if (room != null) together::react else null,
                         canSkip = !isListener,
                     )
+
+                    // The addon is installing this release. Say so: the wait is
+                    // short, but silence reads as a hang.
+                    if (uiState.isPreparingAddon) {
+                        Text(
+                            text = androidx.compose.ui.res.stringResource(R.string.np_preparing),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = npInk(),
+                            modifier = Modifier
+                                .align(Alignment.CenterHorizontally)
+                                .padding(top = 8.dp),
+                        )
+                    }
                 }
             }
 

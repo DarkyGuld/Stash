@@ -2481,6 +2481,21 @@ interface TrackDao {
     suspend fun tracksMissingIsrc(limit: Int): List<TrackEntity>
 
     /**
+     * Spotify-backed rows that are in a playlist and still missing an ISRC.
+     *
+     * The songs in a playlist are the ones the user actually plays, so they
+     * come first: the worker spends its quota where it is worth something.
+     */
+    @Query(
+        "SELECT t.* FROM tracks t " +
+            "WHERE t.spotify_uri IS NOT NULL AND t.spotify_uri != '' " +
+            "AND (t.isrc IS NULL OR t.isrc = '') " +
+            "AND EXISTS (SELECT 1 FROM playlist_tracks pt WHERE pt.track_id = t.id) " +
+            "GROUP BY t.id ORDER BY t.id LIMIT :limit",
+    )
+    suspend fun tracksMissingIsrcInPlaylists(limit: Int): List<TrackEntity>
+
+    /**
      * Set the cached canonical ATV/OMV video id for this track. Called once
      * per track by [com.stash.core.data.youtube.YtCanonicalResolver] when it
      * resolves a non-ATV/OMV track via InnerTube search. Never re-runs —

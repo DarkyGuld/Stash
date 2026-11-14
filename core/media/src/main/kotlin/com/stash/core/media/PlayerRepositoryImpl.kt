@@ -125,6 +125,9 @@ class PlayerRepositoryImpl @Inject constructor(
     // Remote v2 (spec 2026-11-03 §2.3): while a linked browser plays the queue, this phone resolves nothing it won't play.
     // Null in hand-built tests (never a browser).
     private val browserOutputs: com.stash.core.media.cast.BrowserOutputs? = null,
+    // The ISRCs for the songs ahead, in one Spotify call when the queue is set.
+    // Null in hand-built tests (no Spotify lookups then).
+    private val isrcPrefetcher: com.stash.core.data.addons.SpotifyIsrcQueuePrefetcher? = null,
 ) : PlayerRepository {
 
     /**
@@ -1102,6 +1105,19 @@ class PlayerRepositoryImpl @Inject constructor(
         // (the placeholder path is the cold-jump fallback, not the happy path).
         // Not for a paused restore: nothing resolves until the user presses play.
         if (play) scope.launch { prefetchNextTrack() }
+
+        // The ISRCs for the songs ahead, in one Spotify call. An addon that
+        // is asked to resolve a track by ISRC matches the recording itself;
+        // without one it has to match on title and artist, and a remix can
+        // slip through. This is metadata only - nothing is downloaded.
+        //
+        // Not when a browser plays the queue: that phone resolves its own
+        // songs and has no use for ours.
+        if (!playsOnBrowser) {
+            isrcPrefetcher?.let { prefetcher ->
+                scope.launch { prefetcher.prefetch(built.queueTracks) }
+            }
+        }
     }
 
     override suspend fun restoreHandoff(plan: com.stash.core.media.handoff.HandoffQueuePlan): Boolean {

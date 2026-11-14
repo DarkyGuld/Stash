@@ -37,7 +37,11 @@ class SpotifyIsrcBackfillWorker @AssistedInject constructor(
             runCatching { enqueue(applicationContext, delayMs = RESCHEDULE_MS) }
             return Result.success()
         }
-        val rows = runCatching { trackDao.tracksMissingIsrc(BATCH_LIMIT) }.getOrElse {
+        val rows = runCatching {
+            // The songs in a playlist first: those are the ones the user plays.
+            val inPlaylists = trackDao.tracksMissingIsrcInPlaylists(BATCH_LIMIT)
+            if (inPlaylists.isNotEmpty()) inPlaylists else trackDao.tracksMissingIsrc(BATCH_LIMIT)
+        }.getOrElse {
             Log.w(TAG, "ISRC backfill query failed", it)
             return Result.retry()
         }
@@ -93,10 +97,12 @@ class SpotifyIsrcBackfillWorker @AssistedInject constructor(
 
     companion object {
         private const val TAG = "SpotifyIsrcBackfill"
-        private const val BATCH_LIMIT = 200
+        /** Rows per run. 500 rows is 10 Spotify calls. */
+        private const val BATCH_LIMIT = 500
         private const val SPOTIFY_BATCH = 50
         private const val STEP_MS = 500L
-        private const val RESCHEDULE_MS = 30 * 60_000L
+        /** How soon the next run starts. The queue prefetch covers the songs ahead. */
+        private const val RESCHEDULE_MS = 5 * 60_000L
         private const val WORK = "spotify-isrc-backfill"
 
         /** Unmetered + charging + idle, delayed so startup/first play is never competing. */

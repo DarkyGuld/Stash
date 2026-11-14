@@ -1,5 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- The addon is installing this release (it answered 503 "preparing"). The wait is short,
+         but silence reads as a hang, so the player says what is going on. -->
+    <string name="np_preparing">forbereder…</string>
+
     <!-- Streaming quality sheet (⋮ › Streaming quality, #716). The rows say exactly what
          Settings › Audio & Quality says for the same switches, so the two read as one setting. -->
     <string name="np_quality_title">Streaming quality</string>

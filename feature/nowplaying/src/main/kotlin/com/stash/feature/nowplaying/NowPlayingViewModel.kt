@@ -129,6 +129,10 @@ class NowPlayingViewModel @Inject constructor(
     // Data saver: the back cover / inside pages / Discogs look-up waits for Wi-Fi. Tests leave the
     // default, which never applies.
     private val dataSaver: com.stash.core.data.prefs.DataSaver = com.stash.core.data.prefs.DataSaver.Off,
+    // "The addon is preparing this song": the player's hint while it waits. Tests leave the
+    // default, which never prepares anything.
+    private val addonPreparing: com.stash.core.media.streaming.AddonPreparingState =
+        com.stash.core.media.streaming.AddonPreparingState(),
     // Spotify Canvas (experimental): the data layer's resolver, and the Wi-Fi/power gates. Tests
     // leave the defaults, which find no Canvas and never touch the network.
     private val canvasVideoResolver: com.stash.feature.nowplaying.canvas.CanvasVideoResolver =
@@ -1175,6 +1179,13 @@ class NowPlayingViewModel @Inject constructor(
                 )
             }
         }.launchIn(viewModelScope)
+
+        // The addon's own "preparing" answer, for the hint under the spinner.
+        viewModelScope.launch {
+            addonPreparing.preparing.collect { preparing ->
+                _uiState.update { it.copy(isPreparingAddon = preparing) }
+            }
+        }
     }
 
     /** The bounded look-ahead for the adjacent songs' Canvases; cancelled whenever the request changes. */

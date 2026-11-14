@@ -28,6 +28,11 @@ data class NowPlayingUiState(
     val repeatMode: RepeatMode = RepeatMode.OFF,
     val isBuffering: Boolean = false,
     /**
+     * An addon is preparing this song (it answered 503 "preparing"). The player
+     * says so, because the wait is real and silence reads as a hang.
+     */
+    val isPreparingAddon: Boolean = false,
+    /**
      * The player means to play (see [com.stash.core.model.PlayerState.playWhenReady]): true
      * through buffering, where [isPlaying] is false. The play/pause toggle and its icon key on
      * this, so a stalled stream can always be paused.

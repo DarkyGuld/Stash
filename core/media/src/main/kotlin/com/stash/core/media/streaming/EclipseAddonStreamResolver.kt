@@ -53,6 +53,8 @@ class EclipseAddonStreamResolver private constructor(
     private val isrcEnricher: EclipseIsrcEnricher?,
     /** Account changes invalidate session-only Apple dead ids; null in hand-built tests. */
     private val account: EclipseAccountManager?,
+    /** "The addon is preparing this song", for the player's hint. Null in hand-built tests. */
+    private val preparingState: AddonPreparingState?,
 ) {
     /** Apple ids that 404'd at every tier this session: never request them again. */
     private val deadAppleIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
@@ -77,6 +79,7 @@ class EclipseAddonStreamResolver private constructor(
         streamUrlStore: EclipseStreamUrlStore,
         isrcEnricher: EclipseIsrcEnricher,
         account: EclipseAccountManager,
+        preparingState: AddonPreparingState,
     ) : this(
         repository,
         EclipseAddonResolveCache(),
@@ -86,11 +89,12 @@ class EclipseAddonStreamResolver private constructor(
         streamUrlStore,
         isrcEnricher,
         account,
+        preparingState,
     )
 
     /** Hand-built tests: Tidal-first, as the default switch does. */
     internal constructor(repository: EclipseAddonRepository) :
-        this(repository, EclipseAddonResolveCache(), { false }, null, null, null, null, null)
+        this(repository, EclipseAddonResolveCache(), { false }, null, null, null, null, null, null)
 
     suspend fun resolve(track: TrackEntity, speculative: Boolean = false): StreamUrl? =
         resolveInternal(track, speculative, radio = false)
@@ -891,14 +895,22 @@ class EclipseAddonStreamResolver private constructor(
         block: suspend () -> T,
     ): T {
         var retries = 0
-        while (true) {
-            try {
-                return block()
-            } catch (e: EclipseAddonException.Preparing) {
-                if (retries >= MAX_PREPARING_RETRIES) throw e
-                retries += 1
-                waitPreparing(addon, e, retries)
+        try {
+            while (true) {
+                try {
+                    return block()
+                } catch (e: EclipseAddonException.Preparing) {
+                    if (retries >= MAX_PREPARING_RETRIES) throw e
+                    retries += 1
+                    // The player shows "forbereder…" while this is true.
+                    preparingState?.setPreparing(true)
+                    waitPreparing(addon, e, retries)
+                }
             }
+        } finally {
+            // The wait is over, however it ended: the song plays, or the
+            // player moves on to another source.
+            preparingState?.setPreparing(false)
         }
     }
 
@@ -1079,9 +1091,11 @@ class EclipseAddonStreamResolver private constructor(
             streamUrlStore: EclipseStreamUrlStore? = null,
             isrcEnricher: EclipseIsrcEnricher? = null,
             account: EclipseAccountManager? = null,
+            preparingState: AddonPreparingState? = null,
         ): EclipseAddonStreamResolver =
             EclipseAddonStreamResolver(
                 repository, cache, cloudFastestSource, appleLookup, urlCache, streamUrlStore, isrcEnricher, account,
+                preparingState,
             )
 
         private const val TAG = "EclipseAddonStreamResolver"
