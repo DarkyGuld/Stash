@@ -11,6 +11,7 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import coil3.SingletonImageLoader
 import android.util.Log
+import com.stash.core.data.addons.BackgroundCatalogPrefetchWorker
 import com.stash.core.data.db.MixPinCleanup
 import com.stash.core.data.db.dao.ArtistProfileCacheDao
 import com.stash.core.data.db.dao.DiscoveryQueueDao
@@ -392,6 +393,7 @@ class StashApplication : Application(), Configuration.Provider {
         // so it's observing as early as possible; the first STARTED event
         // doesn't fire until after onCreate completes anyway.
         mirrorSignal.start()
+        BackgroundCatalogPrefetchWorker.schedulePeriodic(WorkManager.getInstance(applicationContext))
         ProcessLifecycleOwner.get().lifecycle.addObserver(
             object : DefaultLifecycleObserver {
                 override fun onStart(owner: LifecycleOwner) {
@@ -433,6 +435,7 @@ class StashApplication : Application(), Configuration.Provider {
                 }
 
                 override fun onStop(owner: LifecycleOwner) {
+                    BackgroundCatalogPrefetchWorker.scheduleOnStop(WorkManager.getInstance(applicationContext))
                     // squidCookieAutoRefresher.stop()
                     // kennyyHealthProbe.stop()
                     // The BotGuard WebView is ~50 MB; drop it while backgrounded, it

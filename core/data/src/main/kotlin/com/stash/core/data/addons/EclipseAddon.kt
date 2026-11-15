@@ -94,6 +94,8 @@ data class EclipseAddon(
     val supportsSearch: Boolean get() = "search" in resources
     val supportsResolve: Boolean get() = "resolve" in resources
     val supportsIsrc: Boolean get() = "isrc" in resources
+    /** Optional background batch route; ordinary Eclipse addons need not implement it. */
+    val supportsCatalogPrefetch: Boolean get() = "prefetch" in resources
 
     /** Cloud's Apple Music tier; HI_RES_MAX unlocks its direct Qobuz FLAC (the fastest route). */
     val appleQuality: String

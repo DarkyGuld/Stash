@@ -910,6 +910,20 @@ interface TrackDao {
     @Query("SELECT * FROM tracks WHERE play_count > 0 ORDER BY play_count DESC LIMIT :limit")
     fun getMostPlayed(limit: Int): Flow<List<TrackEntity>>
 
+    /**
+     * A bounded set of exact, ISRC-identified candidates for the Eclipse catalog
+     * prefetch worker. Recent and frequently played rows warm first.
+     */
+    @Query(
+        """
+        SELECT * FROM tracks
+        WHERE isrc IS NOT NULL AND TRIM(isrc) != ''
+        ORDER BY COALESCE(last_played, 0) DESC, play_count DESC, id ASC
+        LIMIT :limit
+        """,
+    )
+    suspend fun catalogPrefetchCandidates(limit: Int): List<TrackEntity>
+
     // ── Single-item lookups ─────────────────────────────────────────────
 
     /** Find a track by its Spotify URI, or null if not found. */

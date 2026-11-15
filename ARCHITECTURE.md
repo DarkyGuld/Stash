@@ -155,6 +155,14 @@ An add-on is an HTTP service that declares a manifest:
   resolves a track to a stream: the item id, the stream URL, and the tier
   the file is in.
 
+Every addon HTTP request carries `X-Stash-Client: 1`, so a server can select
+Stash's preparing/polling behaviour for either manifest path. An addon may also
+advertise `prefetch`: `BackgroundCatalogPrefetchWorker` then sends at most 50
+ISRCs plus the selected quality to that batch route, without asking for streams
+or writing fallback state. The worker runs on `ON_STOP` (`KEEP`) and every four
+hours through WorkManager, with a connected network and a non-low battery. The
+server, not the phone, owns cold-job concurrency.
+
 ### The NullBeat Cache add-on
 
 The NullBeat Cache V2 server is itself an add-on. The phone talks to it

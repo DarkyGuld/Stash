@@ -1,5 +1,6 @@
 package com.stash.core.data.addons
 
+import com.stash.core.data.db.entity.TrackEntity
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CancellationException
@@ -281,6 +282,24 @@ class EclipseAddonRepository @Inject constructor(
             addonId = addon.id,
             path = if (addon.isEclipseCloud) listOf("tidal", "resolve-isrc") else listOf("resolve-isrc"),
         )
+
+    /**
+     * Resolve-only background catalog warm. No stream call and no fallback
+     * cache write: a miss/preparing result cannot lock in YouTube for a track.
+     * Addons that do not advertise the batch resource are simply skipped.
+     */
+    suspend fun prefetchCatalog(addon: EclipseAddon, tracks: List<TrackEntity>): Int {
+        if (!addon.supportsCatalogPrefetch || tracks.isEmpty()) return 0
+        val isrcs = tracks.mapNotNull { it.isrc?.trim()?.takeIf(String::isNotEmpty) }
+        if (isrcs.isEmpty()) return 0
+        return client.prefetchCatalog(
+            manifestUrl = addon.manifestUrl,
+            isrcs = isrcs,
+            quality = addon.qualityForResolve() ?: addon.settings["quality"] ?: "max",
+            settings = addon.settings,
+            addonId = addon.id,
+        )
+    }
 
     suspend fun stream(addon: EclipseAddon, trackId: String): EclipseAddonStream =
         if (addon.isEclipseCloud) {

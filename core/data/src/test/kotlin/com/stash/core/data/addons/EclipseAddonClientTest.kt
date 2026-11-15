@@ -823,4 +823,38 @@ class EclipseAddonClientTest {
         assertThat(url.queryParameter("quality")).isEqualTo("HI_RES_LOSSLESS")
         assertThat(url.queryParameter("isrc")).isEqualTo("USUM71923546")
     }
+
+    @Test
+    fun `every addon call identifies Stash and catalog prefetch sends one ISRC batch`() = kotlinx.coroutines.test.runTest {
+        val manifestUrl = "https://addons.test/u/session/manifest.json"
+        server.enqueue(MockResponse().setBody("""{"id":"nb","name":"NullBeat","resources":["resolve","isrc","stream","search","prefetch"]}"""))
+        client.fetchManifest(manifestUrl)
+        server.enqueue(MockResponse().setBody("""{"tracks":[]}"""))
+        client.search(manifestUrl, "song")
+        server.enqueue(MockResponse().setBody("""{"item":{"id":"nb:one"}}"""))
+        client.resolve(manifestUrl, "Song", "Artist", 204_000, "NOAAA1010101")
+        server.enqueue(MockResponse().setBody("""{"trackId":"nb:one"}"""))
+        client.resolveIsrc(manifestUrl, "NOAAA1010101")
+        server.enqueue(MockResponse().setBody("""{"url":"https://cdn.test/song.flac"}"""))
+        client.stream(manifestUrl, "nb:one")
+        server.enqueue(MockResponse().setBody("""{"accepted":2}"""))
+        val accepted = client.prefetchCatalog(
+            manifestUrl = manifestUrl,
+            isrcs = listOf("noaaa1010101", "NOAAA2020202", "NOAAA1010101"),
+            quality = "lossless",
+        )
+
+        assertThat(accepted).isEqualTo(2)
+        val calls = List(6) { server.takeRequest() }
+        for (request in calls) {
+            assertThat(request.getHeader(EclipseAddonClient.STASH_CLIENT_HEADER))
+                .isEqualTo(EclipseAddonClient.STASH_CLIENT_VALUE)
+        }
+        assertThat(calls.map { it.method }).containsExactly("GET", "GET", "GET", "GET", "GET", "POST").inOrder()
+        assertThat(calls.last().path).isEqualTo("/u/session/prefetch")
+        val body = calls.last().body.readUtf8()
+        assertThat(body).contains("\"isrcs\":[\"NOAAA1010101\",\"NOAAA2020202\"]")
+        assertThat(body).contains("\"quality\":\"lossless\"")
+        assertThat(body).doesNotContain("cdn.test")
+    }
 }

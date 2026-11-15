@@ -35,6 +35,7 @@ import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 
 /** What an Eclipse addon advertises at its `manifest.json`. */
@@ -126,6 +127,12 @@ data class EclipseAddonManifest(
     private fun JsonElement.asQueryValue(): String? =
         (this as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotEmpty() }
 }
+
+@Serializable
+private data class EclipseCatalogPrefetchPayload(
+    val isrcs: List<String>,
+    val quality: String,
+)
 
 /** One search hit, or one `/resolve` item. [duration] is seconds per the protocol; see [durationMs]. */
 @Serializable
@@ -342,6 +349,34 @@ class EclipseAddonClient @Inject constructor(
             .build()
         val body = getBody(url, addonId, missCodes = MISS_CODES) ?: return null
         return parseBody(body) { parseResolvedId(it, isrc) }
+    }
+
+    /**
+     * Background-only ISRC batch warm. It never asks for a stream, so neither
+     * a provisional response nor a miss can lock in a YouTube fallback.
+     */
+    suspend fun prefetchCatalog(
+        manifestUrl: String,
+        isrcs: List<String>,
+        quality: String,
+        settings: Map<String, String> = emptyMap(),
+        addonId: String? = null,
+    ): Int {
+        val batch = isrcs.mapNotNull { raw ->
+            raw.trim().uppercase().takeIf { ISRC_PATTERN.matches(it) }
+        }.distinct().take(MAX_CATALOG_PREFETCH_BATCH)
+        if (batch.isEmpty()) return 0
+        val url = endpoint(manifestUrl, listOf("prefetch"), settings)
+        val payload = json.encodeToString(
+            EclipseCatalogPrefetchPayload.serializer(),
+            EclipseCatalogPrefetchPayload(isrcs = batch, quality = quality.ifBlank { "max" }),
+        )
+        val body = postBody(url, addonId, payload)
+        return parseBody(body) { text ->
+            val root = json.parseToJsonElement(text) as? JsonObject
+            (root?.get("accepted") as? JsonPrimitive)?.contentOrNull?.toIntOrNull()
+                ?: throw EclipseAddonException.InvalidResponse()
+        }
     }
 
     suspend fun stream(
@@ -659,6 +694,28 @@ class EclipseAddonClient @Inject constructor(
             }
         }
 
+    private suspend fun postBody(
+        url: HttpUrl,
+        addonId: String?,
+        payload: String,
+    ): String = withContext(Dispatchers.IO) {
+        val request = requestBuilder(url, addonId)
+            .header("Content-Type", "application/json; charset=utf-8")
+            .post(payload.toRequestBody("application/json; charset=utf-8".toMediaType()))
+            .build()
+        try {
+            executeAsync(http, request).use { response ->
+                if (response.code == 503) {
+                    throw EclipseAddonException.Preparing(parseRetryAfter(response.header("Retry-After")))
+                }
+                if (!response.isSuccessful) throw EclipseAddonException.HttpFailure(response.code)
+                response.body?.string().orEmpty()
+            }
+        } catch (e: IOException) {
+            throw EclipseAddonException.Unreachable(e)
+        }
+    }
+
     /** `Retry-After` in whole seconds, capped: a proxied addon may say 300. */
     private fun parseRetryAfter(header: String?): Int? =
         header?.trim()?.toIntOrNull()?.coerceIn(0, MAX_RETRY_AFTER_SECONDS)
@@ -693,14 +750,18 @@ class EclipseAddonClient @Inject constructor(
 
     /**
      * The common headers. `X-Client-Platform: web` on every addon request (Eclipse's
-     * addons check it); the account's Bearer and the minted `X-Eclipse-Access` only
-     * when this really is an Eclipse-hosted `/addon/` URL and a token is configured.
+     * addons check it), and `X-Stash-Client: 1` so a Stash-aware addon answers in
+     * Stash mode whichever manifest path the user installed (`/manifest.json` or
+     * `/stash/manifest.json`). The account's Bearer and the minted
+     * `X-Eclipse-Access` are added only when this really is an Eclipse-hosted
+     * `/addon/` URL and a token is configured.
      */
     private suspend fun requestBuilder(url: HttpUrl, addonId: String?): Request.Builder {
         val builder = Request.Builder()
             .url(url)
             .header("User-Agent", userAgentFor(url))
             .header("X-Client-Platform", CLIENT_PLATFORM)
+            .header(STASH_CLIENT_HEADER, STASH_CLIENT_VALUE)
 
         // Eclipse's addon routes answer 403 "Unavailable" to any request that has
         // neither Origin nor Referer (backend change, Nov 2026), even with a valid
@@ -811,6 +872,14 @@ class EclipseAddonClient @Inject constructor(
         const val CLIENT_PLATFORM: String = "web"
 
         /**
+         * Identifies every addon call as coming from Stash. A Stash-aware addon
+         * (NullBeat Cache) switches to its Stash mode on this header even when
+         * the installed URL is `/manifest.json` rather than `/stash/manifest.json`.
+         */
+        const val STASH_CLIENT_HEADER: String = "X-Stash-Client"
+        const val STASH_CLIENT_VALUE: String = "1"
+
+        /**
          * Eclipse's web origin. Its addon routes answer 403 "Unavailable" unless a
          * request carries an Origin or Referer (Nov 2026 backend change), so every
          * call to that host states the web origin it is shaped like.
@@ -835,6 +904,8 @@ class EclipseAddonClient @Inject constructor(
          * failure so the resolver can retry on the next play.
          */
         private val MISS_CODES = setOf(404)
+        const val MAX_CATALOG_PREFETCH_BATCH: Int = 50
+        private val ISRC_PATTERN = Regex("^[A-Z]{2}[A-Z0-9]{3}[0-9]{7}$")
 
         const val LOSSLESS_QUALITY: String = "LOSSLESS"
 
