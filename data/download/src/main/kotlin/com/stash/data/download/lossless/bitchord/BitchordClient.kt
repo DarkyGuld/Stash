@@ -1,5 +1,7 @@
 package com.stash.data.download.lossless.bitchord
 
+import com.stash.data.download.BuildConfig
+
 import android.util.Log
 import com.stash.core.data.db.dao.TidalMatchDao
 import com.stash.core.data.db.entity.TidalMatchEntity
@@ -201,6 +203,10 @@ class BitchordClient @Inject constructor(
      */
     private suspend fun server(): TidalRelay? {
         prefs.bitchordEndpointNow()?.let { return TidalRelay(it, prefs.bitchordAccessTokenNow(), userOwned = true) }
+        // Self-built APKs can bake their own relay in (gradle property
+        // `tidal.relayUrl` / env TIDAL_RELAY_URL). Empty in normal builds.
+        BuildConfig.TIDAL_RELAY_URL.takeIf { it.isNotBlank() }
+            ?.let { return TidalRelay(it, null, userOwned = true) }
         return config.tidalRelay.first()
     }
 

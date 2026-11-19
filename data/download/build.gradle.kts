@@ -26,12 +26,19 @@ fun qbdlxProp(key: String, env: String) =
 val losslessConfigUrl = qbdlxProp("lossless.configUrl", "LOSSLESS_CONFIG_URL")
 val losslessConfigPubKey = qbdlxProp("lossless.configPubKey", "LOSSLESS_CONFIG_PUBKEY")
 
+// ── Personal relay ─────────────────────────────────────────────────────────
+// Optional built-in TIDAL relay base for self-built APKs (e.g. a NullBeat
+// instance: https://host/<token>/relay). Empty → only the settings override
+// and the signed config are used, exactly as before.
+val tidalRelayUrl = qbdlxProp("tidal.relayUrl", "TIDAL_RELAY_URL")
+
 android {
     namespace = "com.stash.data.download"
 
     defaultConfig {
         buildConfigField("String", "LOSSLESS_CONFIG_URL", "\"$losslessConfigUrl\"")
         buildConfigField("String", "LOSSLESS_CONFIG_PUBKEY", "\"$losslessConfigPubKey\"")
+        buildConfigField("String", "TIDAL_RELAY_URL", "\"$tidalRelayUrl\"")
     }
 
     buildFeatures {

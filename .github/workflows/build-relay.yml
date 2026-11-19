@@ -1,0 +1,57 @@
+name: Build relay APK
+
+# Personal build: an APK with the NullBeat relay baked in, so Stash can use
+# /relay/search + /relay/stream (TorBox when cached, DASH when not).
+#
+# The relay URL is a secret (it contains the listener's addon token), so it is
+# read from `secrets.TIDAL_RELAY_URL` and never appears in the log.
+
+on:
+  push:
+    branches: [feat/nullbeat-relay]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: assembleRelease
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Fix gradlew permission
+        run: chmod +x gradlew
+
+      - name: Build release APK with the relay baked in
+        env:
+          RELAY: ${{ secrets.TIDAL_RELAY_URL }}
+        run: |
+          test -n "$RELAY" || { echo "TIDAL_RELAY_URL secret is missing"; exit 1; }
+          ./gradlew :app:assembleRelease -Ptidal.relayUrl="$RELAY" --no-daemon --stacktrace
+
+      - name: Show what was built
+        run: |
+          ls -lh app/build/outputs/apk/release/ || true
+          for f in app/build/outputs/apk/release/*.apk; do
+            echo "APK: $f"
+            "$ANDROID_HOME"/build-tools/*/aapt2 dump badging "$f" 2>/dev/null | head -3 || true
+          done
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: stash-relay-apk
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 30
