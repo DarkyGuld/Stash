@@ -204,6 +204,9 @@ android {
 
     buildTypes {
         release {
+            // Personal builds have no release keystore: sign with the debug key
+            // so the APK is installable (Android refuses unsigned APKs).
+            if (!hasReleaseSigning) signingConfig = signingConfigs.getByName("debug")
             buildConfigField("String", "SYNC_BASE_URL", "\"$syncReleaseBaseUrl\"")
             buildConfigField("Boolean", "WEB_LINK_ENABLED", "true")
             manifestPlaceholders["webLinkEnabled"] = "true"
