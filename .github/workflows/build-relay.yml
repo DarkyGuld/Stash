@@ -35,10 +35,22 @@ jobs:
 
       - name: Build release APK with the relay baked in
         env:
-          RELAY: ${{ secrets.TIDAL_RELAY_URL }}
+          # qbdlxProp() reads local.properties or this env var — a -P gradle
+          # property is NOT seen by the build, which is why this is an env.
+          TIDAL_RELAY_URL: ${{ secrets.TIDAL_RELAY_URL }}
         run: |
-          test -n "$RELAY" || { echo "TIDAL_RELAY_URL secret is missing"; exit 1; }
-          ./gradlew :app:assembleRelease -Ptidal.relayUrl="$RELAY" --no-daemon --stacktrace
+          test -n "$TIDAL_RELAY_URL" || { echo "TIDAL_RELAY_URL secret is missing"; exit 1; }
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Verify the relay is baked into the APK
+        run: |
+          python3 - <<'EOF'
+          import zipfile
+          z = zipfile.ZipFile('app/build/outputs/apk/release/app-release.apk')
+          hit = any(b'music1.ferlis.net' in z.read(n) for n in z.namelist() if n.endswith('.dex'))
+          print('relay i dex:', hit)
+          raise SystemExit(0 if hit else 1)
+          EOF
 
       - name: Show what was built
         run: |
